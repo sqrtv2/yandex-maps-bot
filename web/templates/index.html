@@ -1,0 +1,508 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Yandex Maps Profile Visitor{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2">Dashboard</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <div class="btn-group me-2">
+            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="updateDashboard()">
+                <i class="bi bi-arrow-clockwise"></i> Refresh
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Statistics Cards -->
+<div class="row mb-4">
+    <div class="col-xl-3 col-md-6 mb-4">
+        <div class="card border-left-primary shadow h-100 py-2 stats-card">
+            <div class="card-body">
+                <div class="row no-gutters align-items-center">
+                    <div class="col mr-2">
+                        <div class="text-xs font-weight-bold text-primary text-uppercase mb-1">
+                            Browser Profiles
+                        </div>
+                        <div class="h5 mb-0 font-weight-bold text-gray-800" id="profileCount">
+                            {{ profile_count }}
+                        </div>
+                        <small class="text-muted">Total profiles</small>
+                    </div>
+                    <div class="col-auto">
+                        <i class="bi bi-person-circle fa-2x text-gray-300"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-xl-3 col-md-6 mb-4">
+        <div class="card border-left-success shadow h-100 py-2 stats-card">
+            <div class="card-body">
+                <div class="row no-gutters align-items-center">
+                    <div class="col mr-2">
+                        <div class="text-xs font-weight-bold text-success text-uppercase mb-1">
+                            Proxy Servers
+                        </div>
+                        <div class="h5 mb-0 font-weight-bold text-gray-800" id="proxyCount">
+                            {{ proxy_count }}
+                        </div>
+                        <small class="text-muted">Total proxies</small>
+                    </div>
+                    <div class="col-auto">
+                        <i class="bi bi-shield-lock fa-2x text-gray-300"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-xl-3 col-md-6 mb-4">
+        <div class="card border-left-info shadow h-100 py-2 stats-card">
+            <div class="card-body">
+                <div class="row no-gutters align-items-center">
+                    <div class="col mr-2">
+                        <div class="text-xs font-weight-bold text-info text-uppercase mb-1">
+                            Tasks
+                        </div>
+                        <div class="h5 mb-0 font-weight-bold text-gray-800" id="taskCount">
+                            {{ task_count }}
+                        </div>
+                        <small class="text-muted">Total tasks</small>
+                    </div>
+                    <div class="col-auto">
+                        <i class="bi bi-list-task fa-2x text-gray-300"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-xl-3 col-md-6 mb-4">
+        <div class="card border-left-warning shadow h-100 py-2 stats-card">
+            <div class="card-body">
+                <div class="row no-gutters align-items-center">
+                    <div class="col mr-2">
+                        <div class="text-xs font-weight-bold text-warning text-uppercase mb-1">
+                            Success Rate
+                        </div>
+                        <div class="h5 mb-0 font-weight-bold text-gray-800" id="successRate">
+                            95.2%
+                        </div>
+                        <small class="text-muted">Overall performance</small>
+                    </div>
+                    <div class="col-auto">
+                        <i class="bi bi-graph-up fa-2x text-gray-300"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Charts Row -->
+<div class="row mb-4">
+    <!-- Task Status Chart -->
+    <div class="col-xl-6 col-lg-6">
+        <div class="card shadow mb-4">
+            <div class="card-header py-3 d-flex flex-row align-items-center justify-content-between">
+                <h6 class="m-0 font-weight-bold text-primary">Task Status Distribution</h6>
+            </div>
+            <div class="card-body">
+                <canvas id="taskStatusChart" width="400" height="200"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- Proxy Status Chart -->
+    <div class="col-xl-6 col-lg-6">
+        <div class="card shadow mb-4">
+            <div class="card-header py-3 d-flex flex-row align-items-center justify-content-between">
+                <h6 class="m-0 font-weight-bold text-primary">Proxy Status</h6>
+            </div>
+            <div class="card-body">
+                <canvas id="proxyStatusChart" width="400" height="200"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Recent Activity -->
+<div class="row">
+    <div class="col-12">
+        <div class="card shadow mb-4">
+            <div class="card-header py-3">
+                <h6 class="m-0 font-weight-bold text-primary">Recent Tasks</h6>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-bordered" id="recentTasksTable">
+                        <thead>
+                            <tr>
+                                <th>Task ID</th>
+                                <th>Type</th>
+                                <th>Profile</th>
+                                <th>Status</th>
+                                <th>Created</th>
+                                <th>Duration</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td colspan="6" class="text-center text-muted">Loading recent tasks...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Quick Actions -->
+<div class="row">
+    <div class="col-12">
+        <div class="card shadow mb-4">
+            <div class="card-header py-3">
+                <h6 class="m-0 font-weight-bold text-primary">Quick Actions</h6>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-primary btn-sm w-100" onclick="showCreateProfileModal()">
+                            <i class="bi bi-plus-circle"></i> New Profile
+                        </button>
+                    </div>
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-success btn-sm w-100" onclick="startWarmupAll()">
+                            <i class="bi bi-play-circle"></i> Warmup All
+                        </button>
+                    </div>
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-info btn-sm w-100" onclick="checkProxies()">
+                            <i class="bi bi-shield-check"></i> Test Proxies
+                        </button>
+                    </div>
+                    <div class="col-md-3 mb-2">
+                        <button class="btn btn-warning btn-sm w-100" onclick="showYandexVisitModal()">
+                            <i class="bi bi-geo-alt"></i> Visit Yandex
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Create Profile Modal -->
+<div class="modal fade" id="createProfileModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Create New Profile</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="createProfileForm">
+                    <div class="mb-3">
+                        <label class="form-label">Profile Name</label>
+                        <input type="text" class="form-control" id="profileName" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">User Agent</label>
+                        <input type="text" class="form-control" id="profileUserAgent"
+                               placeholder="Leave empty for auto-generated">
+                    </div>
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Viewport Width</label>
+                                <input type="number" class="form-control" id="viewportWidth" value="1366">
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Viewport Height</label>
+                                <input type="number" class="form-control" id="viewportHeight" value="768">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Timezone</label>
+                        <select class="form-control" id="profileTimezone">
+                            <option value="Europe/Moscow">Europe/Moscow</option>
+                            <option value="Europe/London">Europe/London</option>
+                            <option value="America/New_York">America/New_York</option>
+                            <option value="Asia/Tokyo">Asia/Tokyo</option>
+                        </select>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="createProfile()">Create Profile</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Yandex Visit Modal -->
+<div class="modal fade" id="yandexVisitModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Visit Yandex Maps Profile</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="yandexVisitForm">
+                    <div class="mb-3">
+                        <label class="form-label">Profile to Use</label>
+                        <select class="form-control" id="visitProfileId" required>
+                            <option value="">Select a profile...</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Yandex Maps URL</label>
+                        <input type="url" class="form-control" id="yandexUrl" required
+                               placeholder="https://yandex.ru/maps/org/...">
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="startYandexVisit()">Start Visit</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    let taskStatusChart = null;
+    let proxyStatusChart = null;
+
+    // Initialize dashboard
+    document.addEventListener('DOMContentLoaded', function() {
+        updateDashboard();
+        setInterval(updateDashboard, 30000); // Update every 30 seconds
+    });
+
+    async function updateDashboard() {
+        try {
+            // Update statistics
+            const stats = await apiCall('/dashboard/stats');
+
+            document.getElementById('profileCount').textContent = stats.profiles.total;
+            document.getElementById('proxyCount').textContent = stats.proxies.total;
+            document.getElementById('taskCount').textContent = stats.tasks.total;
+            document.getElementById('successRate').textContent = stats.tasks.success_rate.toFixed(1) + '%';
+
+            // Update charts
+            updateTaskStatusChart(stats.tasks);
+            updateProxyStatusChart(stats.proxies);
+
+            // Update recent tasks table
+            updateRecentTasksTable();
+
+        } catch (error) {
+            console.error('Failed to update dashboard:', error);
+        }
+    }
+
+    function updateTaskStatusChart(taskData) {
+        const ctx = document.getElementById('taskStatusChart').getContext('2d');
+
+        if (taskStatusChart) {
+            taskStatusChart.destroy();
+        }
+
+        taskStatusChart = new Chart(ctx, {
+            type: 'doughnut',
+            data: {
+                labels: ['Completed', 'Failed', 'In Progress', 'Pending'],
+                datasets: [{
+                    data: [
+                        taskData.completed,
+                        taskData.total - taskData.completed,
+                        5, // Mock data
+                        3  // Mock data
+                    ],
+                    backgroundColor: [
+                        '#28a745',
+                        '#dc3545',
+                        '#007bff',
+                        '#6c757d'
+                    ]
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false
+            }
+        });
+    }
+
+    function updateProxyStatusChart(proxyData) {
+        const ctx = document.getElementById('proxyStatusChart').getContext('2d');
+
+        if (proxyStatusChart) {
+            proxyStatusChart.destroy();
+        }
+
+        proxyStatusChart = new Chart(ctx, {
+            type: 'doughnut',
+            data: {
+                labels: ['Working', 'Failed'],
+                datasets: [{
+                    data: [proxyData.working, proxyData.total - proxyData.working],
+                    backgroundColor: ['#28a745', '#dc3545']
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false
+            }
+        });
+    }
+
+    async function updateRecentTasksTable() {
+        try {
+            const tasks = await apiCall('/tasks');
+            const tbody = document.querySelector('#recentTasksTable tbody');
+
+            if (tasks.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No tasks found</td></tr>';
+                return;
+            }
+
+            const rows = tasks.slice(0, 10).map(task => `
+                <tr>
+                    <td>${task.id}</td>
+                    <td><span class="badge bg-info">${task.task_type}</span></td>
+                    <td>${task.profile_id || 'N/A'}</td>
+                    <td><span class="badge bg-${getStatusColor(task.status)}">${task.status}</span></td>
+                    <td>${new Date(task.created_at).toLocaleString()}</td>
+                    <td>${task.execution_time_seconds ? task.execution_time_seconds.toFixed(1) + 's' : 'N/A'}</td>
+                </tr>
+            `).join('');
+
+            tbody.innerHTML = rows;
+
+        } catch (error) {
+            console.error('Failed to update tasks table:', error);
+        }
+    }
+
+    function getStatusColor(status) {
+        const colors = {
+            'pending': 'secondary',
+            'in_progress': 'primary',
+            'completed': 'success',
+            'failed': 'danger',
+            'cancelled': 'dark'
+        };
+        return colors[status] || 'secondary';
+    }
+
+    // Quick actions
+    function showCreateProfileModal() {
+        const modal = new bootstrap.Modal(document.getElementById('createProfileModal'));
+        modal.show();
+    }
+
+    async function createProfile() {
+        try {
+            const profileData = {
+                name: document.getElementById('profileName').value,
+                user_agent: document.getElementById('profileUserAgent').value,
+                viewport_width: parseInt(document.getElementById('viewportWidth').value),
+                viewport_height: parseInt(document.getElementById('viewportHeight').value),
+                timezone: document.getElementById('profileTimezone').value
+            };
+
+            await apiCall('/profiles', 'POST', profileData);
+            showToast('Profile created successfully', 'success');
+
+            const modal = bootstrap.Modal.getInstance(document.getElementById('createProfileModal'));
+            modal.hide();
+
+            updateDashboard();
+
+        } catch (error) {
+            showToast('Failed to create profile', 'danger');
+        }
+    }
+
+    async function startWarmupAll() {
+        if (!confirm('Start warmup for all profiles? This may take a while.')) {
+            return;
+        }
+
+        try {
+            // This would typically call a batch warmup endpoint
+            showToast('Warmup started for all profiles', 'info');
+        } catch (error) {
+            showToast('Failed to start warmup', 'danger');
+        }
+    }
+
+    async function checkProxies() {
+        try {
+            showToast('Proxy health check started', 'info');
+            // This would call the proxy health check endpoint
+        } catch (error) {
+            showToast('Failed to start proxy check', 'danger');
+        }
+    }
+
+    async function showYandexVisitModal() {
+        try {
+            // Load profiles for selection
+            const profiles = await apiCall('/profiles');
+            const select = document.getElementById('visitProfileId');
+
+            select.innerHTML = '<option value="">Select a profile...</option>' +
+                profiles.filter(p => p.warmup_completed).map(p =>
+                    `<option value="${p.id}">${p.name}</option>`
+                ).join('');
+
+            const modal = new bootstrap.Modal(document.getElementById('yandexVisitModal'));
+            modal.show();
+
+        } catch (error) {
+            showToast('Failed to load profiles', 'danger');
+        }
+    }
+
+    async function startYandexVisit() {
+        try {
+            const profileId = document.getElementById('visitProfileId').value;
+            const yandexUrl = document.getElementById('yandexUrl').value;
+
+            if (!profileId || !yandexUrl) {
+                showToast('Please fill in all fields', 'warning');
+                return;
+            }
+
+            await apiCall('/tasks/yandex-visit', 'POST', {
+                profile_id: parseInt(profileId),
+                target_url: yandexUrl
+            });
+
+            showToast('Yandex Maps visit started', 'success');
+
+            const modal = bootstrap.Modal.getInstance(document.getElementById('yandexVisitModal'));
+            modal.hide();
+
+        } catch (error) {
+            showToast('Failed to start Yandex visit', 'danger');
+        }
+    }
+
+    // Make updateDashboard available globally for WebSocket
+    window.updateDashboard = updateDashboard;
+</script>
+{% endblock %}

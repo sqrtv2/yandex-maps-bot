@@ -1,0 +1,75 @@
+# =========================================================
+# GitHub Actions: Auto-deploy to Ubuntu server on push to main
+# =========================================================
+# 
+# Required GitHub Secrets (Settings → Secrets → Actions):
+#   SERVER_HOST     — IP адрес сервера (например 185.123.45.67)
+#   SERVER_USER     — SSH пользователь (например ubuntu)
+#   SERVER_SSH_KEY  — Приватный SSH ключ (содержимое id_rsa / id_ed25519)
+#   DEPLOY_PATH     — Путь к проекту на сервере (например /home/ubuntu/yandex-maps-bot)
+#
+
+name: Deploy to Server
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    name: 🚀 Deploy to Ubuntu Server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: 🚀 Deploy to server
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'DEPLOY_SCRIPT'
+            
+            set -e
+            
+            DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
+            
+            echo "📥 Pulling latest code..."
+            cd "$DEPLOY_PATH"
+            git fetch origin main
+            git reset --hard origin/main
+            
+            echo "🔨 Building Docker images..."
+            docker compose build
+            
+            echo "🔄 Restarting services..."
+            docker compose up -d postgres redis app celery_worker celery_beat
+            
+            echo "⏳ Waiting for startup..."
+            sleep 15
+            
+            echo "🏥 Health check..."
+            if curl -sf http://localhost:8000/health; then
+              echo ""
+              echo "✅ Deploy successful!"
+            else
+              echo "⚠️ Health check failed, showing logs:"
+              docker compose logs --tail=30 app
+              exit 1
+            fi
+            
+            echo "🧹 Cleanup..."
+            docker image prune -f
+            
+            echo "✅ Done!"
+          DEPLOY_SCRIPT
+
+      - name: ❌ Deploy failed
+        if: failure()
+        run: echo "::error::Deployment failed! Check the logs above."

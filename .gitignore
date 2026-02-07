@@ -1,0 +1,51 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Database
+*.db
+*.sqlite3
+dump.rdb
+
+# Celery
+celerybeat-schedule
+celerybeat-schedule-shm
+celerybeat-schedule-wal
+celerybeat.pid
+
+# Browser profiles (large, generated per-server)
+browser_profiles/
+
+# Logs & Screenshots
+logs/
+screenshots/
+downloads/
+
+# Test outputs
+test_output.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# SSL certificates (sensitive)
+ssl/
+
+# Docker volumes data (local only)
+postgres_data/
+redis_data/

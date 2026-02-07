@@ -1,0 +1,1166 @@
+{% extends "base.html" %}
+
+{% block title %}Browser Profiles - Yandex Maps Profile Visitor{% endblock %}
+
+{% block content %}
+<style>
+.spin {
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+.warmup-progress-cell {
+    min-width: 120px;
+}
+
+.progress {
+    height: 8px;
+}
+
+.alert.position-fixed {
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    border: none;
+}
+</style>
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2">Browser Profiles</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <div class="btn-group me-2">
+            <button type="button" class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#addProfileModal">
+                <i class="bi bi-plus-circle"></i> Add Profile
+            </button>
+            <button type="button" class="btn btn-sm btn-success" data-bs-toggle="modal" data-bs-target="#bulkCreateModal">
+                <i class="bi bi-stack"></i> Bulk Create
+            </button>
+            <button type="button" class="btn btn-sm btn-warning" onclick="startBulkWarmup()">
+                <i class="bi bi-fire"></i> Warm All
+            </button>
+            <button type="button" class="btn btn-sm btn-danger" onclick="clearAllProfiles()">
+                <i class="bi bi-trash3-fill"></i> Clear All
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="refreshProfiles()">
+                <i class="bi bi-arrow-clockwise"></i> Refresh
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Overall System Progress -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card border-primary">
+            <div class="card-header bg-primary text-white">
+                <div class="row align-items-center">
+                    <div class="col-md-8">
+                        <h5 class="mb-0"><i class="bi bi-speedometer2"></i> System Progress</h5>
+                        <small>Large-scale profile warmup system (optimized for 1000+ profiles)</small>
+                    </div>
+                    <div class="col-md-4 text-end">
+                        <span class="h4 mb-0" id="overallProgressText">0%</span>
+                    </div>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="progress mb-3" style="height: 20px;">
+                    <div class="progress-bar progress-bar-striped progress-bar-animated"
+                         id="overallProgressBar"
+                         role="progressbar"
+                         style="width: 0%"
+                         aria-valuenow="0"
+                         aria-valuemin="0"
+                         aria-valuemax="100">
+                        <span class="progress-text">0%</span>
+                    </div>
+                </div>
+                <div class="row text-center">
+                    <div class="col-md-3">
+                        <div class="h5 text-success mb-1" id="warmedCount">0</div>
+                        <div class="small text-muted">Warmed Up</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="h5 text-warning mb-1" id="warmingCount">0</div>
+                        <div class="small text-muted">Warming Up</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="h5 text-info mb-1" id="pendingCount">0</div>
+                        <div class="small text-muted">Pending</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="h5 text-primary mb-1" id="totalCount">0</div>
+                        <div class="small text-muted">Total Profiles</div>
+                    </div>
+                </div>
+                <div class="text-center mt-2">
+                    <small class="text-muted" id="estimatedTime"></small>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Filters and Search -->
+<div class="card mb-4">
+    <div class="card-header">
+        <h6 class="mb-0"><i class="bi bi-funnel"></i> Filters & Search</h6>
+    </div>
+    <div class="card-body">
+        <div class="row">
+            <div class="col-md-3">
+                <label for="searchProfiles" class="form-label">Search</label>
+                <input type="text" class="form-control form-control-sm" id="searchProfiles" placeholder="Search by name...">
+            </div>
+            <div class="col-md-2">
+                <label for="statusFilter" class="form-label">Status</label>
+                <select class="form-select form-select-sm" id="statusFilter">
+                    <option value="">All Status</option>
+                    <option value="created">Created</option>
+                    <option value="warming_up">Warming Up</option>
+                    <option value="warmed">Warmed</option>
+                    <option value="active">Active</option>
+                    <option value="blocked">Blocked</option>
+                    <option value="error">Error</option>
+                </select>
+            </div>
+            <div class="col-md-2">
+                <label for="warmupFilter" class="form-label">Warmup</label>
+                <select class="form-select form-select-sm" id="warmupFilter">
+                    <option value="">All</option>
+                    <option value="completed">Completed</option>
+                    <option value="not_completed">Not Completed</option>
+                </select>
+            </div>
+            <div class="col-md-2">
+                <label for="perPageSelect" class="form-label">Per Page</label>
+                <select class="form-select form-select-sm" id="perPageSelect">
+                    <option value="25">25</option>
+                    <option value="50" selected>50</option>
+                    <option value="100">100</option>
+                </select>
+            </div>
+            <div class="col-md-3 d-flex align-items-end">
+                <button type="button" class="btn btn-outline-secondary btn-sm me-2" onclick="applyFilters()">
+                    <i class="bi bi-search"></i> Apply
+                </button>
+                <button type="button" class="btn btn-outline-secondary btn-sm" onclick="clearFilters()">
+                    <i class="bi bi-x-circle"></i> Clear
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Profiles Table -->
+<div class="card">
+    <div class="card-header">
+        <div class="row align-items-center">
+            <div class="col-md-6">
+                <h6 class="mb-0">Profiles</h6>
+            </div>
+            <div class="col-md-6 text-end">
+                <span class="badge bg-secondary" id="profilesCountBadge">Loading...</span>
+            </div>
+        </div>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover table-sm mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th width="5%">ID</th>
+                        <th width="15%">Name</th>
+                        <th width="8%">Status</th>
+                        <th width="20%">User Agent</th>
+                        <th width="8%">Viewport</th>
+                        <th width="8%">Warmup</th>
+                        <th width="10%">Success Rate</th>
+                        <th width="10%">Created</th>
+                        <th width="16%">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="profilesTableBody">
+                    <tr>
+                        <td colspan="9" class="text-center py-4">Loading profiles...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Pagination -->
+<nav aria-label="Profiles pagination" class="mt-4">
+    <div class="row align-items-center">
+        <div class="col-md-6">
+            <div class="text-muted small" id="paginationInfo">
+                Showing 0 - 0 of 0 profiles
+            </div>
+        </div>
+        <div class="col-md-6">
+            <ul class="pagination pagination-sm justify-content-end mb-0" id="pagination">
+                <li class="page-item disabled">
+                    <span class="page-link">Loading...</span>
+                </li>
+            </ul>
+        </div>
+    </div>
+</nav>
+
+<!-- Add Profile Modal -->
+<div class="modal fade" id="addProfileModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Add New Browser Profile</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="addProfileForm">
+                    <div class="mb-3">
+                        <label for="profileName" class="form-label">Profile Name</label>
+                        <input type="text" class="form-control" id="profileName" required>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-6">
+                            <label for="viewportWidth" class="form-label">Viewport Width</label>
+                            <input type="number" class="form-control" id="viewportWidth" value="1366">
+                        </div>
+                        <div class="col-md-6">
+                            <label for="viewportHeight" class="form-label">Viewport Height</label>
+                            <input type="number" class="form-control" id="viewportHeight" value="768">
+                        </div>
+                    </div>
+                    <div class="row mt-3">
+                        <div class="col-md-6">
+                            <label for="timezone" class="form-label">Timezone</label>
+                            <select class="form-select" id="timezone">
+                                <option value="Europe/Moscow">Europe/Moscow</option>
+                                <option value="America/New_York">America/New_York</option>
+                                <option value="Europe/London">Europe/London</option>
+                                <option value="Asia/Tokyo">Asia/Tokyo</option>
+                            </select>
+                        </div>
+                        <div class="col-md-6">
+                            <label for="language" class="form-label">Language</label>
+                            <select class="form-select" id="language">
+                                <option value="ru-RU">Russian (ru-RU)</option>
+                                <option value="en-US">English (en-US)</option>
+                                <option value="en-GB">English UK (en-GB)</option>
+                                <option value="ja-JP">Japanese (ja-JP)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="mt-3">
+                        <label for="userAgent" class="form-label">User Agent (optional)</label>
+                        <textarea class="form-control" id="userAgent" rows="2" placeholder="Leave empty for auto-generated"></textarea>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="createProfile()">Create Profile</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Bulk Create Profiles Modal -->
+<div class="modal fade" id="bulkCreateModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Bulk Create Browser Profiles</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="bulkCreateForm">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <label for="profileCount" class="form-label">Number of Profiles</label>
+                            <input type="number" class="form-control" id="profileCount" min="1" max="50" value="5" required>
+                            <div class="form-text">Maximum 50 profiles at once</div>
+                        </div>
+                        <div class="col-md-6">
+                            <label for="profileNamePrefix" class="form-label">Name Prefix</label>
+                            <input type="text" class="form-control" id="profileNamePrefix" value="Profile-" required>
+                            <div class="form-text">Profiles will be named: Prefix-1, Prefix-2, etc.</div>
+                        </div>
+                    </div>
+
+                    <hr class="my-4">
+                    <h6>Profile Configuration</h6>
+
+                    <div class="row">
+                        <div class="col-md-4">
+                            <label for="bulkViewportWidth" class="form-label">Viewport Width</label>
+                            <select class="form-select" id="bulkViewportWidth">
+                                <option value="random">Random</option>
+                                <option value="1366">1366px (Laptop)</option>
+                                <option value="1920">1920px (Desktop)</option>
+                                <option value="1440">1440px (MacBook)</option>
+                                <option value="1536">1536px (Surface)</option>
+                            </select>
+                        </div>
+                        <div class="col-md-4">
+                            <label for="bulkViewportHeight" class="form-label">Viewport Height</label>
+                            <select class="form-select" id="bulkViewportHeight">
+                                <option value="random">Random</option>
+                                <option value="768">768px</option>
+                                <option value="1080">1080px</option>
+                                <option value="900">900px</option>
+                                <option value="864">864px</option>
+                            </select>
+                        </div>
+                        <div class="col-md-4">
+                            <label for="bulkTimezone" class="form-label">Timezone</label>
+                            <select class="form-select" id="bulkTimezone">
+                                <option value="random">Random</option>
+                                <option value="Europe/Moscow">Europe/Moscow</option>
+                                <option value="America/New_York">America/New_York</option>
+                                <option value="Europe/London">Europe/London</option>
+                                <option value="Asia/Tokyo">Asia/Tokyo</option>
+                                <option value="Europe/Paris">Europe/Paris</option>
+                                <option value="America/Los_Angeles">America/Los_Angeles</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="row mt-3">
+                        <div class="col-md-4">
+                            <label for="bulkLanguage" class="form-label">Language</label>
+                            <select class="form-select" id="bulkLanguage">
+                                <option value="random">Random</option>
+                                <option value="ru-RU">Russian (ru-RU)</option>
+                                <option value="en-US">English (en-US)</option>
+                                <option value="en-GB">English UK (en-GB)</option>
+                                <option value="ja-JP">Japanese (ja-JP)</option>
+                                <option value="fr-FR">French (fr-FR)</option>
+                                <option value="de-DE">German (de-DE)</option>
+                            </select>
+                        </div>
+                        <div class="col-md-4">
+                            <label for="bulkPlatform" class="form-label">Platform</label>
+                            <select class="form-select" id="bulkPlatform">
+                                <option value="random">Random</option>
+                                <option value="Win32">Windows</option>
+                                <option value="MacIntel">macOS</option>
+                                <option value="Linux x86_64">Linux</option>
+                            </select>
+                        </div>
+                        <div class="col-md-4">
+                            <label for="bulkUserAgent" class="form-label">User Agent</label>
+                            <select class="form-select" id="bulkUserAgent">
+                                <option value="generate">Auto Generate</option>
+                                <option value="chrome">Chrome Only</option>
+                                <option value="firefox">Firefox Only</option>
+                                <option value="safari">Safari Only</option>
+                                <option value="mixed">Mixed Browsers</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="mt-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="autoStartWarmup">
+                            <label class="form-check-label" for="autoStartWarmup">
+                                Start warmup automatically after creation
+                            </label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="randomizeAll" checked>
+                            <label class="form-check-label" for="randomizeAll">
+                                Randomize all parameters for each profile
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="mt-3">
+                        <div class="alert alert-info">
+                            <i class="bi bi-info-circle"></i>
+                            <strong>Note:</strong> Creating many profiles at once may take a few moments. Each profile will have unique fingerprints and parameters.
+                        </div>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-success" onclick="bulkCreateProfiles()">
+                    <i class="bi bi-stack"></i> Create Profiles
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+// Global state
+let currentPage = 1;
+let currentPerPage = 50;
+let currentFilters = {};
+
+// Load profiles on page load
+document.addEventListener('DOMContentLoaded', function() {
+    loadProfiles();
+
+    // Auto-refresh every 15 seconds for large-scale systems
+    setInterval(loadProfiles, 15000);
+
+    // Update overall progress every 5 seconds
+    setInterval(updateOverallProgress, 5000);
+
+    // Add event listeners for real-time filtering
+    document.getElementById('searchProfiles').addEventListener('input', debounce(applyFilters, 500));
+    document.getElementById('statusFilter').addEventListener('change', applyFilters);
+    document.getElementById('warmupFilter').addEventListener('change', applyFilters);
+    document.getElementById('perPageSelect').addEventListener('change', function() {
+        currentPerPage = parseInt(this.value);
+        currentPage = 1;
+        loadProfiles();
+    });
+});
+
+function loadProfiles(page = currentPage) {
+    const params = new URLSearchParams({
+        page: page,
+        per_page: currentPerPage,
+        ...currentFilters
+    });
+
+    // Show loading state
+    document.getElementById('profilesTableBody').innerHTML =
+        '<tr><td colspan="9" class="text-center py-4"><div class="spinner-border spinner-border-sm"></div> Loading profiles...</td></tr>';
+
+    fetch(`/api/profiles?${params}`)
+        .then(response => response.json())
+        .then(data => {
+            currentPage = page;
+
+            // Update overall progress
+            updateOverallProgressDisplay(data.overall_progress);
+
+            // Update profiles table
+            updateProfilesTable(data.profiles);
+
+            // Update pagination
+            updatePagination(data.pagination);
+
+            // Update count badge
+            document.getElementById('profilesCountBadge').textContent =
+                `${data.pagination.total_count} profiles`;
+        })
+        .catch(error => {
+            console.error('Error loading profiles:', error);
+            document.getElementById('profilesTableBody').innerHTML =
+                '<tr><td colspan="9" class="text-center text-danger py-4">Error loading profiles</td></tr>';
+            document.getElementById('profilesCountBadge').textContent = 'Error';
+        });
+}
+
+function updateOverallProgress() {
+    fetch('/api/profiles-overall-progress')
+        .then(response => response.json())
+        .then(progress => updateOverallProgressDisplay(progress))
+        .catch(error => console.log('Progress update error:', error));
+}
+
+function updateOverallProgressDisplay(progress) {
+    if (!progress) return;
+
+    const progressBar = document.getElementById('overallProgressBar');
+    const progressText = document.getElementById('overallProgressText');
+
+    // Update progress bar
+    progressBar.style.width = progress.warmup_percentage + '%';
+    progressBar.setAttribute('aria-valuenow', progress.warmup_percentage);
+    progressBar.querySelector('.progress-text').textContent = progress.warmup_percentage + '%';
+
+    // Update progress text
+    progressText.textContent = progress.warmup_percentage + '%';
+
+    // Update counters
+    document.getElementById('warmedCount').textContent = progress.warmed_profiles;
+    document.getElementById('warmingCount').textContent = progress.warming_profiles;
+    document.getElementById('pendingCount').textContent = progress.pending_profiles;
+    document.getElementById('totalCount').textContent = progress.total_profiles;
+
+    // Update progress bar color based on status
+    progressBar.className = 'progress-bar progress-bar-striped ' + getProgressBarColor(progress.status);
+    if (progress.warming_profiles > 0) {
+        progressBar.classList.add('progress-bar-animated');
+    } else {
+        progressBar.classList.remove('progress-bar-animated');
+    }
+
+    // Update estimated time
+    const timeElement = document.getElementById('estimatedTime');
+    if (progress.estimated_time_remaining > 0) {
+        const hours = Math.floor(progress.estimated_time_remaining / 60);
+        const minutes = progress.estimated_time_remaining % 60;
+        timeElement.textContent = `Estimated time remaining: ${hours}h ${minutes}m`;
+    } else if (progress.status === 'completed') {
+        timeElement.textContent = '✅ All profiles warmed up successfully!';
+    } else {
+        timeElement.textContent = '';
+    }
+}
+
+function updateProfilesTable(profiles) {
+    const tbody = document.getElementById('profilesTableBody');
+
+    if (!profiles || profiles.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="9" class="text-center py-4">No profiles found</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = profiles.map(profile => `
+        <tr data-profile-id="${profile.id}">
+            <td><span class="badge bg-light text-dark">${profile.id}</span></td>
+            <td><strong>${profile.name}</strong></td>
+            <td><span class="badge bg-${getStatusColor(profile.status)}">${profile.status}</span></td>
+            <td><small title="${profile.user_agent || 'Auto-generated'}">${
+                profile.user_agent ? profile.user_agent.substring(0, 25) + '...' : 'Auto'
+            }</small></td>
+            <td><small>${profile.viewport_width}x${profile.viewport_height}</small></td>
+            <td>
+                <span class="badge ${getWarmupBadgeColor(profile)}">
+                    ${getWarmupStatusText(profile)}
+                </span>
+            </td>
+            <td>
+                <span class="badge bg-${profile.total_sessions > 0 ? 'success' : 'secondary'}">
+                    ${profile.total_sessions > 0 ? Math.round((profile.successful_sessions / profile.total_sessions) * 100) + '%' : 'N/A'}
+                </span>
+            </td>
+            <td><small>${new Date(profile.created_at).toLocaleDateString()}</small></td>
+            <td>
+                <div class="btn-group btn-group-sm">
+                    <button class="btn btn-outline-primary btn-sm" onclick="startWarmup(${profile.id})"
+                            title="Start Warmup" ${profile.warmup_completed ? 'disabled' : ''}>
+                        <i class="bi bi-play"></i>
+                    </button>
+                    <button class="btn btn-outline-info btn-sm" onclick="editProfile(${profile.id})" title="Edit">
+                        <i class="bi bi-pencil"></i>
+                    </button>
+                    <button class="btn btn-outline-danger btn-sm" onclick="deleteProfile(${profile.id})" title="Delete">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function updatePagination(pagination) {
+    const paginationElement = document.getElementById('pagination');
+    const paginationInfo = document.getElementById('paginationInfo');
+
+    // Update pagination info
+    const startItem = (pagination.page - 1) * pagination.per_page + 1;
+    const endItem = Math.min(pagination.page * pagination.per_page, pagination.total_count);
+    paginationInfo.textContent = `Showing ${startItem} - ${endItem} of ${pagination.total_count} profiles`;
+
+    // Build pagination HTML
+    let paginationHTML = '';
+
+    // Previous button
+    paginationHTML += `
+        <li class="page-item ${!pagination.has_prev ? 'disabled' : ''}">
+            <button class="page-link" onclick="loadProfiles(${pagination.page - 1})" ${!pagination.has_prev ? 'disabled' : ''}>
+                <i class="bi bi-chevron-left"></i>
+            </button>
+        </li>
+    `;
+
+    // Page numbers (show max 5 pages around current page)
+    const startPage = Math.max(1, pagination.page - 2);
+    const endPage = Math.min(pagination.total_pages, pagination.page + 2);
+
+    if (startPage > 1) {
+        paginationHTML += `
+            <li class="page-item">
+                <button class="page-link" onclick="loadProfiles(1)">1</button>
+            </li>
+        `;
+        if (startPage > 2) {
+            paginationHTML += '<li class="page-item disabled"><span class="page-link">...</span></li>';
+        }
+    }
+
+    for (let i = startPage; i <= endPage; i++) {
+        paginationHTML += `
+            <li class="page-item ${i === pagination.page ? 'active' : ''}">
+                <button class="page-link" onclick="loadProfiles(${i})">${i}</button>
+            </li>
+        `;
+    }
+
+    if (endPage < pagination.total_pages) {
+        if (endPage < pagination.total_pages - 1) {
+            paginationHTML += '<li class="page-item disabled"><span class="page-link">...</span></li>';
+        }
+        paginationHTML += `
+            <li class="page-item">
+                <button class="page-link" onclick="loadProfiles(${pagination.total_pages})">${pagination.total_pages}</button>
+            </li>
+        `;
+    }
+
+    // Next button
+    paginationHTML += `
+        <li class="page-item ${!pagination.has_next ? 'disabled' : ''}">
+            <button class="page-link" onclick="loadProfiles(${pagination.page + 1})" ${!pagination.has_next ? 'disabled' : ''}>
+                <i class="bi bi-chevron-right"></i>
+            </button>
+        </li>
+    `;
+
+    paginationElement.innerHTML = paginationHTML;
+}
+
+// Filter and utility functions
+function applyFilters() {
+    currentFilters = {};
+
+    const search = document.getElementById('searchProfiles').value.trim();
+    const status = document.getElementById('statusFilter').value;
+    const warmup = document.getElementById('warmupFilter').value;
+
+    if (search) currentFilters.search = search;
+    if (status) currentFilters.status = status;
+    if (warmup) currentFilters.warmup_status = warmup;
+
+    currentPage = 1; // Reset to first page when filtering
+    loadProfiles();
+}
+
+function clearFilters() {
+    document.getElementById('searchProfiles').value = '';
+    document.getElementById('statusFilter').value = '';
+    document.getElementById('warmupFilter').value = '';
+
+    currentFilters = {};
+    currentPage = 1;
+    loadProfiles();
+}
+
+function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+        const later = () => {
+            clearTimeout(timeout);
+            func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+    };
+}
+
+function getStatusColor(status) {
+    const colors = {
+        'created': 'secondary',
+        'warming_up': 'warning',
+        'warmed': 'success',
+        'active': 'primary',
+        'blocked': 'danger',
+        'error': 'danger'
+    };
+    return colors[status] || 'secondary';
+}
+
+function getProgressBarColor(status) {
+    const colors = {
+        'completed': 'bg-success',
+        'in_progress': 'bg-warning',
+        'partial': 'bg-info',
+        'not_started': 'bg-secondary',
+        'no_profiles': 'bg-light'
+    };
+    return colors[status] || 'bg-secondary';
+}
+
+function getWarmupBadgeColor(profile) {
+    if (profile.warmup_completed) return 'bg-success text-white';
+    if (profile.status === 'warming_up') return 'bg-warning text-dark';
+    return 'bg-secondary text-white';
+}
+
+function getWarmupStatusText(profile) {
+    if (profile.warmup_completed) return '✅ Complete';
+    if (profile.status === 'warming_up') return '🔥 Warming...';
+    if (profile.status === 'error') return '❌ Error';
+    return '⏳ Pending';
+}
+
+function refreshProfiles() {
+    loadProfiles(currentPage);
+}
+
+function createProfile() {
+    const formData = {
+        name: document.getElementById('profileName').value,
+        viewport_width: parseInt(document.getElementById('viewportWidth').value),
+        viewport_height: parseInt(document.getElementById('viewportHeight').value),
+        timezone: document.getElementById('timezone').value,
+        language: document.getElementById('language').value,
+        user_agent: document.getElementById('userAgent').value || ''
+    };
+
+    fetch('/api/profiles', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(formData)
+    })
+    .then(response => response.json())
+    .then(profile => {
+        bootstrap.Modal.getInstance(document.getElementById('addProfileModal')).hide();
+        loadProfiles();
+        document.getElementById('addProfileForm').reset();
+        alert('Profile created successfully!');
+    })
+    .catch(error => {
+        console.error('Error creating profile:', error);
+        alert('Error creating profile');
+    });
+}
+
+function startWarmup(profileId) {
+    if (confirm('Start warmup process for this profile?\n\nThis will:\n• Visit 7-10 popular websites\n• Spend 30+ minutes browsing\n• Build natural browser history\n• Create cookies and cache\n\nProfile will be ready for Yandex Maps tasks after completion.')) {
+        // Update UI immediately to show warming up status
+        const row = document.querySelector(`tr[data-profile-id="${profileId}"]`);
+        if (row) {
+            const statusCell = row.children[2];
+            statusCell.innerHTML = '<span class="badge bg-warning">warming_up</span>';
+
+            const warmupStatusCell = row.children[6];
+            warmupStatusCell.innerHTML = '<span class="badge bg-warning">Warming Up... 🔥</span>';
+        }
+
+        fetch(`/api/profiles/${profileId}/start-warmup`, {method: 'POST'})
+            .then(response => response.json())
+            .then(result => {
+                showWarmupStartedNotification(profileId);
+                loadProfiles();
+            })
+            .catch(error => {
+                console.error('Error starting warmup:', error);
+                alert('Error starting warmup: ' + error.message);
+                loadProfiles(); // Refresh to show actual state
+            });
+    }
+}
+
+function startBulkWarmup() {
+    // Get current overall progress to show user what will happen
+    fetch('/api/profiles-overall-progress')
+        .then(response => response.json())
+        .then(progress => {
+            if (!progress.can_start_bulk_warmup) {
+                alert('No profiles available for warmup. All profiles are either already warmed up or currently warming up.');
+                return;
+            }
+
+            const pendingCount = progress.pending_profiles;
+            const estimatedHours = Math.ceil((pendingCount * 30) / 60); // 30 min per profile
+
+            if (confirm(`🚀 BULK WARMUP - Large Scale Operation
+
+• Profiles to warmup: ${pendingCount}
+• Estimated time: ${estimatedHours} hours
+• Current system load: ${progress.warming_profiles} profiles warming
+• Recommended for: Systems handling 1000+ profiles
+
+Each profile will:
+• Visit 10-20 unique domains from our pool
+• Build natural browsing history
+• Generate realistic cookies & cache
+• Take 30-60 minutes per profile
+
+This is optimized for large-scale operations. Continue?`)) {
+
+                // Show enhanced loading state
+                const bulkWarmupBtn = document.querySelector('button[onclick="startBulkWarmup()"]');
+                const originalText = bulkWarmupBtn.innerHTML;
+                bulkWarmupBtn.disabled = true;
+                bulkWarmupBtn.innerHTML = '<i class="bi bi-rocket spin"></i> Launching...';
+
+                fetch('/api/profiles-bulk-warmup', {method: 'POST'})
+                    .then(response => response.json())
+                    .then(result => {
+                        showEnhancedNotification(result);
+                        // Refresh current page to see updated data
+                        loadProfiles(currentPage);
+                    })
+                    .catch(error => {
+                        console.error('Error starting bulk warmup:', error);
+                        alert('Error starting bulk warmup: ' + error.message);
+                    })
+                    .finally(() => {
+                        // Restore button state
+                        bulkWarmupBtn.disabled = false;
+                        bulkWarmupBtn.innerHTML = originalText;
+                    });
+            }
+        })
+        .catch(error => {
+            console.error('Error getting progress stats:', error);
+            alert('Error getting system stats. Please try again.');
+        });
+}
+
+function showEnhancedNotification(result) {
+    const notification = document.createElement('div');
+    notification.className = 'alert alert-success alert-dismissible fade show position-fixed';
+    notification.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 600px; box-shadow: 0 8px 16px rgba(0,0,0,0.15);';
+
+    const mode = result.celery_available ? 'Real Browser Automation' : 'Simulation Mode';
+    const modeIcon = result.celery_available ? '🚀' : '🔧';
+    const modeClass = result.celery_available ? 'text-success' : 'text-warning';
+
+    let message = `
+        <div class="d-flex align-items-start">
+            <div class="me-3">
+                <i class="bi bi-rocket-takeoff h4 text-success mb-0"></i>
+            </div>
+            <div class="flex-grow-1">
+                <h6 class="alert-heading mb-2">🎯 Bulk Warmup Launched Successfully!</h6>
+                <p class="mb-2">
+                    <strong>${result.started_count}</strong> profiles queued for warmup<br>
+                    <small class="${modeClass}">Mode: ${modeIcon} ${mode}</small>
+                </p>
+                <div class="small text-muted">
+                    ⏱️ Progress updates every 5 seconds<br>
+                    📊 System optimized for large-scale operations<br>
+                    🎲 Each profile gets unique domains for realistic diversity
+                </div>
+            </div>
+        </div>
+    `;
+
+    notification.innerHTML = message + `
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    `;
+
+    document.body.appendChild(notification);
+
+    // Auto remove after 10 seconds
+    setTimeout(() => {
+        if (notification.parentNode) {
+            notification.remove();
+        }
+    }, 10000);
+}
+
+function showWarmupStartedNotification(profileId) {
+    const notification = document.createElement('div');
+    notification.className = 'alert alert-info alert-dismissible fade show position-fixed';
+    notification.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 400px;';
+    notification.innerHTML = `
+        <i class="bi bi-fire"></i>
+        <strong>Warmup Started!</strong><br>
+        Profile #${profileId} is now warming up...<br>
+        <small>Expected completion: 30-60 minutes</small>
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    `;
+
+    document.body.appendChild(notification);
+
+    // Auto-remove after 5 seconds
+    setTimeout(() => {
+        if (notification.parentNode) {
+            notification.remove();
+        }
+    }, 5000);
+}
+
+function deleteProfile(profileId) {
+    if (confirm('Are you sure you want to delete this profile?')) {
+        fetch(`/api/profiles/${profileId}`, {method: 'DELETE'})
+            .then(() => {
+                loadProfiles();
+                alert('Profile deleted successfully!');
+            })
+            .catch(error => {
+                console.error('Error deleting profile:', error);
+                alert('Error deleting profile');
+            });
+    }
+}
+
+function editProfile(profileId) {
+    alert('Edit functionality coming soon!');
+}
+
+function bulkCreateProfiles() {
+    const count = parseInt(document.getElementById('profileCount').value);
+    const namePrefix = document.getElementById('profileNamePrefix').value;
+    const autoStartWarmup = document.getElementById('autoStartWarmup').checked;
+    const randomizeAll = document.getElementById('randomizeAll').checked;
+
+    if (count < 1 || count > 50) {
+        alert('Please enter a number between 1 and 50');
+        return;
+    }
+
+    if (!namePrefix.trim()) {
+        alert('Please enter a name prefix');
+        return;
+    }
+
+    const config = {
+        viewport_width: document.getElementById('bulkViewportWidth').value,
+        viewport_height: document.getElementById('bulkViewportHeight').value,
+        timezone: document.getElementById('bulkTimezone').value,
+        language: document.getElementById('bulkLanguage').value,
+        platform: document.getElementById('bulkPlatform').value,
+        user_agent_type: document.getElementById('bulkUserAgent').value
+    };
+
+    const requestData = {
+        count: count,
+        name_prefix: namePrefix,
+        config: config,
+        auto_start_warmup: autoStartWarmup,
+        randomize_all: randomizeAll
+    };
+
+    // Show loading state
+    const createBtn = document.querySelector('#bulkCreateModal .btn-success');
+    const originalText = createBtn.innerHTML;
+    createBtn.innerHTML = '<i class="spinner-border spinner-border-sm"></i> Creating...';
+    createBtn.disabled = true;
+
+    fetch('/api/profiles-bulk-create', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestData)
+    })
+    .then(response => {
+        if (!response.ok) {
+            throw new Error('Network response was not ok');
+        }
+        return response.json();
+    })
+    .then(result => {
+        bootstrap.Modal.getInstance(document.getElementById('bulkCreateModal')).hide();
+        loadProfiles();
+        document.getElementById('bulkCreateForm').reset();
+
+        // Reset default values
+        document.getElementById('profileCount').value = 5;
+        document.getElementById('profileNamePrefix').value = 'Profile-';
+        document.getElementById('randomizeAll').checked = true;
+
+        alert(`Successfully created ${result.created_count} profiles!${result.warmup_started ? ' Warmup started automatically.' : ''}`);
+    })
+    .catch(error => {
+        console.error('Error creating profiles:', error);
+        alert('Error creating profiles: ' + error.message);
+    })
+    .finally(() => {
+        // Restore button state
+        createBtn.innerHTML = originalText;
+        createBtn.disabled = false;
+    });
+}
+
+// Helper functions for random generation
+function getRandomViewportWidth() {
+    const widths = [1366, 1920, 1440, 1536, 1280, 1600];
+    return widths[Math.floor(Math.random() * widths.length)];
+}
+
+function getRandomViewportHeight() {
+    const heights = [768, 1080, 900, 864, 720, 1200];
+    return heights[Math.floor(Math.random() * heights.length)];
+}
+
+function getRandomTimezone() {
+    const timezones = [
+        'Europe/Moscow', 'America/New_York', 'Europe/London',
+        'Asia/Tokyo', 'Europe/Paris', 'America/Los_Angeles',
+        'Australia/Sydney', 'Asia/Shanghai', 'Europe/Berlin'
+    ];
+    return timezones[Math.floor(Math.random() * timezones.length)];
+}
+
+function getRandomLanguage() {
+    const languages = ['ru-RU', 'en-US', 'en-GB', 'ja-JP', 'fr-FR', 'de-DE', 'es-ES'];
+    return languages[Math.floor(Math.random() * languages.length)];
+}
+
+function getRandomPlatform() {
+    const platforms = ['Win32', 'MacIntel', 'Linux x86_64'];
+    return platforms[Math.floor(Math.random() * platforms.length)];
+}
+
+// Update form when randomize option changes
+document.addEventListener('DOMContentLoaded', function() {
+    const randomizeCheckbox = document.getElementById('randomizeAll');
+    if (randomizeCheckbox) {
+        randomizeCheckbox.addEventListener('change', function() {
+            const isRandomize = this.checked;
+            const selects = ['bulkViewportWidth', 'bulkViewportHeight', 'bulkTimezone', 'bulkLanguage', 'bulkPlatform'];
+
+            selects.forEach(selectId => {
+                const select = document.getElementById(selectId);
+                if (isRandomize) {
+                    select.value = 'random';
+                    select.disabled = true;
+                } else {
+                    select.disabled = false;
+                }
+            });
+        });
+
+        // Trigger change event to set initial state
+        randomizeCheckbox.dispatchEvent(new Event('change'));
+    }
+});
+
+function clearAllProfiles() {
+    // Get current profiles count first
+    fetch('/api/profiles?page=1&per_page=1')
+        .then(response => response.json())
+        .then(data => {
+            const totalProfiles = data.pagination.total_count;
+
+            if (totalProfiles === 0) {
+                alert('❌ Нет профилей для удаления');
+                return;
+            }
+
+            if (confirm(`🗑️ ОЧИСТИТЬ ВСЕ ПРОФИЛИ
+
+⚠️  ВНИМАНИЕ: Это действие нельзя отменить!
+
+Будет удалено:
+• ${totalProfiles} профилей из базы данных
+• Все папки браузерных профилей
+• Вся история прогрева и куки
+• Все данные профилей навсегда
+
+Вы уверены что хотите продолжить?`)) {
+
+                // Second confirmation for safety
+                if (confirm(`❌ ФИНАЛЬНОЕ ПОДТВЕРЖДЕНИЕ
+
+Удалить ВСЕ ${totalProfiles} профилей?
+
+Введите "УДАЛИТЬ ВСЕ" в следующем диалоге для подтверждения.`)) {
+
+                    const confirmation = prompt('Для подтверждения введите: УДАЛИТЬ ВСЕ');
+
+                    if (confirmation === 'УДАЛИТЬ ВСЕ') {
+                        performClearAllProfiles(totalProfiles);
+                    } else {
+                        alert('❌ Операция отменена - неверный текст подтверждения');
+                    }
+                }
+            }
+        })
+        .catch(error => {
+            console.error('Error getting profiles count:', error);
+            alert('Ошибка получения количества профилей');
+        });
+}
+
+function performClearAllProfiles(totalProfiles) {
+    // Show loading state
+    const clearBtn = document.querySelector('button[onclick="clearAllProfiles()"]');
+    const originalText = clearBtn.innerHTML;
+    clearBtn.disabled = true;
+    clearBtn.innerHTML = '<i class="spinner-border spinner-border-sm"></i> Удаляю...';
+
+    // Create progress notification
+    const notification = document.createElement('div');
+    notification.className = 'alert alert-warning alert-dismissible position-fixed';
+    notification.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 400px;';
+    notification.innerHTML = `
+        <i class="bi bi-trash3-fill"></i>
+        <strong>Удаление профилей...</strong><br>
+        <div class="progress mt-2" style="height: 6px;">
+            <div class="progress-bar progress-bar-striped progress-bar-animated bg-danger" style="width: 0%"></div>
+        </div>
+        <small id="clear-progress-text">Инициализация...</small>
+    `;
+    document.body.appendChild(notification);
+
+    const progressBar = notification.querySelector('.progress-bar');
+    const progressText = notification.querySelector('#clear-progress-text');
+
+    // Call bulk delete API endpoint
+    fetch('/api/profiles-clear-all', {
+        method: 'DELETE',
+        headers: {
+            'Content-Type': 'application/json',
+        }
+    })
+    .then(response => response.json())
+    .then(result => {
+        // Update progress to 100%
+        progressBar.style.width = '100%';
+        progressText.textContent = `Удалено ${result.deleted_count} профилей`;
+
+        // Success notification
+        setTimeout(() => {
+            notification.remove();
+
+            const successNotification = document.createElement('div');
+            successNotification.className = 'alert alert-success alert-dismissible fade show position-fixed';
+            successNotification.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 400px;';
+            successNotification.innerHTML = `
+                <i class="bi bi-check-circle-fill"></i>
+                <strong>✅ Очистка завершена!</strong><br>
+                Удалено: ${result.deleted_count} профилей<br>
+                Очищены: ${result.files_deleted} файлов<br>
+                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+            `;
+            document.body.appendChild(successNotification);
+
+            // Auto-remove after 8 seconds
+            setTimeout(() => {
+                if (successNotification.parentNode) {
+                    successNotification.remove();
+                }
+            }, 8000);
+        }, 1000);
+
+        // Refresh the profiles view
+        loadProfiles();
+    })
+    .catch(error => {
+        console.error('Error clearing profiles:', error);
+        notification.remove();
+
+        const errorNotification = document.createElement('div');
+        errorNotification.className = 'alert alert-danger alert-dismissible fade show position-fixed';
+        errorNotification.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 400px;';
+        errorNotification.innerHTML = `
+            <i class="bi bi-exclamation-triangle-fill"></i>
+            <strong>❌ Ошибка удаления</strong><br>
+            ${error.message}<br>
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        `;
+        document.body.appendChild(errorNotification);
+
+        setTimeout(() => {
+            if (errorNotification.parentNode) {
+                errorNotification.remove();
+            }
+        }, 5000);
+    })
+    .finally(() => {
+        // Restore button state
+        clearBtn.innerHTML = originalText;
+        clearBtn.disabled = false;
+    });
+}
+</script>
+{% endblock %}

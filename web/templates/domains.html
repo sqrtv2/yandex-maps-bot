@@ -1,0 +1,364 @@
+{% extends "base.html" %}
+
+{% block title %}Domain Management - Yandex Maps Profile Visitor{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2">Domain Management</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <div class="btn-group me-2">
+            <button type="button" class="btn btn-sm btn-primary" onclick="reloadDomains()">
+                <i class="bi bi-arrow-clockwise"></i> Reload Domains
+            </button>
+            <button type="button" class="btn btn-sm btn-warning" onclick="resetAllHistory()">
+                <i class="bi bi-trash"></i> Reset History
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="loadStats()">
+                <i class="bi bi-bar-chart"></i> Refresh Stats
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Domain Statistics -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card bg-primary text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="qualityDomainsCount">0</div>
+                        <div class="small">Quality Domains</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-star h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-info text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="totalDomainsCount">0</div>
+                        <div class="small">Total Domains</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-globe h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-success text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="profilesWithHistory">0</div>
+                        <div class="small">Profiles with History</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-people h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-warning text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="avgDomainsPerProfile">0</div>
+                        <div class="small">Avg Domains/Profile</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-graph-up h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Domain Preview Section -->
+<div class="row mb-4">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Domain Preview for Profile</h5>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <label for="previewProfileId" class="form-label">Profile ID</label>
+                    <div class="row">
+                        <div class="col-md-8">
+                            <input type="number" class="form-control" id="previewProfileId" min="1" value="1">
+                        </div>
+                        <div class="col-md-4">
+                            <button type="button" class="btn btn-outline-primary w-100" onclick="previewDomains()">
+                                <i class="bi bi-eye"></i> Preview Domains
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <div id="domainPreview" class="mt-3">
+                    <p class="text-muted">Select a profile ID and click "Preview Domains" to see which domains will be used for warmup.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h6 class="card-title mb-0">Category Domains</h6>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <select class="form-select" id="categorySelect" onchange="previewByCategory()">
+                        <option value="">Select category...</option>
+                        <option value="social">Social Media</option>
+                        <option value="news">News & Media</option>
+                        <option value="search">Search Engines</option>
+                        <option value="ecommerce">E-Commerce</option>
+                        <option value="education">Education</option>
+                        <option value="social,news">Social + News</option>
+                        <option value="search,ecommerce">Search + E-Commerce</option>
+                    </select>
+                </div>
+                <div id="categoryPreview">
+                    <p class="text-muted small">Choose a category to see available domains.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Domain Usage Info -->
+<div class="alert alert-info">
+    <h6><i class="bi bi-info-circle"></i> How Domain System Works</h6>
+    <ul class="mb-0">
+        <li><strong>Unique per Profile:</strong> Each profile gets a different random set of domains to avoid identical cookies</li>
+        <li><strong>History Tracking:</strong> System remembers which domains each profile has used</li>
+        <li><strong>Auto Rotation:</strong> When domains are exhausted, history resets automatically</li>
+        <li><strong>Quality Filtering:</strong> Only reliable, fast-loading domains are used for warmup</li>
+        <li><strong>Categories:</strong> Domains are categorized (social, news, search, etc.) for better diversity</li>
+    </ul>
+</div>
+
+<!-- Domain Management Actions -->
+<div class="row">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h6 class="card-title mb-0">Profile History Management</h6>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <label for="resetProfileId" class="form-label">Reset History for Profile</label>
+                    <div class="row">
+                        <div class="col-md-8">
+                            <input type="number" class="form-control" id="resetProfileId" min="1" placeholder="Profile ID">
+                        </div>
+                        <div class="col-md-4">
+                            <button type="button" class="btn btn-outline-warning w-100" onclick="resetProfileHistory()">
+                                Reset
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <p class="text-muted small">Reset domain usage history for a specific profile. This allows the profile to use all domains again.</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h6 class="card-title mb-0">System Status</h6>
+            </div>
+            <div class="card-body">
+                <div id="systemStatus">
+                    <div class="d-flex justify-content-between">
+                        <span>Domain Manager:</span>
+                        <span class="badge bg-secondary" id="domainManagerStatus">Loading...</span>
+                    </div>
+                    <div class="d-flex justify-content-between mt-2">
+                        <span>Files Loaded:</span>
+                        <span class="badge bg-secondary" id="filesLoadedStatus">Loading...</span>
+                    </div>
+                    <div class="d-flex justify-content-between mt-2">
+                        <span>Last Updated:</span>
+                        <span class="text-muted small" id="lastUpdated">-</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+// Load stats on page load
+document.addEventListener('DOMContentLoaded', function() {
+    loadStats();
+});
+
+function loadStats() {
+    fetch('/api/domains/stats')
+        .then(response => response.json())
+        .then(data => {
+            const stats = data.domain_stats;
+
+            document.getElementById('qualityDomainsCount').textContent = stats.total_quality_domains;
+            document.getElementById('totalDomainsCount').textContent = stats.total_all_domains;
+            document.getElementById('profilesWithHistory').textContent = stats.profiles_with_history;
+            document.getElementById('avgDomainsPerProfile').textContent = Math.round(stats.avg_domains_per_profile);
+
+            // Update status indicators
+            document.getElementById('domainManagerStatus').textContent = data.domains_available ? 'Available' : 'Unavailable';
+            document.getElementById('domainManagerStatus').className = `badge bg-${data.domains_available ? 'success' : 'danger'}`;
+
+            document.getElementById('filesLoadedStatus').textContent = data.files_loaded ? 'Yes' : 'No';
+            document.getElementById('filesLoadedStatus').className = `badge bg-${data.files_loaded ? 'success' : 'warning'}`;
+
+            document.getElementById('lastUpdated').textContent = new Date().toLocaleString();
+        })
+        .catch(error => {
+            console.error('Error loading domain stats:', error);
+            showNotification('Error loading domain statistics', 'danger');
+        });
+}
+
+function previewDomains() {
+    const profileId = document.getElementById('previewProfileId').value;
+    if (!profileId) {
+        alert('Please enter a profile ID');
+        return;
+    }
+
+    fetch(`/api/domains/preview/${profileId}?count=15`)
+        .then(response => response.json())
+        .then(data => {
+            const previewDiv = document.getElementById('domainPreview');
+
+            let html = `<h6>Preview for Profile ${data.profile_id} (${data.count} domains):</h6>`;
+            html += '<div class="row">';
+
+            data.domains.forEach((domain, index) => {
+                const displayDomain = domain.replace('https://', '').replace('http://', '');
+                html += `
+                    <div class="col-md-6 mb-2">
+                        <span class="badge bg-light text-dark">${index + 1}. ${displayDomain}</span>
+                    </div>
+                `;
+            });
+
+            html += '</div>';
+            previewDiv.innerHTML = html;
+        })
+        .catch(error => {
+            console.error('Error previewing domains:', error);
+            showNotification('Error previewing domains', 'danger');
+        });
+}
+
+function previewByCategory() {
+    const categories = document.getElementById('categorySelect').value;
+    if (!categories) {
+        document.getElementById('categoryPreview').innerHTML = '<p class="text-muted small">Choose a category to see available domains.</p>';
+        return;
+    }
+
+    fetch(`/api/domains/categories?categories=${categories}&count=10`)
+        .then(response => response.json())
+        .then(data => {
+            const previewDiv = document.getElementById('categoryPreview');
+
+            let html = `<small class="fw-bold">${data.categories.join(' + ')} (${data.count}):</small><br>`;
+
+            data.domains.forEach(domain => {
+                const displayDomain = domain.replace('https://', '').replace('http://', '');
+                html += `<span class="badge bg-primary me-1 mb-1" style="font-size: 10px;">${displayDomain}</span>`;
+            });
+
+            previewDiv.innerHTML = html;
+        })
+        .catch(error => {
+            console.error('Error previewing category domains:', error);
+        });
+}
+
+function reloadDomains() {
+    if (confirm('Reload domains from files? This will update the domain list with any new domains.')) {
+        fetch('/api/domains/reload', {method: 'POST'})
+            .then(response => response.json())
+            .then(data => {
+                showNotification(data.message, 'success');
+                loadStats();
+            })
+            .catch(error => {
+                console.error('Error reloading domains:', error);
+                showNotification('Error reloading domains', 'danger');
+            });
+    }
+}
+
+function resetAllHistory() {
+    if (confirm('Reset domain history for ALL profiles? This will allow all profiles to use all domains again.')) {
+        fetch('/api/domains/reset-history', {method: 'POST'})
+            .then(response => response.json())
+            .then(data => {
+                showNotification(data.message, 'warning');
+                loadStats();
+            })
+            .catch(error => {
+                console.error('Error resetting history:', error);
+                showNotification('Error resetting domain history', 'danger');
+            });
+    }
+}
+
+function resetProfileHistory() {
+    const profileId = document.getElementById('resetProfileId').value;
+    if (!profileId) {
+        alert('Please enter a profile ID');
+        return;
+    }
+
+    if (confirm(`Reset domain history for profile ${profileId}?`)) {
+        fetch(`/api/domains/reset-history?profile_id=${profileId}`, {method: 'POST'})
+            .then(response => response.json())
+            .then(data => {
+                showNotification(data.message, 'info');
+                document.getElementById('resetProfileId').value = '';
+                loadStats();
+            })
+            .catch(error => {
+                console.error('Error resetting profile history:', error);
+                showNotification('Error resetting profile history', 'danger');
+            });
+    }
+}
+
+function showNotification(message, type) {
+    const notification = document.createElement('div');
+    notification.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
+    notification.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 400px;';
+    notification.innerHTML = `
+        ${message}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    `;
+
+    document.body.appendChild(notification);
+
+    // Auto-remove after 5 seconds
+    setTimeout(() => {
+        if (notification.parentNode) {
+            notification.remove();
+        }
+    }, 5000);
+}
+</script>
+{% endblock %}

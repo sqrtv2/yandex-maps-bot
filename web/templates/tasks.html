@@ -1,0 +1,472 @@
+{% extends "base.html" %}
+
+{% block title %}Tasks - Yandex Maps Profile Visitor{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2">Tasks</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <div class="btn-group me-2">
+            <button type="button" class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#addTaskModal">
+                <i class="bi bi-plus-circle"></i> Add Task
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="refreshTasks()">
+                <i class="bi bi-arrow-clockwise"></i> Refresh
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-warning" onclick="pauseAllTasks()">
+                <i class="bi bi-pause"></i> Pause All
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Task Statistics -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card bg-primary text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="totalTasks">0</div>
+                        <div class="small">Total Tasks</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-list-task h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-success text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="completedTasks">0</div>
+                        <div class="small">Completed</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-check-circle h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-warning text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="runningTasks">0</div>
+                        <div class="small">Running</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-play-circle h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-danger text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="failedTasks">0</div>
+                        <div class="small">Failed</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-x-circle h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Filter and Search -->
+<div class="row mb-3">
+    <div class="col-md-4">
+        <select class="form-select" id="taskTypeFilter" onchange="filterTasks()">
+            <option value="">All Task Types</option>
+            <option value="warmup">Warmup Tasks</option>
+            <option value="yandex_visit">Yandex Visit Tasks</option>
+            <option value="maintenance">Maintenance Tasks</option>
+        </select>
+    </div>
+    <div class="col-md-4">
+        <select class="form-select" id="taskStatusFilter" onchange="filterTasks()">
+            <option value="">All Statuses</option>
+            <option value="pending">Pending</option>
+            <option value="running">Running</option>
+            <option value="completed">Completed</option>
+            <option value="failed">Failed</option>
+            <option value="paused">Paused</option>
+        </select>
+    </div>
+    <div class="col-md-4">
+        <input type="text" class="form-control" id="taskSearch" placeholder="Search tasks..." onkeyup="filterTasks()">
+    </div>
+</div>
+
+<!-- Tasks Table -->
+<div class="table-responsive">
+    <table class="table table-striped table-sm">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Type</th>
+                <th>Target</th>
+                <th>Profile</th>
+                <th>Status</th>
+                <th>Priority</th>
+                <th>Progress</th>
+                <th>Created</th>
+                <th>Duration</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody id="tasksTableBody">
+            <tr>
+                <td colspan="10" class="text-center">Loading tasks...</td>
+            </tr>
+        </tbody>
+    </table>
+</div>
+
+<!-- Add Task Modal -->
+<div class="modal fade" id="addTaskModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Add New Task</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="addTaskForm">
+                    <div class="mb-3">
+                        <label for="taskType" class="form-label">Task Type</label>
+                        <select class="form-select" id="taskType" onchange="toggleTaskFields()">
+                            <option value="warmup">Profile Warmup</option>
+                            <option value="yandex_visit">Yandex Maps Visit</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label for="taskProfile" class="form-label">Browser Profile</label>
+                        <select class="form-select" id="taskProfile" required>
+                            <option value="">Select a profile...</option>
+                        </select>
+                    </div>
+                    <div class="mb-3" id="targetUrlField">
+                        <label for="targetUrl" class="form-label">Target URL</label>
+                        <input type="url" class="form-control" id="targetUrl" placeholder="https://yandex.ru/maps/org/example/123456/">
+                        <div class="form-text">For Yandex Maps visits, enter the organization profile URL</div>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-6">
+                            <label for="taskPriority" class="form-label">Priority</label>
+                            <select class="form-select" id="taskPriority">
+                                <option value="low">Low</option>
+                                <option value="normal" selected>Normal</option>
+                                <option value="high">High</option>
+                                <option value="urgent">Urgent</option>
+                            </select>
+                        </div>
+                        <div class="col-md-6">
+                            <label for="scheduleTime" class="form-label">Schedule Time (optional)</label>
+                            <input type="datetime-local" class="form-control" id="scheduleTime">
+                        </div>
+                    </div>
+                    <div class="mt-3">
+                        <label for="taskNotes" class="form-label">Notes (optional)</label>
+                        <textarea class="form-control" id="taskNotes" rows="2" placeholder="Additional task information..."></textarea>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="createTask()">Create Task</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let allTasks = [];
+
+// Load tasks and profiles on page load
+document.addEventListener('DOMContentLoaded', function() {
+    loadTasks();
+    loadProfiles();
+
+    // Auto-refresh every 30 seconds
+    setInterval(loadTasks, 30000);
+});
+
+function loadTasks() {
+    fetch('/api/tasks')
+        .then(response => response.json())
+        .then(tasks => {
+            allTasks = tasks;
+            updateTaskStats(tasks);
+            displayTasks(tasks);
+        })
+        .catch(error => {
+            console.error('Error loading tasks:', error);
+            document.getElementById('tasksTableBody').innerHTML =
+                '<tr><td colspan="10" class="text-center text-danger">Error loading tasks</td></tr>';
+        });
+}
+
+function loadProfiles() {
+    fetch('/api/profiles')
+        .then(response => response.json())
+        .then(profiles => {
+            const select = document.getElementById('taskProfile');
+            select.innerHTML = '<option value="">Select a profile...</option>' +
+                profiles.map(profile => `<option value="${profile.id}">${profile.name}</option>`).join('');
+        })
+        .catch(error => console.error('Error loading profiles:', error));
+}
+
+function displayTasks(tasks) {
+    const tbody = document.getElementById('tasksTableBody');
+    if (tasks.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" class="text-center">No tasks found. Create a task to get started!</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = tasks.map(task => `
+        <tr>
+            <td>${task.id}</td>
+            <td><span class="badge bg-info">${task.task_type}</span></td>
+            <td title="${task.target_url}">${task.target_url ? (task.target_url.length > 30 ? task.target_url.substring(0, 30) + '...' : task.target_url) : 'Auto'}</td>
+            <td>${task.profile_id}</td>
+            <td><span class="badge bg-${getTaskStatusColor(task.status)}">${task.status}</span></td>
+            <td><span class="badge bg-${getPriorityColor(task.priority)}">${task.priority}</span></td>
+            <td>
+                <div class="progress" style="width: 80px;">
+                    <div class="progress-bar" role="progressbar" style="width: ${getTaskProgress(task)}%"></div>
+                </div>
+                <small>${getTaskProgress(task)}%</small>
+            </td>
+            <td>${new Date(task.created_at).toLocaleString()}</td>
+            <td>${getTaskDuration(task)}</td>
+            <td>
+                <div class="btn-group btn-group-sm">
+                    ${getTaskActions(task)}
+                </div>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function updateTaskStats(tasks) {
+    const total = tasks.length;
+    const completed = tasks.filter(t => t.status === 'completed').length;
+    const running = tasks.filter(t => t.status === 'running').length;
+    const failed = tasks.filter(t => t.status === 'failed').length;
+
+    document.getElementById('totalTasks').textContent = total;
+    document.getElementById('completedTasks').textContent = completed;
+    document.getElementById('runningTasks').textContent = running;
+    document.getElementById('failedTasks').textContent = failed;
+}
+
+function getTaskStatusColor(status) {
+    const colors = {
+        'pending': 'secondary',
+        'running': 'primary',
+        'completed': 'success',
+        'failed': 'danger',
+        'paused': 'warning'
+    };
+    return colors[status] || 'secondary';
+}
+
+function getPriorityColor(priority) {
+    const colors = {
+        'low': 'secondary',
+        'normal': 'info',
+        'high': 'warning',
+        'urgent': 'danger'
+    };
+    return colors[priority] || 'info';
+}
+
+function getTaskProgress(task) {
+    if (task.status === 'completed') return 100;
+    if (task.status === 'failed') return 0;
+    if (task.status === 'running') return Math.floor(Math.random() * 50) + 25; // Simulate progress
+    return 0;
+}
+
+function getTaskDuration(task) {
+    if (task.completed_at) {
+        const duration = new Date(task.completed_at) - new Date(task.started_at);
+        return formatDuration(duration);
+    }
+    if (task.started_at) {
+        const duration = new Date() - new Date(task.started_at);
+        return formatDuration(duration);
+    }
+    return '-';
+}
+
+function formatDuration(ms) {
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+
+    if (hours > 0) return `${hours}h ${minutes % 60}m`;
+    if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+    return `${seconds}s`;
+}
+
+function getTaskActions(task) {
+    const actions = [];
+
+    if (task.status === 'pending') {
+        actions.push('<button class="btn btn-outline-success" onclick="startTask(' + task.id + ')" title="Start"><i class="bi bi-play"></i></button>');
+    }
+
+    if (task.status === 'running') {
+        actions.push('<button class="btn btn-outline-warning" onclick="pauseTask(' + task.id + ')" title="Pause"><i class="bi bi-pause"></i></button>');
+    }
+
+    if (task.status === 'paused') {
+        actions.push('<button class="btn btn-outline-success" onclick="resumeTask(' + task.id + ')" title="Resume"><i class="bi bi-play"></i></button>');
+    }
+
+    if (['failed', 'completed'].includes(task.status)) {
+        actions.push('<button class="btn btn-outline-primary" onclick="retryTask(' + task.id + ')" title="Retry"><i class="bi bi-arrow-clockwise"></i></button>');
+    }
+
+    actions.push('<button class="btn btn-outline-info" onclick="viewTaskDetails(' + task.id + ')" title="Details"><i class="bi bi-eye"></i></button>');
+    actions.push('<button class="btn btn-outline-danger" onclick="deleteTask(' + task.id + ')" title="Delete"><i class="bi bi-trash"></i></button>');
+
+    return actions.join(' ');
+}
+
+function filterTasks() {
+    const typeFilter = document.getElementById('taskTypeFilter').value;
+    const statusFilter = document.getElementById('taskStatusFilter').value;
+    const searchTerm = document.getElementById('taskSearch').value.toLowerCase();
+
+    const filtered = allTasks.filter(task => {
+        const matchesType = !typeFilter || task.task_type === typeFilter;
+        const matchesStatus = !statusFilter || task.status === statusFilter;
+        const matchesSearch = !searchTerm ||
+            task.target_url.toLowerCase().includes(searchTerm) ||
+            task.task_type.toLowerCase().includes(searchTerm);
+
+        return matchesType && matchesStatus && matchesSearch;
+    });
+
+    displayTasks(filtered);
+}
+
+function toggleTaskFields() {
+    const taskType = document.getElementById('taskType').value;
+    const targetUrlField = document.getElementById('targetUrlField');
+    const targetUrl = document.getElementById('targetUrl');
+
+    if (taskType === 'warmup') {
+        targetUrlField.style.display = 'none';
+        targetUrl.required = false;
+    } else {
+        targetUrlField.style.display = 'block';
+        targetUrl.required = true;
+    }
+}
+
+function refreshTasks() {
+    loadTasks();
+}
+
+function createTask() {
+    const formData = {
+        task_type: document.getElementById('taskType').value,
+        profile_id: parseInt(document.getElementById('taskProfile').value),
+        target_url: document.getElementById('targetUrl').value || 'auto',
+        priority: document.getElementById('taskPriority').value,
+        scheduled_at: document.getElementById('scheduleTime').value || null,
+        notes: document.getElementById('taskNotes').value || null
+    };
+
+    if (!formData.profile_id) {
+        alert('Please select a browser profile');
+        return;
+    }
+
+    fetch('/api/tasks', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(formData)
+    })
+    .then(response => response.json())
+    .then(task => {
+        bootstrap.Modal.getInstance(document.getElementById('addTaskModal')).hide();
+        loadTasks();
+        document.getElementById('addTaskForm').reset();
+        toggleTaskFields();
+        alert('Task created successfully!');
+    })
+    .catch(error => {
+        console.error('Error creating task:', error);
+        alert('Error creating task');
+    });
+}
+
+function startTask(taskId) {
+    fetch(`/api/tasks/${taskId}/start`, {method: 'POST'})
+        .then(() => loadTasks())
+        .catch(error => console.error('Error starting task:', error));
+}
+
+function pauseTask(taskId) {
+    fetch(`/api/tasks/${taskId}/pause`, {method: 'POST'})
+        .then(() => loadTasks())
+        .catch(error => console.error('Error pausing task:', error));
+}
+
+function resumeTask(taskId) {
+    fetch(`/api/tasks/${taskId}/resume`, {method: 'POST'})
+        .then(() => loadTasks())
+        .catch(error => console.error('Error resuming task:', error));
+}
+
+function retryTask(taskId) {
+    fetch(`/api/tasks/${taskId}/retry`, {method: 'POST'})
+        .then(() => loadTasks())
+        .catch(error => console.error('Error retrying task:', error));
+}
+
+function deleteTask(taskId) {
+    if (confirm('Are you sure you want to delete this task?')) {
+        fetch(`/api/tasks/${taskId}`, {method: 'DELETE'})
+            .then(() => loadTasks())
+            .catch(error => console.error('Error deleting task:', error));
+    }
+}
+
+function pauseAllTasks() {
+    if (confirm('Pause all running tasks?')) {
+        fetch('/api/tasks/pause-all', {method: 'POST'})
+            .then(() => loadTasks())
+            .catch(error => console.error('Error pausing tasks:', error));
+    }
+}
+
+function viewTaskDetails(taskId) {
+    alert('Task details functionality coming soon!');
+}
+
+// Initialize task type field
+document.addEventListener('DOMContentLoaded', function() {
+    toggleTaskFields();
+});
+</script>
+{% endblock %}

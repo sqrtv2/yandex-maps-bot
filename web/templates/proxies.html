@@ -1,0 +1,321 @@
+{% extends "base.html" %}
+
+{% block title %}Proxy Servers - Yandex Maps Profile Visitor{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2">Proxy Servers</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <div class="btn-group me-2">
+            <button type="button" class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#addProxyModal">
+                <i class="bi bi-plus-circle"></i> Add Proxy
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="refreshProxies()">
+                <i class="bi bi-arrow-clockwise"></i> Refresh
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-info" onclick="testAllProxies()">
+                <i class="bi bi-check-circle"></i> Test All
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Proxy Statistics -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card bg-primary text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="totalProxies">0</div>
+                        <div class="small">Total Proxies</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-shield-lock h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-success text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="workingProxies">0</div>
+                        <div class="small">Working Proxies</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-check-circle h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-warning text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="failedProxies">0</div>
+                        <div class="small">Failed Proxies</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-x-circle h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-info text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="avgResponseTime">0ms</div>
+                        <div class="small">Avg Response Time</div>
+                    </div>
+                    <div class="ms-auto">
+                        <i class="bi bi-speedometer2 h2"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Proxies Table -->
+<div class="table-responsive">
+    <table class="table table-striped table-sm">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Name</th>
+                <th>Address</th>
+                <th>Type</th>
+                <th>Status</th>
+                <th>Response Time</th>
+                <th>Usage Count</th>
+                <th>Success Rate</th>
+                <th>Last Check</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody id="proxiesTableBody">
+            <tr>
+                <td colspan="10" class="text-center">Loading proxies...</td>
+            </tr>
+        </tbody>
+    </table>
+</div>
+
+<!-- Add Proxy Modal -->
+<div class="modal fade" id="addProxyModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Add New Proxy Server</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="addProxyForm">
+                    <div class="mb-3">
+                        <label for="proxyName" class="form-label">Proxy Name</label>
+                        <input type="text" class="form-control" id="proxyName" required>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-8">
+                            <label for="proxyHost" class="form-label">Host/IP</label>
+                            <input type="text" class="form-control" id="proxyHost" required placeholder="proxy.example.com">
+                        </div>
+                        <div class="col-md-4">
+                            <label for="proxyPort" class="form-label">Port</label>
+                            <input type="number" class="form-control" id="proxyPort" required placeholder="8080">
+                        </div>
+                    </div>
+                    <div class="mb-3 mt-3">
+                        <label for="proxyType" class="form-label">Proxy Type</label>
+                        <select class="form-select" id="proxyType">
+                            <option value="http">HTTP</option>
+                            <option value="socks5">SOCKS5</option>
+                            <option value="https">HTTPS</option>
+                        </select>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-6">
+                            <label for="proxyUsername" class="form-label">Username (optional)</label>
+                            <input type="text" class="form-control" id="proxyUsername">
+                        </div>
+                        <div class="col-md-6">
+                            <label for="proxyPassword" class="form-label">Password (optional)</label>
+                            <input type="password" class="form-control" id="proxyPassword">
+                        </div>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="createProxy()">Add Proxy</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+// Load proxies on page load
+document.addEventListener('DOMContentLoaded', function() {
+    loadProxies();
+});
+
+function loadProxies() {
+    fetch('/api/proxies')
+        .then(response => response.json())
+        .then(proxies => {
+            updateProxyStats(proxies);
+            const tbody = document.getElementById('proxiesTableBody');
+            if (proxies.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="10" class="text-center">No proxies found. Add some proxies to get started!</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = proxies.map(proxy => `
+                <tr>
+                    <td>${proxy.id}</td>
+                    <td><strong>${proxy.name}</strong></td>
+                    <td>${proxy.host}:${proxy.port}</td>
+                    <td><span class="badge bg-secondary">${proxy.proxy_type.toUpperCase()}</span></td>
+                    <td><span class="badge bg-${getProxyStatusColor(proxy.status)}">${proxy.status}</span></td>
+                    <td>${proxy.response_time_ms || '-'}ms</td>
+                    <td>${proxy.usage_count}</td>
+                    <td>
+                        <span class="badge bg-${proxy.usage_count > 0 ? 'success' : 'secondary'}">
+                            ${proxy.usage_count > 0 ? Math.round((proxy.successful_requests / proxy.usage_count) * 100) + '%' : 'N/A'}
+                        </span>
+                    </td>
+                    <td>${proxy.last_checked ? new Date(proxy.last_checked).toLocaleString() : 'Never'}</td>
+                    <td>
+                        <div class="btn-group btn-group-sm">
+                            <button class="btn btn-outline-primary" onclick="testProxy(${proxy.id})" title="Test Proxy">
+                                <i class="bi bi-check"></i>
+                            </button>
+                            <button class="btn btn-outline-info" onclick="editProxy(${proxy.id})" title="Edit">
+                                <i class="bi bi-pencil"></i>
+                            </button>
+                            <button class="btn btn-outline-danger" onclick="deleteProxy(${proxy.id})" title="Delete">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </div>
+                    </td>
+                </tr>
+            `).join('');
+        })
+        .catch(error => {
+            console.error('Error loading proxies:', error);
+            document.getElementById('proxiesTableBody').innerHTML =
+                '<tr><td colspan="10" class="text-center text-danger">Error loading proxies</td></tr>';
+        });
+}
+
+function updateProxyStats(proxies) {
+    const total = proxies.length;
+    const working = proxies.filter(p => p.status === 'working').length;
+    const failed = proxies.filter(p => p.status === 'failed').length;
+    const avgTime = total > 0 ? Math.round(proxies.reduce((sum, p) => sum + (p.response_time_ms || 0), 0) / total) : 0;
+
+    document.getElementById('totalProxies').textContent = total;
+    document.getElementById('workingProxies').textContent = working;
+    document.getElementById('failedProxies').textContent = failed;
+    document.getElementById('avgResponseTime').textContent = avgTime + 'ms';
+}
+
+function getProxyStatusColor(status) {
+    const colors = {
+        'working': 'success',
+        'failed': 'danger',
+        'testing': 'warning',
+        'unknown': 'secondary'
+    };
+    return colors[status] || 'secondary';
+}
+
+function refreshProxies() {
+    loadProxies();
+}
+
+function createProxy() {
+    const formData = {
+        name: document.getElementById('proxyName').value,
+        host: document.getElementById('proxyHost').value,
+        port: parseInt(document.getElementById('proxyPort').value),
+        proxy_type: document.getElementById('proxyType').value,
+        username: document.getElementById('proxyUsername').value || null,
+        password: document.getElementById('proxyPassword').value || null
+    };
+
+    fetch('/api/proxies', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(formData)
+    })
+    .then(response => response.json())
+    .then(proxy => {
+        bootstrap.Modal.getInstance(document.getElementById('addProxyModal')).hide();
+        loadProxies();
+        document.getElementById('addProxyForm').reset();
+        alert('Proxy added successfully!');
+    })
+    .catch(error => {
+        console.error('Error creating proxy:', error);
+        alert('Error adding proxy');
+    });
+}
+
+function testProxy(proxyId) {
+    fetch(`/api/proxies/${proxyId}/test`, {method: 'POST'})
+        .then(response => response.json())
+        .then(result => {
+            alert(`Proxy test result: ${result.status}`);
+            loadProxies();
+        })
+        .catch(error => {
+            console.error('Error testing proxy:', error);
+            alert('Error testing proxy');
+        });
+}
+
+function testAllProxies() {
+    if (confirm('Test all proxies? This may take a few minutes.')) {
+        fetch('/api/proxies/test-all', {method: 'POST'})
+            .then(response => response.json())
+            .then(result => {
+                alert('All proxies tested!');
+                loadProxies();
+            })
+            .catch(error => {
+                console.error('Error testing proxies:', error);
+                alert('Error testing proxies');
+            });
+    }
+}
+
+function deleteProxy(proxyId) {
+    if (confirm('Are you sure you want to delete this proxy?')) {
+        fetch(`/api/proxies/${proxyId}`, {method: 'DELETE'})
+            .then(() => {
+                loadProxies();
+                alert('Proxy deleted successfully!');
+            })
+            .catch(error => {
+                console.error('Error deleting proxy:', error);
+                alert('Error deleting proxy');
+            });
+    }
+}
+
+function editProxy(proxyId) {
+    alert('Edit functionality coming soon!');
+}
+</script>
+{% endblock %}

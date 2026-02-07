@@ -1,0 +1,727 @@
+{% extends "base.html" %}
+
+{% block title %}Yandex Maps Targets - Yandex Maps Profile Visitor{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2"><i class="bi bi-geo-alt-fill"></i> Яндекс Карты - Цели</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addTargetModal">
+            <i class="bi bi-plus-circle"></i> Добавить URL
+        </button>
+        <button type="button" class="btn btn-outline-secondary ms-2" onclick="loadTargets()">
+            <i class="bi bi-arrow-clockwise"></i> Обновить
+        </button>
+    </div>
+</div>
+
+<!-- Statistics -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-body">
+                <h6 class="card-title text-muted">Всего целей</h6>
+                <h3 id="totalTargets">0</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-body">
+                <h6 class="card-title text-muted">Активных</h6>
+                <h3 id="activeTargets" class="text-success">0</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-body">
+                <h6 class="card-title text-muted">Посещений сегодня</h6>
+                <h3 id="visitsToday">0</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-body">
+                <h6 class="card-title text-muted">Успешность</h6>
+                <h3 id="successRate">0%</h3>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Targets Table -->
+<div class="card">
+    <div class="card-header">
+        <h5 class="mb-0">Список целей для посещения</h5>
+    </div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-hover" id="targetsTable">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>URL / Название</th>
+                        <th>Посещений/день</th>
+                        <th>Профили</th>
+                        <th>Статистика</th>
+                        <th>Статус</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody id="targetsTableBody">
+                    <tr>
+                        <td colspan="7" class="text-center">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">Загрузка...</span>
+                            </div>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Add Target Modal -->
+<div class="modal fade" id="addTargetModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Добавить новую цель</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="addTargetForm">
+                    <div class="mb-3">
+                        <label class="form-label">URL Яндекс Карт *</label>
+                        <input type="url" class="form-control" id="targetUrl" required 
+                               placeholder="https://yandex.ru/maps/org/...">
+                        <small class="text-muted">Вставьте ссылку на организацию в Яндекс Картах</small>
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Название (опционально)</label>
+                            <input type="text" class="form-control" id="targetTitle">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Название организации</label>
+                            <input type="text" class="form-control" id="targetOrgName">
+                        </div>
+                    </div>
+
+                    <h6 class="mt-4 mb-3"><i class="bi bi-calendar-check"></i> Настройки посещений</h6>
+                    
+                    <div class="row">
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Посещений в день</label>
+                            <input type="number" class="form-control" id="visitsPerDay" value="10" min="1" max="1000">
+                            <small class="text-muted">Сколько раз посещать</small>
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Интервал от (мин)</label>
+                            <input type="number" class="form-control" id="minInterval" value="60" min="1">
+                            <small class="text-muted">Минимальная пауза</small>
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Интервал до (мин)</label>
+                            <input type="number" class="form-control" id="maxInterval" value="180" min="1">
+                            <small class="text-muted">Максимальная пауза</small>
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Время на странице от (сек)</label>
+                            <input type="number" class="form-control" id="minDuration" value="120" min="10">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Время на странице до (сек)</label>
+                            <input type="number" class="form-control" id="maxDuration" value="600" min="10">
+                        </div>
+                    </div>
+
+                    <h6 class="mt-4 mb-3"><i class="bi bi-cpu"></i> Многопоточность</h6>
+                    
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Одновременных посещений</label>
+                            <input type="number" class="form-control" id="concurrentVisits" value="1" min="1" max="10">
+                            <small class="text-muted">Сколько профилей одновременно</small>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Приоритет (1-10)</label>
+                            <input type="number" class="form-control" id="priority" value="5" min="1" max="10">
+                            <small class="text-muted">Выше = важнее</small>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="useDifferentProfiles" checked>
+                            <label class="form-check-label" for="useDifferentProfiles">
+                                Использовать разные профили
+                            </label>
+                        </div>
+                    </div>
+
+                    <h6 class="mt-4 mb-3"><i class="bi bi-gear"></i> Действия на странице</h6>
+                    
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="form-check">
+                                <input class="form-check-input action-check" type="checkbox" value="scroll" checked>
+                                <label class="form-check-label">Прокрутка страницы</label>
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input action-check" type="checkbox" value="photos" checked>
+                                <label class="form-check-label">Просмотр фотографий</label>
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input action-check" type="checkbox" value="reviews" checked>
+                                <label class="form-check-label">Чтение отзывов</label>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="form-check">
+                                <input class="form-check-input action-check" type="checkbox" value="contacts" checked>
+                                <label class="form-check-label">Клик по контактам</label>
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input action-check" type="checkbox" value="map" checked>
+                                <label class="form-check-label">Работа с картой</label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mb-3 mt-3">
+                        <label class="form-label">Заметки</label>
+                        <textarea class="form-control" id="targetNotes" rows="2"></textarea>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                <button type="button" class="btn btn-primary" onclick="addTarget()">Добавить</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Visit Logs Panel -->
+<div class="card mt-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-journal-text"></i> Лог посещений</h5>
+        <div>
+            <span id="autoRefreshLabel" class="badge bg-success me-2">Авто-обновление: ВКЛ</span>
+            <button class="btn btn-sm btn-outline-secondary" onclick="toggleAutoRefresh()">
+                <i class="bi bi-arrow-clockwise"></i>
+            </button>
+        </div>
+    </div>
+    <div class="card-body p-0" style="max-height: 400px; overflow-y: auto;">
+        <table class="table table-sm table-hover mb-0" id="visitLogsTable">
+            <thead class="table-light sticky-top">
+                <tr>
+                    <th style="width:50px">ID</th>
+                    <th style="width:100px">Профиль</th>
+                    <th style="width:90px">Статус</th>
+                    <th>Лог</th>
+                    <th style="width:80px">Время</th>
+                    <th style="width:140px">Дата</th>
+                </tr>
+            </thead>
+            <tbody id="visitLogsBody">
+                <tr><td colspan="6" class="text-center text-muted py-3">Загрузка...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Edit Target Modal -->
+<div class="modal fade" id="editTargetModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Редактировать цель</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="editTargetForm">
+                    <input type="hidden" id="editTargetId">
+                    <!-- Same form fields as add modal -->
+                    <div class="mb-3">
+                        <label class="form-label">URL Яндекс Карт *</label>
+                        <input type="url" class="form-control" id="editTargetUrl" required>
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Название</label>
+                            <input type="text" class="form-control" id="editTargetTitle">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Название организации</label>
+                            <input type="text" class="form-control" id="editTargetOrgName">
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Посещений в день</label>
+                            <input type="number" class="form-control" id="editVisitsPerDay" min="1">
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Интервал от (мин)</label>
+                            <input type="number" class="form-control" id="editMinInterval" min="1">
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Интервал до (мин)</label>
+                            <input type="number" class="form-control" id="editMaxInterval" min="1">
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Одновременных посещений</label>
+                            <input type="number" class="form-control" id="editConcurrentVisits" min="1" max="10">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Приоритет (1-10)</label>
+                            <input type="number" class="form-control" id="editPriority" min="1" max="10">
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="editUseDifferentProfiles">
+                            <label class="form-check-label">Использовать разные профили</label>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">Заметки</label>
+                        <textarea class="form-control" id="editTargetNotes" rows="2"></textarea>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                <button type="button" class="btn btn-primary" onclick="updateTarget()">Сохранить</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let targets = [];
+
+// Load targets on page load
+document.addEventListener('DOMContentLoaded', function() {
+    loadTargets();
+});
+
+async function loadTargets() {
+    try {
+        const response = await fetch('/api/yandex-targets');
+        targets = await response.json();
+        
+        updateStatistics();
+        renderTargetsTable();
+    } catch (error) {
+        console.error('Error loading targets:', error);
+        showAlert('danger', 'Ошибка загрузки целей');
+    }
+}
+
+function updateStatistics() {
+    const totalTargets = targets.length;
+    const activeTargets = targets.filter(t => t.is_active).length;
+    const totalVisits = targets.reduce((sum, t) => sum + t.total_visits, 0);
+    const successfulVisits = targets.reduce((sum, t) => sum + t.successful_visits, 0);
+    const successRate = totalVisits > 0 ? ((successfulVisits / totalVisits) * 100).toFixed(1) : 0;
+    
+    document.getElementById('totalTargets').textContent = totalTargets;
+    document.getElementById('activeTargets').textContent = activeTargets;
+    document.getElementById('visitsToday').textContent = totalVisits;
+    document.getElementById('successRate').textContent = successRate + '%';
+}
+
+function renderTargetsTable() {
+    const tbody = document.getElementById('targetsTableBody');
+    
+    if (targets.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" class="text-center">Нет добавленных целей</td></tr>';
+        return;
+    }
+    
+    tbody.innerHTML = targets.map(target => `
+        <tr>
+            <td>${target.id}</td>
+            <td>
+                <div><a href="${target.url}" target="_blank" class="text-decoration-none">${target.url.substring(0, 50)}...</a></div>
+                <small class="text-muted">${target.title || target.organization_name || 'Без названия'}</small>
+            </td>
+            <td><span class="badge bg-info">${target.visits_per_day}</span></td>
+            <td id="profile-visits-${target.id}">
+                <small class="text-muted">Загрузка...</small>
+            </td>
+            <td>
+                <small>
+                    ${target.total_visits} всего<br>
+                    ${target.successful_visits} успешно
+                </small>
+            </td>
+            <td>
+                <span class="badge ${target.is_active ? 'bg-success' : 'bg-secondary'}">
+                    ${target.is_active ? 'Активна' : 'Неактивна'}
+                </span>
+            </td>
+            <td>
+                <button class="btn btn-sm btn-success" onclick="visitNow(${target.id})" title="Посетить сейчас">
+                    <i class="bi bi-eye"></i> Сейчас
+                </button>
+                <button class="btn btn-sm btn-outline-primary" onclick="editTarget(${target.id})" title="Редактировать">
+                    <i class="bi bi-pencil"></i>
+                </button>
+                <button class="btn btn-sm btn-outline-${target.is_active ? 'warning' : 'success'}" 
+                        onclick="toggleTarget(${target.id})" title="${target.is_active ? 'Остановить' : 'Запустить'}">
+                    <i class="bi bi-${target.is_active ? 'pause' : 'play'}-fill"></i>
+                </button>
+                <button class="btn btn-sm btn-outline-danger" onclick="deleteTarget(${target.id})" title="Удалить">
+                    <i class="bi bi-trash"></i>
+                </button>
+            </td>
+        </tr>
+    `).join('');
+    
+    // Load profile visit info for each target
+    targets.forEach(target => loadProfileVisits(target.id));
+}
+
+async function loadProfileVisits(targetId) {
+    try {
+        const response = await fetch(`/api/yandex-targets/${targetId}/profile-visits`);
+        const data = await response.json();
+        const cell = document.getElementById(`profile-visits-${targetId}`);
+        if (!cell) return;
+        
+        const used = data.used_profiles || 0;
+        const total = data.total_warmed_profiles || 0;
+        const available = data.available_profiles || 0;
+        
+        let profileNames = '';
+        if (data.visits && data.visits.length > 0) {
+            profileNames = data.visits.map(v => v.profile_name).join(', ');
+        }
+        
+        const barPercent = total > 0 ? Math.round((used / total) * 100) : 0;
+        const barColor = available > 0 ? 'bg-success' : 'bg-danger';
+        
+        cell.innerHTML = `
+            <div style="min-width: 120px">
+                <div class="d-flex justify-content-between mb-1">
+                    <small><strong>${used}/${total}</strong></small>
+                    <small class="text-muted">${available > 0 ? `ост. ${available}` : '<span class=\\"text-danger\\">все\\u00a0исп.</span>'}</small>
+                </div>
+                <div class="progress" style="height: 6px;">
+                    <div class="progress-bar ${barColor}" style="width: ${barPercent}%"></div>
+                </div>
+                ${profileNames ? `<small class="text-muted d-block mt-1" title="${profileNames}">${profileNames.substring(0, 30)}${profileNames.length > 30 ? '...' : ''}</small>` : ''}
+                ${used > 0 ? `<button class="btn btn-outline-secondary btn-sm mt-1 py-0 px-1" style="font-size:0.7rem" onclick="resetVisits(${targetId})">
+                    <i class="bi bi-arrow-counterclockwise"></i> Сброс
+                </button>` : ''}
+            </div>
+        `;
+    } catch (error) {
+        console.error(`Error loading profile visits for target ${targetId}:`, error);
+    }
+}
+
+async function resetVisits(targetId) {
+    if (!confirm('Сбросить все записи профилей для этой карты?\\nВсе профили снова смогут её посещать.')) return;
+    
+    try {
+        const response = await fetch(`/api/yandex-targets/${targetId}/reset-visits`, { method: 'POST' });
+        if (response.ok) {
+            const data = await response.json();
+            showAlert('success', data.message);
+            loadTargets();
+        } else {
+            showAlert('danger', 'Ошибка сброса');
+        }
+    } catch (error) {
+        console.error('Error resetting visits:', error);
+        showAlert('danger', 'Ошибка сброса посещений');
+    }
+}
+    `).join('');
+}
+
+async function addTarget() {
+    const targetData = {
+        url: document.getElementById('targetUrl').value,
+        title: document.getElementById('targetTitle').value,
+        organization_name: document.getElementById('targetOrgName').value,
+        visits_per_day: parseInt(document.getElementById('visitsPerDay').value),
+        min_interval_minutes: parseInt(document.getElementById('minInterval').value),
+        max_interval_minutes: parseInt(document.getElementById('maxInterval').value),
+        min_visit_duration: parseInt(document.getElementById('minDuration').value),
+        max_visit_duration: parseInt(document.getElementById('maxDuration').value),
+        concurrent_visits: parseInt(document.getElementById('concurrentVisits').value),
+        use_different_profiles: document.getElementById('useDifferentProfiles').checked,
+        priority: parseInt(document.getElementById('priority').value),
+        enabled_actions: Array.from(document.querySelectorAll('.action-check:checked'))
+            .map(cb => cb.value).join(','),
+        notes: document.getElementById('targetNotes').value
+    };
+    
+    try {
+        const response = await fetch('/api/yandex-targets', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(targetData)
+        });
+        
+        if (response.ok) {
+            showAlert('success', 'Цель успешно добавлена');
+            bootstrap.Modal.getInstance(document.getElementById('addTargetModal')).hide();
+            document.getElementById('addTargetForm').reset();
+            loadTargets();
+        } else {
+            const error = await response.json();
+            showAlert('danger', 'Ошибка: ' + (error.detail || 'Неизвестная ошибка'));
+        }
+    } catch (error) {
+        console.error('Error adding target:', error);
+        showAlert('danger', 'Ошибка добавления цели');
+    }
+}
+
+async function toggleTarget(targetId) {
+    try {
+        const response = await fetch(`/api/yandex-targets/${targetId}/toggle`, {
+            method: 'POST'
+        });
+        
+        if (response.ok) {
+            showAlert('success', 'Статус цели изменён');
+            loadTargets();
+        } else {
+            showAlert('danger', 'Ошибка изменения статуса');
+        }
+    } catch (error) {
+        console.error('Error toggling target:', error);
+        showAlert('danger', 'Ошибка изменения статуса');
+    }
+}
+
+async function deleteTarget(targetId) {
+    if (!confirm('Удалить эту цель?')) return;
+    
+    try {
+        const response = await fetch(`/api/yandex-targets/${targetId}`, {
+            method: 'DELETE'
+        });
+        
+        if (response.ok) {
+            showAlert('success', 'Цель удалена');
+            loadTargets();
+        } else {
+            showAlert('danger', 'Ошибка удаления цели');
+        }
+    } catch (error) {
+        console.error('Error deleting target:', error);
+        showAlert('danger', 'Ошибка удаления цели');
+    }
+}
+
+function editTarget(targetId) {
+    const target = targets.find(t => t.id === targetId);
+    if (!target) return;
+    
+    document.getElementById('editTargetId').value = target.id;
+    document.getElementById('editTargetUrl').value = target.url;
+    document.getElementById('editTargetTitle').value = target.title || '';
+    document.getElementById('editTargetOrgName').value = target.organization_name || '';
+    document.getElementById('editVisitsPerDay').value = target.visits_per_day;
+    document.getElementById('editMinInterval').value = target.min_interval_minutes;
+    document.getElementById('editMaxInterval').value = target.max_interval_minutes;
+    document.getElementById('editConcurrentVisits').value = target.concurrent_visits;
+    document.getElementById('editPriority').value = target.priority;
+    document.getElementById('editUseDifferentProfiles').checked = target.use_different_profiles;
+    document.getElementById('editTargetNotes').value = target.notes || '';
+    
+    new bootstrap.Modal(document.getElementById('editTargetModal')).show();
+}
+
+async function updateTarget() {
+    const targetId = document.getElementById('editTargetId').value;
+    const targetData = {
+        url: document.getElementById('editTargetUrl').value,
+        title: document.getElementById('editTargetTitle').value,
+        organization_name: document.getElementById('editTargetOrgName').value,
+        visits_per_day: parseInt(document.getElementById('editVisitsPerDay').value),
+        min_interval_minutes: parseInt(document.getElementById('editMinInterval').value),
+        max_interval_minutes: parseInt(document.getElementById('editMaxInterval').value),
+        concurrent_visits: parseInt(document.getElementById('editConcurrentVisits').value),
+        use_different_profiles: document.getElementById('editUseDifferentProfiles').checked,
+        priority: parseInt(document.getElementById('editPriority').value),
+        notes: document.getElementById('editTargetNotes').value
+    };
+    
+    try {
+        const response = await fetch(`/api/yandex-targets/${targetId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(targetData)
+        });
+        
+        if (response.ok) {
+            showAlert('success', 'Цель обновлена');
+            bootstrap.Modal.getInstance(document.getElementById('editTargetModal')).hide();
+            loadTargets();
+        } else {
+            showAlert('danger', 'Ошибка обновления цели');
+        }
+    } catch (error) {
+        console.error('Error updating target:', error);
+        showAlert('danger', 'Ошибка обновления цели');
+    }
+}
+
+function showAlert(type, message) {
+    const alertDiv = document.createElement('div');
+    alertDiv.className = `alert alert-${type} alert-dismissible fade show position-fixed top-0 start-50 translate-middle-x mt-3`;
+    alertDiv.style.zIndex = '9999';
+    alertDiv.innerHTML = `
+        ${message}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    `;
+    document.body.appendChild(alertDiv);
+    
+    setTimeout(() => alertDiv.remove(), 5000);
+}
+
+async function visitNow(targetId) {
+    if (!confirm('Запустить посещение сейчас с видимым браузером?\\n\\nБудет выбран случайный профиль, который ещё не посещал эту карту.')) {
+        return;
+    }
+    
+    try {
+        showAlert('info', '⏳ Запуск посещения... Браузер откроется через несколько секунд');
+        
+        const response = await fetch(`/api/yandex-targets/${targetId}/visit-now`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'}
+        });
+        
+        if (response.ok) {
+            const data = await response.json();
+            showAlert('success', `✅ Посещение запущено!\\nПрофиль: ${data.profile_name}\\nTask ID: ${data.task_id}`);
+            loadTargets();
+            loadVisitLogs(); // Refresh logs immediately
+        } else {
+            const error = await response.json();
+            showAlert('danger', `❌ Ошибка: ${error.detail || 'Не удалось запустить посещение'}`);
+        }
+    } catch (error) {
+        console.error('Error starting visit:', error);
+        showAlert('danger', '❌ Ошибка запуска посещения');
+    }
+}
+
+// === Visit Logs ===
+let autoRefreshEnabled = true;
+let autoRefreshInterval = null;
+
+function startAutoRefresh() {
+    if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+    autoRefreshInterval = setInterval(() => {
+        loadVisitLogs();
+        loadTargets();
+    }, 5000);
+}
+
+function toggleAutoRefresh() {
+    autoRefreshEnabled = !autoRefreshEnabled;
+    const label = document.getElementById('autoRefreshLabel');
+    if (autoRefreshEnabled) {
+        label.textContent = 'Авто-обновление: ВКЛ';
+        label.className = 'badge bg-success me-2';
+        startAutoRefresh();
+    } else {
+        label.textContent = 'Авто-обновление: ВЫКЛ';
+        label.className = 'badge bg-secondary me-2';
+        if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+    }
+}
+
+async function loadVisitLogs() {
+    try {
+        const response = await fetch('/api/visit-logs?limit=20');
+        const logs = await response.json();
+        renderVisitLogs(logs);
+    } catch (error) {
+        console.error('Error loading visit logs:', error);
+    }
+}
+
+function renderVisitLogs(logs) {
+    const tbody = document.getElementById('visitLogsBody');
+    
+    if (!logs || logs.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">Нет записей о посещениях</td></tr>';
+        return;
+    }
+    
+    tbody.innerHTML = logs.map(log => {
+        const statusBadge = getStatusBadge(log.status);
+        const lastLog = log.logs ? log.logs.trim().split('\\n').pop() : '—';
+        const execTime = log.execution_time ? `${log.execution_time.toFixed(0)}с` : '—';
+        const date = log.created_at ? new Date(log.created_at).toLocaleString('ru-RU', {
+            day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'
+        }) : '—';
+        const errorText = log.error_message ? `<br><small class="text-danger">${log.error_message.substring(0, 100)}</small>` : '';
+        
+        return `<tr class="${log.status === 'in_progress' ? 'table-info' : log.status === 'failed' ? 'table-danger' : log.status === 'completed' ? 'table-success' : ''}">
+            <td>${log.id}</td>
+            <td><small>${log.profile_name}</small></td>
+            <td>${statusBadge}</td>
+            <td><small>${escapeHtml(lastLog)}${errorText}</small></td>
+            <td><small>${execTime}</small></td>
+            <td><small>${date}</small></td>
+        </tr>`;
+    }).join('');
+}
+
+function getStatusBadge(status) {
+    const badges = {
+        'pending': '<span class="badge bg-secondary">⏳ Ожидает</span>',
+        'in_progress': '<span class="badge bg-primary"><span class="spinner-border spinner-border-sm" style="width:10px;height:10px"></span> Выполняется</span>',
+        'completed': '<span class="badge bg-success">✅ Готово</span>',
+        'failed': '<span class="badge bg-danger">❌ Ошибка</span>',
+        'retry': '<span class="badge bg-warning">🔄 Повтор</span>',
+        'cancelled': '<span class="badge bg-secondary">⏹ Отмена</span>',
+    };
+    return badges[status] || `<span class="badge bg-secondary">${status}</span>`;
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Start loading logs on page load
+document.addEventListener('DOMContentLoaded', function() {
+    loadVisitLogs();
+    startAutoRefresh();
+});
+
+</script>
+
+{% endblock %}
