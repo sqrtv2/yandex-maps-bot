@@ -32,12 +32,18 @@ class YandexMapTarget(Base):
     concurrent_visits = Column(Integer, default=1)  # How many profiles can visit simultaneously
     use_different_profiles = Column(Boolean, default=True)  # Rotate through different profiles
     
-    # Status & Statistics
+    # Status & Statistics (cumulative)
     is_active = Column(Boolean, default=True)
     total_visits = Column(Integer, default=0)
     successful_visits = Column(Integer, default=0)
     failed_visits = Column(Integer, default=0)
     last_visit_at = Column(DateTime, nullable=True)
+
+    # Daily statistics (reset every day at midnight)
+    today_visits = Column(Integer, default=0)
+    today_successful = Column(Integer, default=0)
+    today_failed = Column(Integer, default=0)
+    stats_reset_date = Column(DateTime, nullable=True)  # date when daily stats were last reset
     
     # Priority & Scheduling
     priority = Column(Integer, default=5)  # 1-10, higher = more important
@@ -74,6 +80,10 @@ class YandexMapTarget(Base):
             "total_visits": self.total_visits,
             "successful_visits": self.successful_visits,
             "failed_visits": self.failed_visits,
+            "today_visits": self.today_visits or 0,
+            "today_successful": self.today_successful or 0,
+            "today_failed": self.today_failed or 0,
+            "stats_reset_date": self.stats_reset_date.isoformat() if self.stats_reset_date else None,
             "last_visit_at": self.last_visit_at.isoformat() if self.last_visit_at else None,
             "priority": self.priority,
             "schedule_type": self.schedule_type,
@@ -124,8 +134,9 @@ class YandexMapTarget(Base):
         time_since_last = (current_time - self.last_visit_at).total_seconds() / 60  # minutes
         
         # Check if enough time has passed (use min interval)
-        if time_since_last < self.min_interval_minutes:
-            return False, f"Too soon (last visit {time_since_last:.1f} min ago)"
+        # Subtract 0.5 min tolerance to avoid race condition with celery beat timing
+        if time_since_last < (self.min_interval_minutes - 0.5):
+            return False, f"Too soon (last visit {time_since_last:.1f} min ago, need {self.min_interval_minutes})"
         
         return True, "Ready for next visit"
     
@@ -147,7 +158,8 @@ class YandexMapTarget(Base):
         time_since_last = (current_time - self.last_visit_at).total_seconds() / 60  # minutes
         
         # If within min interval, don't schedule
-        if time_since_last < self.min_interval_minutes:
+        # Subtract 0.5 min tolerance to avoid race condition with celery beat timing
+        if time_since_last < (self.min_interval_minutes - 0.5):
             return 0
         
         # Calculate average interval for this target (hours in a day / visits per day)

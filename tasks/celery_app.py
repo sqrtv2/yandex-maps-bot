@@ -81,6 +81,14 @@ celery_app.conf.update(
             'task': 'tasks.yandex_maps.schedule_visits',
             'schedule': crontab(minute='*/5'),  # Every 5 minutes
         },
+        'yandex-daily-stats-reset': {
+            'task': 'tasks.yandex_maps.daily_stats_reset',
+            'schedule': crontab(minute=0, hour=0),  # Daily at midnight UTC
+        },
+        'process-health-check': {
+            'task': 'tasks.warmup.auto_fix_stuck_processes',
+            'schedule': crontab(minute='*/10'),  # Every 10 minutes
+        },
     }
 )
 
@@ -92,6 +100,21 @@ celery_app.autodiscover_tasks([
     'tasks.proxy',
     'tasks.maintenance'
 ])
+
+
+# Pre-patch chromedriver once BEFORE any task is dispatched to workers.
+# This avoids the race condition where multiple ForkPoolWorkers try to
+# patch the same binary simultaneously.
+@signals.worker_init.connect
+def _pre_patch_chromedriver_on_worker_init(**kwargs):
+    """Eagerly patch chromedriver when the Celery worker process starts."""
+    try:
+        from core.browser_manager import _ensure_patched_chromedriver
+        path = _ensure_patched_chromedriver()
+        logger.info(f"🔧 Chromedriver pre-patched at worker init: {path}")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to pre-patch chromedriver at worker init: {e}")
+
 
 # Task failure callback
 @celery_app.task(bind=True)

@@ -30,17 +30,27 @@ from app.config import settings
 from .celery_app import BaseTask
 
 
-def _update_task_log(profile_id: int, target_url: str, message: str, status: str = None, error: str = None, result_data: dict = None, exec_time: float = None):
-    """Update the latest non-completed task in DB for this profile+url with log entry and optionally status."""
+def _update_task_log(profile_id: int, target_url: str, message: str, status: str = None, error: str = None, result_data: dict = None, exec_time: float = None, task_id: int = None):
+    """Update the task in DB with log entry and optionally status.
+    
+    If task_id is provided, update that exact task. Otherwise fall back to searching by profile_id + target_url.
+    """
     try:
         with get_db_session() as db:
-            # First try to find a non-completed task (pending or in_progress)
-            task_obj = db.query(Task).filter(
-                Task.profile_id == profile_id,
-                Task.target_url == target_url,
-                Task.task_type == 'yandex_visit',
-                Task.status.notin_(['completed', 'failed'])
-            ).order_by(Task.created_at.desc()).first()
+            task_obj = None
+            
+            # Prefer direct lookup by task_id
+            if task_id:
+                task_obj = db.query(Task).filter(Task.id == task_id).first()
+            
+            # Fallback: find by profile_id + target_url
+            if not task_obj:
+                task_obj = db.query(Task).filter(
+                    Task.profile_id == profile_id,
+                    Task.target_url == target_url,
+                    Task.task_type == 'yandex_visit',
+                    Task.status.notin_(['completed', 'failed'])
+                ).order_by(Task.created_at.desc()).first()
             
             # If setting to completed/failed, allow finding in_progress tasks
             if not task_obj and status in ('completed', 'failed'):
@@ -71,8 +81,8 @@ def _update_task_log(profile_id: int, target_url: str, message: str, status: str
 logger = logging.getLogger(__name__)
 
 
-@shared_task(base=BaseTask, bind=True, max_retries=2, default_retry_delay=60, soft_time_limit=240, time_limit=300)
-def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit_parameters: Dict = None):
+@shared_task(base=BaseTask, bind=True, max_retries=2, default_retry_delay=30, soft_time_limit=180, time_limit=210)
+def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit_parameters: Dict = None, task_id: int = None):
     """
     Visit a Yandex Maps profile and perform realistic interactions.
 
@@ -80,6 +90,7 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
         profile_id: Browser profile to use
         target_url: Yandex Maps profile URL
         visit_parameters: Custom parameters for the visit
+        task_id: DB Task record ID for precise status tracking
     """
     browser_manager = None
     browser_id = None
@@ -91,8 +102,8 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
 
         # Default visit parameters
         default_params = {
-            'min_visit_time': get_setting('yandex_min_visit_time', 120),
-            'max_visit_time': get_setting('yandex_max_visit_time', 600),
+            'min_visit_time': get_setting('yandex_visit_min_time', 10),
+            'max_visit_time': get_setting('yandex_visit_max_time', 20),
             'actions': get_setting('yandex_actions_enabled', [
                 'scroll', 'view_photos', 'read_reviews', 'click_contacts', 'view_map'
             ]),
@@ -135,10 +146,23 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
             db.commit()
 
         logger.info(f"Starting Yandex Maps visit for profile {profile_id}: {target_url}")
-        _update_task_log(profile_id, target_url, f"🚀 Запуск визита профилем {profile_data_from_db['name']}", status='in_progress')
+        _update_task_log(profile_id, target_url, f"🚀 Запуск визита профилем {profile_data_from_db['name']}", status='in_progress', task_id=task_id)
 
         # Initialize managers
         browser_manager = BrowserManager()
+        
+        # Guard: check how many Chrome processes are already running
+        try:
+            import subprocess as _sp
+            chrome_count = int(_sp.run(['sh', '-c', 'pgrep -c chrome || echo 0'], capture_output=True, text=True, timeout=5).stdout.strip())
+            if chrome_count > 50:
+                logger.warning(f"⚠️ Too many Chrome processes ({chrome_count}), cleaning up before launching new one")
+                from core.browser_manager import cleanup_orphaned_chrome
+                cleanup_orphaned_chrome()
+                time.sleep(2)
+        except Exception:
+            pass
+        
         proxy_manager = ProxyManager()
         proxy_manager.load_proxies_from_db()
         captcha_solver = CaptchaSolver()
@@ -161,6 +185,11 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
 
         if proxy_data:
             logger.info(f"Using proxy: {proxy_data['host']}:{proxy_data['port']}")
+        else:
+            error_msg = "🚫 Нет доступных прокси! Визит без прокси запрещён."
+            logger.error(error_msg)
+            _update_task_log(profile_id, target_url, error_msg, status='failed', task_id=task_id)
+            return {'status': 'error', 'error': error_msg, 'profile_id': profile_id, 'target_url': target_url}
 
         # Create profile data
         from core.profile_generator import ProfileGenerator
@@ -168,6 +197,7 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
         profile_data = profile_generator.generate_profile(profile_data_from_db['name'])
 
         # Update with database values
+        # Force ru-RU language for Yandex visits — prevents redirect to yandex.com
         profile_data.update({
             'user_agent': profile_data_from_db['user_agent'],
             'viewport': {
@@ -175,7 +205,7 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
                 'height': profile_data_from_db['viewport_height']
             },
             'timezone': profile_data_from_db['timezone'],
-            'language': profile_data_from_db['language']
+            'language': 'ru-RU'
         })
 
         # Create browser session
@@ -185,31 +215,40 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
         # Visit Yandex Maps profile
         start_time = time.time()
 
-        # Navigate to target URL
-        _update_task_log(profile_id, target_url, "🌐 Открываем страницу...")
-        if not browser_manager.navigate_to_url(browser_id, target_url, timeout=45):
-            _update_task_log(profile_id, target_url, "❌ Не удалось открыть страницу", status='failed', error='Navigation failed')
+        # Navigate to target URL (use generous timeout for slow proxies)
+        _update_task_log(profile_id, target_url, "🌐 Открываем страницу...", task_id=task_id)
+        if not browser_manager.navigate_to_url(browser_id, target_url, timeout=90):
+            _update_task_log(profile_id, target_url, "❌ Не удалось открыть страницу", status='failed', error='Navigation failed', task_id=task_id)
             raise Exception("Failed to navigate to Yandex Maps profile")
 
-        _update_task_log(profile_id, target_url, "✅ Страница загружена")
+        actual_url = driver.current_url
+        _update_task_log(profile_id, target_url, f"✅ Страница загружена: {actual_url[:120]}", task_id=task_id)
+        logger.info(f"📍 Requested URL: {target_url}")
+        logger.info(f"📍 Actual URL after load: {actual_url}")
+        
+        # Если всё равно произошёл редирект .ru → .com — логируем как предупреждение
+        if 'yandex.com' in actual_url and 'yandex.ru' in target_url:
+            logger.warning(f"⚠️ Yandex redirected .ru → .com despite ru-RU language — possible proxy geo issue")
+            _update_task_log(profile_id, target_url, "⚠️ Редирект на yandex.com — возможно прокси определяется как не-RU", task_id=task_id)
+
         # Wait for page to load
         time.sleep(random.uniform(2, 4))
 
         # Check for captcha or blocks
         if detect_captcha_or_block(driver):
             logger.warning("Captcha or block detected, attempting to solve")
-            _update_task_log(profile_id, target_url, "⚠️ Обнаружена капча, решаем через Capsola...")
+            _update_task_log(profile_id, target_url, "⚠️ Обнаружена капча, решаем через Capsola...", task_id=task_id)
             if not handle_yandex_protection(driver, captcha_solver):
-                _update_task_log(profile_id, target_url, "❌ Не удалось решить капчу", status='failed', error='Captcha not solved')
+                _update_task_log(profile_id, target_url, "❌ Не удалось решить капчу", status='failed', error='Captcha not solved', task_id=task_id)
                 raise Exception("Unable to bypass Yandex protection")
-            _update_task_log(profile_id, target_url, "✅ Капча решена!")
+            _update_task_log(profile_id, target_url, "✅ Капча решена!", task_id=task_id)
 
         # Take initial screenshot
         if settings.save_screenshots:
             browser_manager.take_screenshot(browser_id, f"yandex_visit_{profile_id}_start.png")
 
         # Perform realistic visit actions
-        _update_task_log(profile_id, target_url, "🎯 Выполняем действия на странице...")
+        _update_task_log(profile_id, target_url, "🎯 Выполняем действия на странице...", task_id=task_id)
         visit_results = perform_yandex_visit_actions(
             browser_manager,
             browser_id,
@@ -259,7 +298,7 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
         }
 
         logger.info(f"Yandex Maps visit completed successfully: {result}")
-        _update_task_log(profile_id, target_url, f"🎉 Визит завершён! Время: {total_duration:.0f}с", status='completed', result_data=result, exec_time=total_duration)
+        _update_task_log(profile_id, target_url, f"🎉 Визит завершён! Время: {total_duration:.0f}с", status='completed', result_data=result, exec_time=total_duration, task_id=task_id)
         
         # Update target statistics
         try:
@@ -269,7 +308,10 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
                 if target_obj:
                     target_obj.total_visits = (target_obj.total_visits or 0) + 1
                     target_obj.successful_visits = (target_obj.successful_visits or 0) + 1
-                    target_obj.last_visit_at = datetime.utcnow()
+                    target_obj.today_visits = (target_obj.today_visits or 0) + 1
+                    target_obj.today_successful = (target_obj.today_successful or 0) + 1
+                    # Don't overwrite last_visit_at here — the scheduler sets it
+                    # at dispatch time, so interval checks stay consistent.
                     
                     # Record profile-target visit (one profile visits one target only once)
                     existing_visit = db.query(ProfileTargetVisit).filter(
@@ -297,7 +339,7 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
 
     except Exception as e:
         logger.error(f"Error visiting Yandex Maps profile {profile_id}: {e}")
-        _update_task_log(profile_id, target_url, f"❌ Ошибка: {str(e)[:200]}", status='failed', error=str(e)[:500])
+        _update_task_log(profile_id, target_url, f"❌ Ошибка: {str(e)[:200]}", status='failed', error=str(e)[:500], task_id=task_id)
         
         # Update target failure stats
         try:
@@ -307,6 +349,8 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
                 if target_obj:
                     target_obj.total_visits = (target_obj.total_visits or 0) + 1
                     target_obj.failed_visits = (target_obj.failed_visits or 0) + 1
+                    target_obj.today_visits = (target_obj.today_visits or 0) + 1
+                    target_obj.today_failed = (target_obj.today_failed or 0) + 1
                     db.commit()
         except:
             pass
@@ -321,15 +365,34 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
         except:
             pass
 
-        # Update proxy with failure if used
+        # Update proxy with failure if used — but only for actual proxy errors,
+        # not Chrome crashes or resource issues
         try:
             if proxy_data and 'id' in proxy_data:
-                proxy_manager.update_proxy_stats(proxy_data['id'], False, error_message=str(e))
+                error_str_lower = str(e).lower()
+                is_proxy_error = any(x in error_str_lower for x in [
+                    'proxy', 'tunnel', 'socks', 'err_proxy',
+                    'proxy connection', 'authentication required',
+                ])
+                is_browser_error = any(x in error_str_lower for x in [
+                    'unexpectedly exited', 'session not created',
+                    'connection refused', 'chrome not reachable',
+                    'oom', 'out of memory', 'status code was: -9',
+                    'devtoolsactiveport', 'cannot find chrome',
+                    'unable to bypass', 'navigation failed',
+                    'timeout', 'timed out',
+                ])
+                if is_proxy_error or not is_browser_error:
+                    proxy_manager.update_proxy_stats(proxy_data['id'], False, error_message=str(e))
+                else:
+                    logger.info(f"Skipping proxy failure report — browser error, not proxy: {str(e)[:100]}")
         except:
             pass
 
-        # Retry task if possible
-        if self.request.retries < self.max_retries:
+        # Retry task if possible (but not for Chrome resource issues)
+        error_str = str(e).lower()
+        is_resource_error = any(x in error_str for x in ['connection refused', 'session not created', 'chrome not reachable', 'oom', 'out of memory'])
+        if not is_resource_error and self.request.retries < self.max_retries:
             # Use different proxy on retry
             raise self.retry(exc=e)
 
@@ -342,6 +405,9 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
                 browser_manager.close_browser_session(browser_id)
             except Exception as e:
                 logger.error(f"Error closing browser session: {e}")
+        # Note: Do NOT call cleanup_orphaned_chrome() here — it kills ALL Chrome
+        # processes including those used by other concurrent tasks, causing -9 errors.
+        # close_browser_session() already kills Chrome by PID for this specific session.
 
 
 def detect_captcha_or_block(driver) -> bool:
@@ -357,7 +423,9 @@ def detect_captcha_or_block(driver) -> bool:
         captcha_selectors = [
             "div[class*='CheckboxCaptcha']",
             "div[class*='AdvancedCaptcha']",
+            "div[class*='AdvancedCaptcha_silhouette']",
             "[class*='SmartCaptcha']",
+            "[class*='SilhouetteTask']",
             ".form-captcha",
             ".check-robot",
             "iframe[src*='captcha']",
@@ -432,14 +500,30 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver) -> bool:
 
         # === ШАГ 1: Определяем тип капчи ===
         current_url = driver.current_url.lower()
-        page_source = driver.page_source.lower()
+        page_source = driver.page_source
+        page_source_lower = page_source.lower()
         logger.info(f"🔍 URL: {current_url[:120]}")
+        
+        # ============================================
+        # YANDEX SILHOUETTE / PAZL CAPTCHA (priority — detected before SmartCaptcha)
+        # ============================================
+        is_silhouette = (
+            'advancedcaptcha_silhouette' in page_source_lower or
+            'advancedcaptcha-silhouettetask' in page_source_lower or
+            'silhouette-container' in page_source_lower or
+            '/silhouette' in page_source_lower or
+            'silhouettecaptcha' in page_source_lower
+        )
+        
+        if is_silhouette:
+            logger.info("🧩 Silhouette/PazlCaptcha detected! Solving via Capsola PazlCaptcha API...")
+            return _solve_yandex_silhouette_captcha(driver, screenshot_path)
         
         # ============================================
         # YANDEX SMARTCAPTCHA (showcaptcha page OR embedded)
         # ============================================
         is_captcha_page = 'showcaptcha' in current_url or 'captcha' in current_url
-        is_smartcaptcha_in_source = any(kw in page_source for kw in [
+        is_smartcaptcha_in_source = any(kw in page_source_lower for kw in [
             'smartcaptcha', 'checkboxcaptcha', 'checkbox-captcha', 
             'captcha-api.yandex', 'i\'m not a robot', 'я не робот',
             'advancedcaptcha', 'captcha'
@@ -745,7 +829,19 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str) -> bool:
                 logger.warning("❌ Checkbox captcha failed — no redirect, no image grid")
                 return False
         
-        # ШАГ 4: Image grid is visible — extract images for Capsola
+        # ШАГ 4: Check if this is a Silhouette captcha (redirect to PazlCaptcha solver)
+        try:
+            page_src_check = driver.page_source.lower()
+            if ('advancedcaptcha_silhouette' in page_src_check or
+                'advancedcaptcha-silhouettetask' in page_src_check or
+                'silhouette-container' in page_src_check or
+                '/silhouette' in page_src_check):
+                logger.info("🧩 Silhouette captcha detected after checkbox — switching to PazlCaptcha solver")
+                return _solve_yandex_silhouette_captcha(driver, screenshot_path)
+        except:
+            pass
+        
+        # ШАГ 5: Image grid is visible — extract images for Capsola SmartCaptcha
         logger.info("📸 Extracting SmartCaptcha images for Capsola...")
         
         click_image_data = None
@@ -824,6 +920,327 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str) -> bool:
         
     except Exception as e:
         logger.error(f"❌ Error solving SmartCaptcha: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
+    """Solve Yandex Silhouette/PazlCaptcha using Capsola PazlCaptcha V1 API.
+    
+    This captcha type shows an image with silhouettes that need to be clicked in order.
+    We send the full page HTML to Capsola PazlCaptcha V1 API.
+    The API returns coordinates of clicks to perform.
+    
+    Flow:
+    1. Get full page HTML
+    2. Send to Capsola PazlCaptcha V1
+    3. Parse result (coordinates)
+    4. Click on the image at returned coordinates
+    5. Submit the form
+    """
+    from app.config import settings
+    from core.capsola_solver import create_capsola_solver
+    
+    try:
+        capsola = create_capsola_solver(settings.capsola_api_key)
+        
+        # ШАГ 1: Получаем полный HTML страницы
+        page_html = driver.page_source
+        logger.info(f"🧩 Silhouette captcha: page HTML length = {len(page_html)}")
+        
+        # Save debug screenshot
+        try:
+            debug_ss = f"screenshots/silhouette_debug_{int(time.time())}.png"
+            driver.save_screenshot(debug_ss)
+            debug_html = debug_ss.replace('.png', '.html')
+            with open(debug_html, 'w', encoding='utf-8') as f:
+                f.write(page_html)
+            logger.info(f"📄 Silhouette debug saved: {debug_html}")
+        except:
+            pass
+        
+        # ШАГ 2: Пробуем PazlCaptcha V1 (полный HTML)
+        logger.info("🔄 Sending Silhouette captcha to Capsola PazlCaptcha V1...")
+        result = capsola.solve_pazl_captcha_v1(page_html, max_wait=120)
+        
+        if not result or result.get('status') != 1:
+            logger.warning(f"⚠️ PazlCaptcha V1 failed: {result}")
+            
+            # Fallback: попробуем PazlCaptcha V2 (image + permutations)
+            logger.info("🔄 Trying PazlCaptcha V2 fallback...")
+            result = _try_pazl_captcha_v2(driver, capsola)
+            
+            if not result or result.get('status') != 1:
+                logger.error(f"❌ PazlCaptcha V2 also failed: {result}")
+                # Last fallback: try as SmartCaptcha
+                logger.info("🔄 Final fallback: trying as SmartCaptcha...")
+                return _solve_yandex_showcaptcha(driver, screenshot_path)
+        
+        answer = result.get('response', '')
+        logger.info(f"✅ PazlCaptcha answer: {answer}")
+        
+        # ШАГ 3: Парсим и применяем результат
+        return _apply_silhouette_answer(driver, answer)
+        
+    except Exception as e:
+        logger.error(f"❌ Error solving Silhouette captcha: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def _try_pazl_captcha_v2(driver, capsola) -> Optional[Dict]:
+    """Try solving with PazlCaptcha V2 (image + permutations).
+    
+    Extracts the captcha image and permutation data from the page,
+    sends to Capsola PazlCaptcha V2 API.
+    """
+    try:
+        # Find the main captcha image
+        image_element = None
+        image_selectors = [
+            "[data-testid='silhouette-container'] img",
+            ".AdvancedCaptcha-ImageWrapper img",
+            ".AdvancedCaptcha_silhouette img[alt='Image challenge']",
+            ".AdvancedCaptcha img[alt='Image challenge']",
+        ]
+        
+        for selector in image_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for el in elements:
+                    if el.is_displayed():
+                        image_element = el
+                        logger.info(f"✅ Found silhouette image: {selector}")
+                        break
+            except:
+                continue
+            if image_element:
+                break
+        
+        if not image_element:
+            logger.warning("⚠️ Could not find silhouette image element")
+            return None
+        
+        # Get image as screenshot
+        image_data = image_element.screenshot_as_png
+        logger.info(f"📸 Captured silhouette image: {len(image_data)} bytes")
+        
+        # Try to extract permutations from SSR data  
+        permutations = []
+        try:
+            ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+            if ssr_data:
+                logger.info(f"📋 SSR data keys: {list(ssr_data.keys()) if isinstance(ssr_data, dict) else type(ssr_data)}")
+                # Look for any permutation/task data
+                if isinstance(ssr_data, dict):
+                    for key in ['permutations', 'task', 'taskData', 'puzzleData', 'silhouetteData']:
+                        if key in ssr_data:
+                            permutations = ssr_data[key]
+                            logger.info(f"✅ Found permutations in SSR_DATA.{key}")
+                            break
+        except Exception as e:
+            logger.warning(f"Could not extract SSR data: {e}")
+        
+        # If no permutations from SSR, try to extract from hidden inputs
+        if not permutations:
+            try:
+                rdata_el = driver.find_element(By.CSS_SELECTOR, "input[name='rdata']")
+                rdata_value = rdata_el.get_attribute('value')
+                if rdata_value:
+                    import base64
+                    decoded = base64.b64decode(rdata_value).decode('utf-8')
+                    import json
+                    permutations = json.loads(decoded)
+                    logger.info(f"✅ Extracted permutations from rdata: {type(permutations)}")
+            except Exception as e:
+                logger.debug(f"Could not extract rdata: {e}")
+        
+        if not permutations:
+            logger.warning("⚠️ No permutation data found, sending empty list")
+            permutations = []
+        
+        # Send to PazlCaptcha V2
+        result = capsola.solve_pazl_captcha_v2(image_data, permutations, max_wait=120)
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ PazlCaptcha V2 extraction error: {e}")
+        return None
+
+
+def _apply_silhouette_answer(driver, answer) -> bool:
+    """Apply the PazlCaptcha answer by clicking at the returned coordinates on the captcha image.
+    
+    The answer can be:
+    - Coordinates string: "coordinates:x=34.7,y=108.0;x=234.3,y=72.3" 
+    - Step number: integer step
+    - Comma-separated coords: "x1,y1,x2,y2"
+    """
+    try:
+        logger.info(f"🎯 Applying silhouette answer: {answer}")
+        
+        # Find the clickable image container
+        image_element = None
+        image_selectors = [
+            "[data-testid='silhouette-container'] img",
+            ".AdvancedCaptcha-ImageWrapper img",
+            ".AdvancedCaptcha_silhouette img[alt='Image challenge']",
+            ".AdvancedCaptcha img[alt='Image challenge']",
+        ]
+        
+        for selector in image_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for el in elements:
+                    if el.is_displayed():
+                        image_element = el
+                        break
+            except:
+                continue
+            if image_element:
+                break
+        
+        if not image_element:
+            # Try the container instead
+            try:
+                image_element = driver.find_element(By.CSS_SELECTOR, ".AdvancedCaptcha-ImageWrapper, [data-testid='silhouette-container']")
+            except:
+                logger.error("❌ Could not find silhouette image element for clicking")
+                return False
+        
+        # Parse answer
+        if isinstance(answer, str):
+            # Remove "coordinates:" prefix
+            coords_str = answer.replace('coordinates:', '').strip()
+            
+            # Parse x=...,y=... pairs
+            import re
+            coord_pairs = re.findall(r'x=([\d.]+),\s*y=([\d.]+)', coords_str)
+            
+            if coord_pairs:
+                logger.info(f"📍 Found {len(coord_pairs)} coordinate pairs to click")
+                for i, (x_str, y_str) in enumerate(coord_pairs):
+                    try:
+                        x, y = float(x_str), float(y_str)
+                        
+                        # Click relative to image element with slight random offset
+                        offset_x = random.randint(-1, 1)
+                        offset_y = random.randint(-1, 1)
+                        
+                        ActionChains(driver)\
+                            .move_to_element_with_offset(image_element, int(x) + offset_x, int(y) + offset_y)\
+                            .pause(random.uniform(0.2, 0.5))\
+                            .click()\
+                            .perform()
+                        
+                        logger.info(f"✅ Silhouette click {i+1}: ({x:.1f}, {y:.1f})")
+                        time.sleep(random.uniform(0.3, 0.8))
+                    except Exception as e:
+                        logger.warning(f"Click error at ({x_str}, {y_str}): {e}")
+            else:
+                # Try "x1,y1;x2,y2" format or "x1,y1,x2,y2" format
+                parts = coords_str.replace(';', ',').split(',')
+                if len(parts) >= 2 and len(parts) % 2 == 0:
+                    for i in range(0, len(parts), 2):
+                        try:
+                            x = float(parts[i].strip())
+                            y = float(parts[i+1].strip())
+                            
+                            ActionChains(driver)\
+                                .move_to_element_with_offset(image_element, int(x), int(y))\
+                                .pause(random.uniform(0.2, 0.5))\
+                                .click()\
+                                .perform()
+                            
+                            logger.info(f"✅ Silhouette click: ({x:.1f}, {y:.1f})")
+                            time.sleep(random.uniform(0.3, 0.8))
+                        except Exception as e:
+                            logger.warning(f"Click error: {e}")
+                else:
+                    # Maybe it's a step number or other format  
+                    logger.info(f"📋 Answer format not recognized as coords, trying as step: {answer}")
+                    try:
+                        step = int(answer)
+                        logger.info(f"📋 Step number: {step} — filling rep field")
+                        driver.execute_script(f"""
+                            var repInput = document.querySelector('input[name="rep"]');
+                            if (repInput) repInput.value = '{step}';
+                        """)
+                    except (ValueError, TypeError):
+                        # Try setting raw value  
+                        logger.info(f"📋 Setting raw answer as rep: {answer}")
+                        safe_answer = answer.replace("'", "\\'")
+                        driver.execute_script(f"""
+                            var repInput = document.querySelector('input[name="rep"]');
+                            if (repInput) repInput.value = '{safe_answer}';
+                        """)
+        elif isinstance(answer, (int, float)):
+            logger.info(f"📋 Numeric answer: {answer} — filling rep field")
+            driver.execute_script(f"""
+                var repInput = document.querySelector('input[name="rep"]');
+                if (repInput) repInput.value = '{int(answer)}';
+            """)
+        
+        # ШАГ: Submit the form
+        time.sleep(random.uniform(0.5, 1.5))
+        
+        submit_clicked = False
+        submit_selectors = [
+            "button[data-testid='submit']",
+            "[class*='CaptchaButton_view_action']",
+            "[class*='AdvancedCaptcha'] button[type='submit']",
+            "button[type='submit']",
+            "#advanced-captcha-form button[type='submit']",
+            "#submit-button",
+        ]
+        
+        for selector in submit_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for el in elements:
+                    if el.is_displayed():
+                        el.click()
+                        submit_clicked = True
+                        logger.info(f"✅ Clicked submit button: {selector}")
+                        break
+            except:
+                continue
+            if submit_clicked:
+                break
+        
+        if not submit_clicked:
+            # Try form submit directly
+            try:
+                driver.execute_script("""
+                    var form = document.getElementById('advanced-captcha-form');
+                    if (form) form.submit();
+                """)
+                submit_clicked = True
+                logger.info("✅ Submitted form via JS")
+            except:
+                pass
+        
+        # Wait for result
+        time.sleep(random.uniform(5, 8))
+        
+        # Check if captcha resolved
+        if not detect_captcha_or_block(driver):
+            logger.info("🎉 Silhouette/PazlCaptcha solved successfully!")
+            return True
+        
+        # Check if page redirected
+        current_url = driver.current_url.lower()
+        if 'showcaptcha' not in current_url and 'captcha' not in current_url:
+            logger.info(f"🎉 Redirected away from captcha: {current_url[:100]}")
+            return True
+        
+        logger.warning("❌ Silhouette captcha still present after submitting answer")
+        return False
+        
+    except Exception as e:
+        logger.error(f"❌ Error applying silhouette answer: {e}")
         import traceback
         traceback.print_exc()
         return False

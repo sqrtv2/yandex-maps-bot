@@ -11,6 +11,8 @@ from celery import shared_task
 from app.database import get_db_session
 from app.models.yandex_target import YandexMapTarget
 from app.models import BrowserProfile
+from app.models.task import Task
+from app.models.profile_target_visit import ProfileTargetVisit
 from tasks.yandex_maps import visit_yandex_maps_profile_task
 
 logger = logging.getLogger(__name__)
@@ -22,7 +24,28 @@ def schedule_yandex_visits():
     Check all active targets and schedule visits based on their configuration.
     This task runs every 5 minutes and checks if any targets need visits.
     """
+    # Distributed lock to prevent duplicate scheduler runs
+    try:
+        import redis as _redis
+        from app.config import settings as _s
+        r = _redis.Redis(host=_s.redis_host, port=_s.redis_port)
+        lock_key = 'scheduler:schedule_visits:lock'
+        if not r.set(lock_key, '1', nx=True, ex=240):  # 4 min lock (beat interval is 5 min)
+            logger.info("⏭️ Another scheduler instance already running, skipping")
+            return {'status': 'skipped', 'reason': 'duplicate', 'scheduled': 0}
+    except Exception as le:
+        logger.warning(f"Could not acquire scheduler lock: {le}")
+
     logger.info("🔄 Starting Yandex Maps visit scheduler")
+    
+    # Don't flood the queue — check how many tasks are already queued
+    try:
+        queue_len = r.llen('yandex') or 0
+        if queue_len > 20:
+            logger.warning(f"⏭️ Yandex queue already has {queue_len} tasks, skipping scheduling")
+            return {'status': 'skipped', 'reason': f'queue_full ({queue_len})', 'scheduled': 0}
+    except Exception as qe:
+        logger.warning(f"Could not check queue length: {qe}")
     
     try:
         with get_db_session() as db:
@@ -42,11 +65,11 @@ def schedule_yandex_visits():
             logger.info(f"📊 Found {len(targets)} active targets")
             
             # Get available warmed profiles
-            profiles = db.query(BrowserProfile).filter(
+            all_profiles = db.query(BrowserProfile).filter(
                 BrowserProfile.warmup_completed == True
             ).all()
             
-            if not profiles:
+            if not all_profiles:
                 logger.warning("⚠️  No warmed profiles available")
                 return {
                     'status': 'error',
@@ -54,7 +77,7 @@ def schedule_yandex_visits():
                     'scheduled': 0
                 }
             
-            logger.info(f"✅ Found {len(profiles)} warmed profiles")
+            logger.info(f"✅ Found {len(all_profiles)} warmed profiles")
             
             scheduled_count = 0
             current_time = datetime.utcnow()
@@ -66,17 +89,36 @@ def schedule_yandex_visits():
                     should_visit, reason = target.should_visit_now(current_time)
                     
                     if not should_visit:
-                        logger.debug(f"⏭️  Skipping {target.title}: {reason}")
+                        logger.info(f"⏭️  Skipping {target.title}: {reason}")
                         continue
                     
                     # Calculate how many visits to schedule now
                     visits_to_schedule = target.get_visits_needed_now(current_time)
                     
                     if visits_to_schedule <= 0:
-                        logger.debug(f"⏭️  No visits needed for {target.title}")
+                        logger.info(f"⏭️  No visits needed for {target.title}")
                         continue
                     
                     logger.info(f"📅 Scheduling {visits_to_schedule} visits for: {target.title}")
+                    
+                    # Filter out profiles that already visited this target
+                    visited_profile_ids = set()
+                    try:
+                        visited_rows = db.query(ProfileTargetVisit.profile_id).filter(
+                            ProfileTargetVisit.target_id == target.id,
+                            ProfileTargetVisit.status == "completed"
+                        ).all()
+                        visited_profile_ids = {row[0] for row in visited_rows}
+                    except Exception as ve:
+                        logger.warning(f"Could not query visited profiles: {ve}")
+                    
+                    available_profiles = [p for p in all_profiles if p.id not in visited_profile_ids]
+                    
+                    if not available_profiles:
+                        logger.warning(f"⚠️ All {len(all_profiles)} profiles already visited {target.title}, skipping")
+                        continue
+                    
+                    logger.info(f"🔄 {len(available_profiles)} profiles available for {target.title} (visited: {len(visited_profile_ids)})")
                     
                     # Prepare visit parameters from target configuration
                     visit_params = {
@@ -106,23 +148,34 @@ def schedule_yandex_visits():
                     concurrent_visits = min(
                         visits_to_schedule,
                         target.concurrent_visits,
-                        len(profiles)
+                        len(available_profiles)
                     )
                     
+                    # Shuffle available profiles so we pick different ones each time
+                    random.shuffle(available_profiles)
+                    
                     for i in range(concurrent_visits):
-                        # Select profile (rotate through available profiles)
-                        if target.use_different_profiles:
-                            profile = profiles[scheduled_count % len(profiles)]
-                        else:
-                            # Use random profile if not rotating
-                            profile = random.choice(profiles)
+                        # Select profile from available (not yet visited) profiles
+                        profile = available_profiles[i % len(available_profiles)]
                         
                         # Add small random delay between concurrent visits (0-10 seconds)
                         delay_seconds = random.randint(0, 10) if i > 0 else 0
                         
-                        # Schedule the visit task
+                        # Create Task record for UI visibility
+                        task_record = Task(
+                            name=f"Visit {target.title}",
+                            task_type="yandex_visit",
+                            status="pending",
+                            target_url=target.url,
+                            profile_id=profile.id,
+                        )
+                        db.add(task_record)
+                        db.flush()  # get task_record.id
+                        
+                        # Schedule the visit task with task_id for log tracking
                         visit_yandex_maps_profile_task.apply_async(
                             args=[profile.id, target.url, visit_params],
+                            kwargs={'task_id': task_record.id},
                             countdown=delay_seconds,
                             queue='yandex'
                         )
@@ -240,6 +293,51 @@ def force_visit_target(target_id: int, profile_id: Optional[int] = None):
             
     except Exception as e:
         logger.error(f"❌ Force visit error: {e}", exc_info=True)
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+
+
+@shared_task(name='tasks.yandex_maps.daily_stats_reset')
+def daily_stats_reset():
+    """
+    Reset daily visit statistics for all targets.
+    Runs at midnight UTC via celery beat.
+    Also resets profile_target_visits so profiles can visit targets again.
+    """
+    logger.info("🔄 Starting daily stats reset for Yandex targets")
+    
+    try:
+        with get_db_session() as db:
+            targets = db.query(YandexMapTarget).all()
+            current_time = datetime.utcnow()
+            
+            for target in targets:
+                target.today_visits = 0
+                target.today_successful = 0
+                target.today_failed = 0
+                target.stats_reset_date = current_time
+            
+            # Reset profile-target visits so all profiles can visit again
+            from app.models.profile_target_visit import ProfileTargetVisit as PTV
+            deleted = db.query(PTV).delete()
+            
+            db.commit()
+            
+            logger.info(
+                f"✅ Daily reset done: {len(targets)} targets zeroed, "
+                f"{deleted} profile-visit records cleared"
+            )
+            
+            return {
+                'status': 'success',
+                'targets_reset': len(targets),
+                'visit_records_cleared': deleted,
+                'timestamp': current_time.isoformat()
+            }
+    except Exception as e:
+        logger.error(f"❌ Daily stats reset error: {e}", exc_info=True)
         return {
             'status': 'error',
             'error': str(e)

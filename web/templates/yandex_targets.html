@@ -63,7 +63,7 @@
                     <tr>
                         <th>ID</th>
                         <th>URL / Название</th>
-                        <th>Посещений/день</th>
+                        <th>Визитов / день</th>
                         <th>Профили</th>
                         <th>Статистика</th>
                         <th>Статус</th>
@@ -213,30 +213,21 @@
 <!-- Visit Logs Panel -->
 <div class="card mt-4">
     <div class="card-header d-flex justify-content-between align-items-center">
-        <h5 class="mb-0"><i class="bi bi-journal-text"></i> Лог посещений</h5>
-        <div>
-            <span id="autoRefreshLabel" class="badge bg-success me-2">Авто-обновление: ВКЛ</span>
-            <button class="btn btn-sm btn-outline-secondary" onclick="toggleAutoRefresh()">
+        <h5 class="mb-0"><i class="bi bi-journal-text"></i> Последние 20 действий</h5>
+        <div class="d-flex align-items-center gap-2">
+            <span id="autoRefreshLabel" class="badge bg-success">Авто-обновление: ВКЛ</span>
+            <button class="btn btn-sm btn-outline-secondary" onclick="toggleAutoRefresh()" title="Вкл/Выкл авто-обновление">
                 <i class="bi bi-arrow-clockwise"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-primary" onclick="loadVisitLogs()" title="Обновить сейчас">
+                <i class="bi bi-arrow-repeat"></i>
             </button>
         </div>
     </div>
-    <div class="card-body p-0" style="max-height: 400px; overflow-y: auto;">
-        <table class="table table-sm table-hover mb-0" id="visitLogsTable">
-            <thead class="table-light sticky-top">
-                <tr>
-                    <th style="width:50px">ID</th>
-                    <th style="width:100px">Профиль</th>
-                    <th style="width:90px">Статус</th>
-                    <th>Лог</th>
-                    <th style="width:80px">Время</th>
-                    <th style="width:140px">Дата</th>
-                </tr>
-            </thead>
-            <tbody id="visitLogsBody">
-                <tr><td colspan="6" class="text-center text-muted py-3">Загрузка...</td></tr>
-            </tbody>
-        </table>
+    <div class="card-body p-0">
+        <div id="visitLogsContainer" style="max-height: 600px; overflow-y: auto;">
+            <div class="text-center text-muted py-4">Загрузка логов...</div>
+        </div>
     </div>
 </div>
 
@@ -340,13 +331,13 @@ async function loadTargets() {
 function updateStatistics() {
     const totalTargets = targets.length;
     const activeTargets = targets.filter(t => t.is_active).length;
-    const totalVisits = targets.reduce((sum, t) => sum + t.total_visits, 0);
-    const successfulVisits = targets.reduce((sum, t) => sum + t.successful_visits, 0);
-    const successRate = totalVisits > 0 ? ((successfulVisits / totalVisits) * 100).toFixed(1) : 0;
+    const todayVisits = targets.reduce((sum, t) => sum + (t.today_visits || 0), 0);
+    const todaySuccessful = targets.reduce((sum, t) => sum + (t.today_successful || 0), 0);
+    const successRate = todayVisits > 0 ? ((todaySuccessful / todayVisits) * 100).toFixed(1) : 0;
     
     document.getElementById('totalTargets').textContent = totalTargets;
     document.getElementById('activeTargets').textContent = activeTargets;
-    document.getElementById('visitsToday').textContent = totalVisits;
+    document.getElementById('visitsToday').textContent = todayVisits;
     document.getElementById('successRate').textContent = successRate + '%';
 }
 
@@ -365,14 +356,21 @@ function renderTargetsTable() {
                 <div><a href="${target.url}" target="_blank" class="text-decoration-none">${target.url.substring(0, 50)}...</a></div>
                 <small class="text-muted">${target.title || target.organization_name || 'Без названия'}</small>
             </td>
-            <td><span class="badge bg-info">${target.visits_per_day}</span></td>
+            <td>
+                <div class="d-flex align-items-center gap-1">
+                    <input type="number" class="form-control form-control-sm" style="width:60px" 
+                           id="vpd-${target.id}" value="${target.visits_per_day}" min="1" max="1000"
+                           onchange="saveVisitsPerDay(${target.id})">
+                    <small class="text-muted">/день</small>
+                </div>
+            </td>
             <td id="profile-visits-${target.id}">
                 <small class="text-muted">Загрузка...</small>
             </td>
             <td>
                 <small>
-                    ${target.total_visits} всего<br>
-                    ${target.successful_visits} успешно
+                    <strong>Сегодня:</strong> ${target.today_visits || 0} (✅${target.today_successful || 0} ❌${target.today_failed || 0})<br>
+                    <span class="text-muted">Всего: ${target.total_visits} (✅${target.successful_visits})</span>
                 </small>
             </td>
             <td>
@@ -381,8 +379,8 @@ function renderTargetsTable() {
                 </span>
             </td>
             <td>
-                <button class="btn btn-sm btn-success" onclick="visitNow(${target.id})" title="Посетить сейчас">
-                    <i class="bi bi-eye"></i> Сейчас
+                <button class="btn btn-sm btn-success" id="launch-btn-${target.id}" onclick="launchVisits(${target.id})" title="Запустить визиты">
+                    <i class="bi bi-rocket-takeoff"></i> Запуск
                 </button>
                 <button class="btn btn-sm btn-outline-primary" onclick="editTarget(${target.id})" title="Редактировать">
                     <i class="bi bi-pencil"></i>
@@ -457,8 +455,6 @@ async function resetVisits(targetId) {
         console.error('Error resetting visits:', error);
         showAlert('danger', 'Ошибка сброса посещений');
     }
-}
-    `).join('');
 }
 
 async function addTarget() {
@@ -606,31 +602,74 @@ function showAlert(type, message) {
     setTimeout(() => alertDiv.remove(), 5000);
 }
 
-async function visitNow(targetId) {
-    if (!confirm('Запустить посещение сейчас с видимым браузером?\\n\\nБудет выбран случайный профиль, который ещё не посещал эту карту.')) {
+async function launchVisits(targetId) {
+    const vpdInput = document.getElementById(`vpd-${targetId}`);
+    const count = vpdInput ? parseInt(vpdInput.value) : 10;
+    
+    if (!confirm(`Запустить ${count} визитов для этой цели?\\n\\nБудут выбраны случайные прогретые профили, которые ещё не посещали эту карту.`)) {
         return;
     }
     
+    const btn = document.getElementById(`launch-btn-${targetId}`);
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Запуск...';
+    }
+    
     try {
-        showAlert('info', '⏳ Запуск посещения... Браузер откроется через несколько секунд');
+        showAlert('info', `⏳ Запуск ${count} визитов... Браузеры откроются через несколько секунд`);
         
-        const response = await fetch(`/api/yandex-targets/${targetId}/visit-now`, {
+        const response = await fetch(`/api/yandex-targets/${targetId}/launch-visits`, {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'}
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ count: count })
         });
         
         if (response.ok) {
             const data = await response.json();
-            showAlert('success', `✅ Посещение запущено!\\nПрофиль: ${data.profile_name}\\nTask ID: ${data.task_id}`);
+            const profileNames = data.tasks.map(t => `${t.profile_name}(${t.delay}с)`).join(', ');
+            showAlert('success', `✅ ${data.message}\\nПрофили: ${profileNames}`);
             loadTargets();
-            loadVisitLogs(); // Refresh logs immediately
+            loadVisitLogs();
         } else {
             const error = await response.json();
-            showAlert('danger', `❌ Ошибка: ${error.detail || 'Не удалось запустить посещение'}`);
+            showAlert('danger', `❌ Ошибка: ${error.detail || 'Не удалось запустить визиты'}`);
+            // Ошибка записана в БД — обновляем лог посещений чтобы показать её
+            setTimeout(() => loadVisitLogs(), 500);
         }
     } catch (error) {
-        console.error('Error starting visit:', error);
-        showAlert('danger', '❌ Ошибка запуска посещения');
+        console.error('Error launching visits:', error);
+        showAlert('danger', '❌ Ошибка запуска визитов');
+        setTimeout(() => loadVisitLogs(), 500);
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-rocket-takeoff"></i> Запуск';
+        }
+    }
+}
+
+async function saveVisitsPerDay(targetId) {
+    const input = document.getElementById(`vpd-${targetId}`);
+    if (!input) return;
+    const value = parseInt(input.value);
+    if (!value || value < 1) {
+        showAlert('danger', 'Количество визитов должно быть >= 1');
+        return;
+    }
+    try {
+        const response = await fetch(`/api/yandex-targets/${targetId}/visits-per-day`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ visits_per_day: value })
+        });
+        if (response.ok) {
+            showAlert('success', `✅ Настройка сохранена: ${value} визитов/день`);
+        } else {
+            showAlert('danger', 'Ошибка сохранения настройки');
+        }
+    } catch (error) {
+        console.error('Error saving visits per day:', error);
     }
 }
 
@@ -651,11 +690,11 @@ function toggleAutoRefresh() {
     const label = document.getElementById('autoRefreshLabel');
     if (autoRefreshEnabled) {
         label.textContent = 'Авто-обновление: ВКЛ';
-        label.className = 'badge bg-success me-2';
+        label.className = 'badge bg-success';
         startAutoRefresh();
     } else {
         label.textContent = 'Авто-обновление: ВЫКЛ';
-        label.className = 'badge bg-secondary me-2';
+        label.className = 'badge bg-secondary';
         if (autoRefreshInterval) clearInterval(autoRefreshInterval);
     }
 }
@@ -663,6 +702,7 @@ function toggleAutoRefresh() {
 async function loadVisitLogs() {
     try {
         const response = await fetch('/api/visit-logs?limit=20');
+        if (!response.ok) return;
         const logs = await response.json();
         renderVisitLogs(logs);
     } catch (error) {
@@ -671,43 +711,120 @@ async function loadVisitLogs() {
 }
 
 function renderVisitLogs(logs) {
-    const tbody = document.getElementById('visitLogsBody');
+    const container = document.getElementById('visitLogsContainer');
     
     if (!logs || logs.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">Нет записей о посещениях</td></tr>';
+        container.innerHTML = '<div class="text-center text-muted py-4"><i class="bi bi-inbox"></i> Нет записей о посещениях</div>';
         return;
     }
     
-    tbody.innerHTML = logs.map(log => {
-        const statusBadge = getStatusBadge(log.status);
-        const lastLog = log.logs ? log.logs.trim().split('\\n').pop() : '—';
+    container.innerHTML = logs.map((log, idx) => {
+        const statusInfo = getStatusInfo(log.status);
         const execTime = log.execution_time ? `${log.execution_time.toFixed(0)}с` : '—';
-        const date = log.created_at ? new Date(log.created_at).toLocaleString('ru-RU', {
+        // Show started_at if available, otherwise completed_at, fallback to created_at
+        const displayDate = log.started_at || log.completed_at || log.created_at;
+        const date = displayDate ? new Date(displayDate).toLocaleString('ru-RU', {
             day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'
         }) : '—';
-        const errorText = log.error_message ? `<br><small class="text-danger">${log.error_message.substring(0, 100)}</small>` : '';
         
-        return `<tr class="${log.status === 'in_progress' ? 'table-info' : log.status === 'failed' ? 'table-danger' : log.status === 'completed' ? 'table-success' : ''}">
-            <td>${log.id}</td>
-            <td><small>${log.profile_name}</small></td>
-            <td>${statusBadge}</td>
-            <td><small>${escapeHtml(lastLog)}${errorText}</small></td>
-            <td><small>${execTime}</small></td>
-            <td><small>${date}</small></td>
-        </tr>`;
+        // Parse result JSON for actions
+        let actionsInfo = '';
+        let visitDuration = '';
+        let proxyInfo = '';
+        try {
+            if (log.result) {
+                const result = typeof log.result === 'string' ? JSON.parse(log.result) : log.result;
+                if (result.actions_performed && result.actions_performed.length > 0) {
+                    const actionLabels = {
+                        'page_scroll': '📜 Скролл',
+                        'photos': '📷 Фото',
+                        'reviews': '💬 Отзывы',
+                        'contacts': '📞 Контакты',
+                        'map': '🗺️ Карта',
+                        'scroll': '📜 Скролл'
+                    };
+                    actionsInfo = result.actions_performed.map(a => actionLabels[a] || a).join(', ');
+                }
+                if (result.visit_duration) {
+                    visitDuration = `${Math.round(result.visit_duration)}с на странице`;
+                }
+                if (result.proxy_used) {
+                    proxyInfo = `🔒 ${result.proxy_used}`;
+                }
+            }
+        } catch(e) {}
+        
+        // Parse execution logs into steps
+        let logSteps = [];
+        if (log.logs) {
+            logSteps = log.logs.trim().split('\n').filter(l => l.trim());
+        }
+        const lastStep = logSteps.length > 0 ? logSteps[logSteps.length - 1].replace(/^\[.*?\]\s*/, '') : '';
+        
+        // Short URL
+        let shortUrl = '';
+        if (log.target_url) {
+            try {
+                const urlObj = new URL(log.target_url);
+                shortUrl = urlObj.pathname.split('/').filter(Boolean).pop() || urlObj.pathname;
+            } catch(e) {
+                shortUrl = log.target_url.substring(0, 40);
+            }
+        }
+        
+        const errorHtml = log.error_message ? 
+            `<div class="text-danger mt-1" style="font-size:0.8rem"><i class="bi bi-exclamation-triangle"></i> ${escapeHtml(log.error_message.substring(0, 200))}</div>` : '';
+        
+        const collapseId = `logDetail-${log.id}`;
+        
+        return `
+        <div class="border-bottom ${log.status === 'in_progress' ? 'bg-info bg-opacity-10' : log.status === 'failed' ? 'bg-danger bg-opacity-10' : ''}" style="padding: 10px 16px;">
+            <div class="d-flex justify-content-between align-items-start cursor-pointer" 
+                 onclick="document.getElementById('${collapseId}').classList.toggle('d-none')" 
+                 style="cursor:pointer" role="button">
+                <div class="flex-grow-1">
+                    <div class="d-flex align-items-center gap-2 mb-1">
+                        ${statusInfo.badge}
+                        <strong style="font-size:0.85rem">${escapeHtml(log.profile_name)}</strong>
+                        ${shortUrl ? `<span class="text-muted" style="font-size:0.8rem">→ ${escapeHtml(shortUrl)}</span>` : ''}
+                        ${actionsInfo ? `<span class="text-muted" style="font-size:0.75rem">[${actionsInfo}]</span>` : ''}
+                    </div>
+                    <div style="font-size:0.8rem; color: #555;">
+                        ${lastStep ? escapeHtml(lastStep) : '<span class="text-muted">Нет данных</span>'}
+                    </div>
+                    ${errorHtml}
+                </div>
+                <div class="text-end text-nowrap ms-3" style="min-width: 100px;">
+                    <div style="font-size:0.75rem; color: #888;">${date}</div>
+                    <div style="font-size:0.8rem;">
+                        ${visitDuration ? `<span class="badge bg-light text-dark">${visitDuration}</span>` : 
+                          (execTime !== '—' ? `<span class="badge bg-light text-dark">${execTime}</span>` : '')}
+                    </div>
+                </div>
+            </div>
+            <!-- Expandable detail -->
+            <div id="${collapseId}" class="d-none mt-2" style="font-size:0.75rem;">
+                <div class="bg-dark text-light rounded p-2" style="font-family: monospace; max-height: 200px; overflow-y: auto;">
+                    ${logSteps.length > 0 ? logSteps.map(step => `<div>${escapeHtml(step)}</div>`).join('') : '<div class="text-muted">Нет подробных логов</div>'}
+                </div>
+                ${log.target_url ? `<div class="mt-1"><small class="text-muted">URL: <a href="${escapeHtml(log.target_url)}" target="_blank">${escapeHtml(log.target_url)}</a></small></div>` : ''}
+                ${proxyInfo ? `<div><small class="text-muted">${proxyInfo}</small></div>` : ''}
+                ${log.retry_count > 0 ? `<div><small class="text-warning">Повторных попыток: ${log.retry_count}</small></div>` : ''}
+            </div>
+        </div>`;
     }).join('');
 }
 
-function getStatusBadge(status) {
-    const badges = {
-        'pending': '<span class="badge bg-secondary">⏳ Ожидает</span>',
-        'in_progress': '<span class="badge bg-primary"><span class="spinner-border spinner-border-sm" style="width:10px;height:10px"></span> Выполняется</span>',
-        'completed': '<span class="badge bg-success">✅ Готово</span>',
-        'failed': '<span class="badge bg-danger">❌ Ошибка</span>',
-        'retry': '<span class="badge bg-warning">🔄 Повтор</span>',
-        'cancelled': '<span class="badge bg-secondary">⏹ Отмена</span>',
+function getStatusInfo(status) {
+    const statuses = {
+        'pending':     { badge: '<span class="badge bg-secondary" style="font-size:0.7rem">⏳ Ожидает</span>' },
+        'in_progress': { badge: '<span class="badge bg-primary" style="font-size:0.7rem"><span class="spinner-border spinner-border-sm" style="width:8px;height:8px"></span> Выполняется</span>' },
+        'completed':   { badge: '<span class="badge bg-success" style="font-size:0.7rem">✅ Готово</span>' },
+        'failed':      { badge: '<span class="badge bg-danger" style="font-size:0.7rem">❌ Ошибка</span>' },
+        'retry':       { badge: '<span class="badge bg-warning" style="font-size:0.7rem">🔄 Повтор</span>' },
+        'cancelled':   { badge: '<span class="badge bg-secondary" style="font-size:0.7rem">⏹ Отмена</span>' },
     };
-    return badges[status] || `<span class="badge bg-secondary">${status}</span>`;
+    return statuses[status] || { badge: `<span class="badge bg-secondary" style="font-size:0.7rem">${status}</span>` };
 }
 
 function escapeHtml(text) {
