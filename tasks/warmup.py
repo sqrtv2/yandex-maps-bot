@@ -108,6 +108,27 @@ YANDEX_SEARCH_QUERIES = [
     "шиномонтаж рядом",
 ]
 
+# Yandex Maps search queries — for stage 2-3 warmup (pre-browsing maps)
+YANDEX_MAPS_SEARCH_QUERIES = [
+    "кафе рядом",
+    "аптека",
+    "супермаркет рядом",
+    "банкомат сбербанк",
+    "заправка рядом",
+    "парикмахерская рядом",
+    "стоматология",
+    "ветеринарная клиника",
+    "шиномонтаж",
+    "автосервис",
+    "фитнес клуб",
+    "детский сад рядом",
+    "поликлиника",
+    "ресторан",
+    "пиццерия рядом",
+    "химчистка",
+    "ремонт телефонов",
+]
+
 # Google search queries (mixed)
 GOOGLE_SEARCH_QUERIES = [
     "best restaurants near me",
@@ -122,25 +143,71 @@ GOOGLE_SEARCH_QUERIES = [
     "лучшие книги 2025",
 ]
 
+# === Multi-session warmup configuration ===
+# Number of sessions required before marking profile as fully warmed
+MIN_WARMUP_SESSIONS = 3
+# Minimum hours between first and last warmup session
+MIN_WARMUP_HOURS_SPREAD = 6
+# Hours between warmup sessions
+WARMUP_SESSION_INTERVAL_HOURS = 4
 
-def _build_warmup_site_list(profile_id: int, count: int = 20) -> List[str]:
-    """Build a diverse site list with guaranteed Yandex ecosystem presence."""
+
+def _build_warmup_site_list(profile_id: int, count: int = 20, stage: int = 1) -> List[str]:
+    """Build a diverse site list based on warmup stage.
+    
+    Stage 1: General browsing + Yandex ecosystem (build cookies)
+    Stage 2: More Yandex + first Yandex Maps exploration
+    Stage 3: Yandex heavy + Yandex Maps organization searches
+    Stage 4+: Reinforcement/maintenance
+    """
     sites = []
 
-    # 1. Always include 3-5 Yandex ecosystem sites (essential for Yandex cookies)
-    yandex_count = random.randint(3, 5)
-    sites.extend(random.sample(YANDEX_ECOSYSTEM, min(yandex_count, len(YANDEX_ECOSYSTEM))))
+    if stage == 1:
+        # Stage 1: Foundation — Yandex cookies + general browsing
+        yandex_count = random.randint(4, 6)
+        sites.extend(random.sample(YANDEX_ECOSYSTEM, min(yandex_count, len(YANDEX_ECOSYSTEM))))
 
-    # 2. Add 8-12 popular Russian sites
-    russian_count = random.randint(8, 12)
-    available_russian = [s for s in POPULAR_RUSSIAN_SITES if s not in sites]
-    sites.extend(random.sample(available_russian, min(russian_count, len(available_russian))))
+        russian_count = random.randint(8, 12)
+        available_russian = [s for s in POPULAR_RUSSIAN_SITES if s not in sites]
+        sites.extend(random.sample(available_russian, min(russian_count, len(available_russian))))
 
-    # 3. Add 2-4 international sites
-    intl_count = random.randint(2, 4)
-    sites.extend(random.sample(INTERNATIONAL_SITES, min(intl_count, len(INTERNATIONAL_SITES))))
+        intl_count = random.randint(2, 4)
+        sites.extend(random.sample(INTERNATIONAL_SITES, min(intl_count, len(INTERNATIONAL_SITES))))
 
-    # 4. Try to get URLs from DB/domain_manager (additional diversity)
+    elif stage == 2:
+        # Stage 2: Deepen Yandex trust + introduce Maps
+        yandex_count = random.randint(5, 7)
+        sites.extend(random.sample(YANDEX_ECOSYSTEM, min(yandex_count, len(YANDEX_ECOSYSTEM))))
+
+        # Always include Yandex Maps main page
+        if "https://yandex.ru/maps" not in sites:
+            sites.append("https://yandex.ru/maps")
+
+        russian_count = random.randint(5, 8)
+        available_russian = [s for s in POPULAR_RUSSIAN_SITES if s not in sites]
+        sites.extend(random.sample(available_russian, min(russian_count, len(available_russian))))
+
+        intl_count = random.randint(1, 2)
+        sites.extend(random.sample(INTERNATIONAL_SITES, min(intl_count, len(INTERNATIONAL_SITES))))
+
+    elif stage >= 3:
+        # Stage 3+: Yandex-heavy + Maps organization browsing
+        yandex_count = random.randint(5, 8)
+        sites.extend(random.sample(YANDEX_ECOSYSTEM, min(yandex_count, len(YANDEX_ECOSYSTEM))))
+
+        # Yandex Maps — main + category pages
+        maps_urls = [
+            "https://yandex.ru/maps",
+            "https://yandex.ru/maps/?ll=37.622504,55.753215&z=12",  # Moscow center
+            "https://yandex.ru/maps/?ll=30.315868,59.939095&z=12",  # SPb
+        ]
+        sites.extend(random.sample(maps_urls, min(2, len(maps_urls))))
+
+        russian_count = random.randint(3, 6)
+        available_russian = [s for s in POPULAR_RUSSIAN_SITES if s not in sites]
+        sites.extend(random.sample(available_russian, min(russian_count, len(available_russian))))
+
+    # Add DB/domain URLs for diversity
     try:
         db_urls = get_warmup_urls(count=5, profile_id=profile_id, strategy="diverse")
         if db_urls:
@@ -152,9 +219,8 @@ def _build_warmup_site_list(profile_id: int, count: int = 20) -> List[str]:
 
     # Trim to requested count, shuffle
     if len(sites) > count:
-        # Keep first 3 Yandex sites guaranteed, shuffle rest
-        yandex_guaranteed = sites[:min(3, yandex_count)]
-        rest = sites[min(3, yandex_count):]
+        yandex_guaranteed = [s for s in sites if any(y in s for y in ["yandex", "ya.ru", "dzen.ru"])][:3]
+        rest = [s for s in sites if s not in yandex_guaranteed]
         random.shuffle(rest)
         sites = yandex_guaranteed + rest[:count - len(yandex_guaranteed)]
 
@@ -383,6 +449,141 @@ def _perform_google_search_warmup(driver, query: str) -> bool:
         return False
 
 
+def _browse_yandex_maps(driver, query: str = None) -> bool:
+    """Browse Yandex Maps: open maps, optionally search, scroll/zoom, click on organizations.
+    
+    This builds Yandex Maps cookies and browsing history so the profile
+    doesn't appear as a first-time Maps visitor during the target visit.
+    """
+    try:
+        # Go to Yandex Maps
+        driver.get("https://yandex.ru/maps")
+        time.sleep(random.uniform(4, 8))
+
+        # Dismiss popups/banners
+        _try_dismiss_cookies(driver)
+        time.sleep(random.uniform(1, 2))
+
+        # Interact with the map: zoom, pan
+        try:
+            # Zoom in/out with scroll
+            map_el = driver.find_element(By.CSS_SELECTOR, ".ymaps3x0--map, [class*='map-container'], .map-container, ymaps, [data-testid='map']")
+            if map_el and map_el.is_displayed():
+                ActionChains(driver).move_to_element(map_el).perform()
+                time.sleep(random.uniform(0.5, 1.5))
+                # Scroll to zoom
+                for _ in range(random.randint(2, 4)):
+                    ActionChains(driver).scroll_by_amount(0, random.choice([-120, 120])).perform()
+                    time.sleep(random.uniform(0.5, 1.5))
+                # Click-drag to pan
+                try:
+                    ActionChains(driver).move_to_element_with_offset(
+                        map_el, random.randint(-100, 100), random.randint(-50, 50)
+                    ).click_and_hold().move_by_offset(
+                        random.randint(-80, 80), random.randint(-40, 40)
+                    ).release().perform()
+                    time.sleep(random.uniform(1, 2))
+                except:
+                    pass
+        except:
+            logger.debug("Could not find map element for zoom/pan, continuing")
+
+        # Search on maps if query provided
+        if query:
+            search_input = None
+            for selector in [
+                "input.input__control",
+                "input[placeholder*='Поиск']",
+                "input[placeholder*='Найд']",
+                "input[aria-label*='Поиск']",
+                ".search-form-view__input input",
+                "input.suggest-input__input",
+                "input[type='text']",
+            ]:
+                try:
+                    elems = driver.find_elements(By.CSS_SELECTOR, selector)
+                    for elem in elems:
+                        if elem.is_displayed() and elem.size.get('height', 0) > 10:
+                            search_input = elem
+                            break
+                    if search_input:
+                        break
+                except:
+                    continue
+
+            if search_input:
+                ActionChains(driver).move_to_element(search_input).pause(
+                    random.uniform(0.3, 0.8)
+                ).click().perform()
+                time.sleep(random.uniform(0.5, 1.0))
+
+                # Clear existing text
+                search_input.send_keys(Keys.CONTROL + "a")
+                time.sleep(0.1)
+                search_input.send_keys(Keys.DELETE)
+                time.sleep(0.3)
+
+                # Type query
+                for char in query:
+                    search_input.send_keys(char)
+                    time.sleep(random.uniform(0.04, 0.15))
+                time.sleep(random.uniform(1.0, 2.0))
+
+                search_input.send_keys(Keys.RETURN)
+                time.sleep(random.uniform(3, 6))
+
+                # Browse search results — scroll the sidebar
+                _human_read_page(driver, min_time=8, max_time=20)
+
+                # Click on a random organization in results (50% chance)
+                if random.random() < 0.5:
+                    try:
+                        org_selectors = [
+                            "a.search-snippet-view__link-overlay",
+                            ".search-snippet-view__body",
+                            "[class*='SearchSnippet']",
+                            ".search-list-view .card-title-view",
+                            "li.search-snippet-view",
+                            ".search-business-snippet-view",
+                        ]
+                        for sel in org_selectors:
+                            orgs = driver.find_elements(By.CSS_SELECTOR, sel)
+                            visible_orgs = [o for o in orgs if o.is_displayed()]
+                            if visible_orgs:
+                                chosen_org = random.choice(visible_orgs[:5])
+                                ActionChains(driver).move_to_element(chosen_org).pause(
+                                    random.uniform(0.5, 1.0)
+                                ).click().perform()
+                                time.sleep(random.uniform(3, 6))
+                                # Read the organization card
+                                _human_read_page(driver, min_time=5, max_time=15)
+                                # Go back to results
+                                driver.back()
+                                time.sleep(random.uniform(2, 4))
+                                break
+                    except:
+                        pass
+
+                logger.info(f"🗺️ Yandex Maps search completed: '{query}'")
+            else:
+                # Fallback: direct URL search
+                encoded = query.replace(' ', '+')
+                driver.get(f"https://yandex.ru/maps/?text={encoded}")
+                time.sleep(random.uniform(4, 8))
+                _human_read_page(driver, min_time=8, max_time=20)
+                logger.info(f"🗺️ Yandex Maps search (URL) completed: '{query}'")
+        else:
+            # Just browse the map without searching
+            _human_read_page(driver, min_time=10, max_time=25)
+            logger.info("🗺️ Yandex Maps browsing completed (no search)")
+
+        return True
+
+    except Exception as e:
+        logger.warning(f"Error browsing Yandex Maps: {e}")
+        return False
+
+
 def _visit_site_with_actions(driver, url: str, site_index: int, total_sites: int) -> float:
     """Visit a site and perform realistic human actions. Returns time spent."""
     visit_start = time.time()
@@ -443,24 +644,21 @@ def _visit_site_with_actions(driver, url: str, site_index: int, total_sites: int
 @shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=60, time_limit=900, soft_time_limit=840)
 def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sites_list: List[str] = None):
     """
-    Realistic warmup: visit 15-22 sites with human-like browsing behavior.
-    - Yandex ecosystem sites (build cookies/trust)
-    - Search queries on Yandex and Google
-    - Smooth scrolling, mouse movements, pauses
-    - Cookie consent dismissal
-    - Internal link clicking
-    - Total session: 5-12 minutes
+    Multi-session warmup: each call = one warmup session (stage).
+    Profile needs 3+ sessions spread over 6+ hours to be fully warmed.
+    
+    Stage 1: Yandex search + general Russian sites (build cookies)
+    Stage 2: More Yandex ecosystem + Yandex Maps exploration
+    Stage 3: Yandex Maps search + organization browsing
+    Stage 4+: Re-warmup / reinforcement
 
-    Args:
-        profile_id: ID of the browser profile to warm up
-        duration_minutes: Ignored (kept for API compat)
-        sites_list: List of sites to visit (default: auto-generated)
+    The periodic_rewarmup scheduler calls this automatically for next stages.
     """
     browser_manager = None
     browser_id = None
 
     try:
-        # Get profile from database and extract all needed data
+        # Get profile from database and determine current stage
         with get_db_session() as db:
             profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
             if not profile_obj:
@@ -477,16 +675,19 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
             profile_proxy_username = profile_obj.proxy_username
             profile_proxy_password = profile_obj.proxy_password
             profile_proxy_type = profile_obj.proxy_type or 'http'
+            
+            current_stage = profile_obj.get_next_warmup_stage()
+            is_rewarmup = profile_obj.warmup_completed  # re-warming already warmed profile
 
             profile_obj.status = "warming_up"
             db.commit()
 
-        # Build diverse site list with Yandex ecosystem
-        sites_count = random.randint(15, 22)
-        if not sites_list:
-            sites_list = _build_warmup_site_list(profile_id, count=sites_count)
+        logger.info(f"🔥 Warmup profile {profile_id} — STAGE {current_stage} {'(re-warmup)' if is_rewarmup else ''}")
 
-        logger.info(f"🔥 Realistic warmup profile {profile_id}: {len(sites_list)} sites with human behavior")
+        # Build stage-appropriate site list
+        sites_count = random.randint(12, 18) if current_stage >= 2 else random.randint(15, 22)
+        if not sites_list:
+            sites_list = _build_warmup_site_list(profile_id, count=sites_count, stage=current_stage)
 
         # Initialize managers
         browser_manager = BrowserManager()
@@ -521,36 +722,76 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
             'language': profile_language
         })
 
-        # Create browser session (CDP fingerprint injection happens here)
+        # Create browser session
         browser_id = browser_manager.create_browser_session(profile_data, proxy_data)
         driver = browser_manager.active_browsers.get(browser_id)
         if not driver:
             raise RuntimeError(f"Failed to get driver for session {browser_id}")
 
-        logger.info(f"Created browser session {browser_id} for profile {profile_id}")
+        logger.info(f"Created browser session {browser_id} for profile {profile_id} (stage {current_stage})")
 
-        # === REALISTIC WARMUP ===
+        # === STAGE-BASED WARMUP ===
         start_time = time.time()
         sites_visited = 0
         successful_visits = 0
         total_time_spent = 0
         searches_done = 0
+        maps_browsed = 0
 
-        # Phase 1: Yandex search (build Yandex cookies FIRST)
-        if random.random() < 0.85:  # 85% chance to do Yandex search
+        # --- Stage-specific pre-browsing ---
+        if current_stage == 1:
+            # Stage 1: Start with Yandex search to get cookies
+            if random.random() < 0.9:
+                query = random.choice(YANDEX_SEARCH_QUERIES)
+                if _perform_yandex_search(driver, query):
+                    searches_done += 1
+                    total_time_spent += 15
+                time.sleep(random.uniform(2, 5))
+
+        elif current_stage == 2:
+            # Stage 2: Yandex search + first Maps visit
             query = random.choice(YANDEX_SEARCH_QUERIES)
             if _perform_yandex_search(driver, query):
                 searches_done += 1
-                total_time_spent += 15  # approximate
+                total_time_spent += 15
             time.sleep(random.uniform(2, 5))
 
-        # Phase 2: Visit sites with realistic browsing
+            # Browse Yandex Maps without search (just explore)
+            if _browse_yandex_maps(driver, query=None):
+                maps_browsed += 1
+                total_time_spent += 20
+            time.sleep(random.uniform(2, 4))
+
+        elif current_stage >= 3:
+            # Stage 3+: Yandex search + Maps with organization search
+            query = random.choice(YANDEX_SEARCH_QUERIES)
+            if _perform_yandex_search(driver, query):
+                searches_done += 1
+                total_time_spent += 15
+            time.sleep(random.uniform(2, 5))
+
+            # Browse Yandex Maps WITH search query
+            maps_query = random.choice(YANDEX_MAPS_SEARCH_QUERIES)
+            if _browse_yandex_maps(driver, query=maps_query):
+                maps_browsed += 1
+                total_time_spent += 25
+            time.sleep(random.uniform(2, 5))
+
+            # Sometimes do a second maps search (40% chance)
+            if random.random() < 0.4:
+                maps_query2 = random.choice([q for q in YANDEX_MAPS_SEARCH_QUERIES if q != maps_query])
+                if _browse_yandex_maps(driver, query=maps_query2):
+                    maps_browsed += 1
+                    total_time_spent += 20
+                time.sleep(random.uniform(2, 4))
+
+        # --- Visit sites with realistic browsing ---
         consecutive_failures = 0
         for i, site_url in enumerate(sites_list):
             try:
                 if browser_manager.navigate_to_url(browser_id, site_url, timeout=20):
                     sites_visited += 1
-                    consecutive_failures = 0  # Reset on success
+                    consecutive_failures = 0
 
                     visit_time = _visit_site_with_actions(driver, site_url, i, len(sites_list))
                     total_time_spent += visit_time
@@ -558,42 +799,38 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
 
                     logger.info(f"✅ [{successful_visits}/{len(sites_list)}] {site_url} — {visit_time:.1f}s")
 
-                    # Natural delay between sites (1-5 sec, sometimes longer)
                     if random.random() < 0.1:
-                        time.sleep(random.uniform(5, 12))  # 10% chance: longer pause
+                        time.sleep(random.uniform(5, 12))
                     else:
                         time.sleep(random.uniform(1, 4))
-
                 else:
                     sites_visited += 1
                     consecutive_failures += 1
                     logger.warning(f"⚠️ Failed to load {site_url}, skipping")
                     time.sleep(random.uniform(1, 2))
 
-                    # If proxy is dead (3+ consecutive failures), stop early
                     if consecutive_failures >= 3:
-                        logger.warning(f"🛑 {consecutive_failures} consecutive failures — proxy likely dead, stopping warmup early")
+                        logger.warning(f"🛑 {consecutive_failures} consecutive failures — stopping warmup early")
                         break
 
             except Exception as site_error:
                 logger.error(f"Error visiting {site_url}: {site_error}")
                 consecutive_failures += 1
                 time.sleep(1)
-
                 if consecutive_failures >= 3:
                     logger.warning(f"🛑 {consecutive_failures} consecutive errors — stopping warmup early")
                     break
                 continue
 
-            # Mid-session: do a Google search (once, 30% chance)
-            if i == len(sites_list) // 2 and random.random() < 0.3 and searches_done < 2:
+            # Mid-session Google search (once, 25% chance)
+            if i == len(sites_list) // 2 and random.random() < 0.25 and searches_done < 2:
                 query = random.choice(GOOGLE_SEARCH_QUERIES)
                 if _perform_google_search_warmup(driver, query):
                     searches_done += 1
                 time.sleep(random.uniform(2, 4))
 
-        # Phase 3: End with one more Yandex search (40% chance) to reinforce cookies
-        if random.random() < 0.4 and searches_done < 2:
+        # --- End-of-session Yandex search reinforcement (35% chance) ---
+        if random.random() < 0.35 and searches_done < 3:
             query = random.choice(YANDEX_SEARCH_QUERIES)
             if _perform_yandex_search(driver, query):
                 searches_done += 1
@@ -603,32 +840,82 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
         actual_duration = time.time() - start_time
         success_rate = (successful_visits / max(sites_visited, 1) * 100)
 
-        # Update profile in database
+        # Update profile in database — multi-session logic
         with get_db_session() as db:
             profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
             if profile_obj:
-                profile_obj.status = "warmed"
-                profile_obj.warmup_completed = True
-                profile_obj.warmup_sessions_count += 1
-                profile_obj.warmup_time_spent += max(1, int(actual_duration / 60))
+                profile_obj.warmup_sessions_count = (profile_obj.warmup_sessions_count or 0) + 1
+                profile_obj.warmup_time_spent = (profile_obj.warmup_time_spent or 0) + max(1, int(actual_duration / 60))
                 profile_obj.last_used_at = datetime.utcnow()
+                
+                if not is_rewarmup:
+                    # Track stage progression
+                    profile_obj.warmup_stage = current_stage
+                    
+                    # Set first_warmup_at on first session
+                    if not profile_obj.first_warmup_at:
+                        profile_obj.first_warmup_at = datetime.utcnow()
+                    
+                    # Check if profile is fully warmed
+                    if current_stage >= MIN_WARMUP_SESSIONS:
+                        # Check time spread
+                        hours_since_first = 0
+                        if profile_obj.first_warmup_at:
+                            hours_since_first = (datetime.utcnow() - profile_obj.first_warmup_at).total_seconds() / 3600
+                        
+                        if hours_since_first >= MIN_WARMUP_HOURS_SPREAD:
+                            # Fully warmed!
+                            profile_obj.warmup_completed = True
+                            profile_obj.status = "warmed"
+                            logger.info(
+                                f"✅ Profile {profile_id} FULLY WARMED after {current_stage} sessions "
+                                f"over {hours_since_first:.1f} hours"
+                            )
+                        else:
+                            # Enough sessions but need more time spread
+                            profile_obj.status = "created"  # will be picked up by scheduler later
+                            logger.info(
+                                f"⏳ Profile {profile_id} completed stage {current_stage} but only "
+                                f"{hours_since_first:.1f}h since first warmup (need {MIN_WARMUP_HOURS_SPREAD}h). "
+                                f"Will be auto-scheduled later."
+                            )
+                    else:
+                        # More sessions needed
+                        profile_obj.status = "created"  # will be picked up by scheduler
+                        logger.info(
+                            f"📋 Profile {profile_id} completed stage {current_stage}/{MIN_WARMUP_SESSIONS}. "
+                            f"Next session will be auto-scheduled."
+                        )
+                else:
+                    # Re-warmup — advance stage for Maps warmup catch-up
+                    if profile_obj.warmup_stage < current_stage:
+                        profile_obj.warmup_stage = current_stage
+                        logger.info(
+                            f"📈 Profile {profile_id} re-warmup advanced to stage {current_stage}"
+                        )
+                    profile_obj.status = "warmed"
+                
                 db.commit()
 
         result = {
             "status": "completed",
             "profile_id": profile_id,
+            "stage": current_stage,
+            "is_rewarmup": is_rewarmup,
             "duration_seconds": round(actual_duration, 1),
             "sites_visited": sites_visited,
             "successful_visits": successful_visits,
             "success_rate": round(success_rate, 1),
             "searches_performed": searches_done,
+            "maps_browsed": maps_browsed,
             "total_time_spent": round(total_time_spent, 1),
             "average_time_per_site": round(total_time_spent / max(successful_visits, 1), 1)
         }
 
         logger.info(
-            f"🔥 Warmup DONE profile {profile_id} in {actual_duration:.0f}s: "
+            f"🔥 Warmup DONE profile {profile_id} stage {current_stage} in {actual_duration:.0f}s: "
             f"{successful_visits}/{sites_visited} sites, {searches_done} searches, "
+            f"{maps_browsed} maps sessions, "
             f"avg {result['average_time_per_site']:.1f}s/site"
         )
         return result
@@ -640,7 +927,11 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
             with get_db_session() as db:
                 profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
                 if profile_obj:
-                    profile_obj.status = "error"
+                    # On error, reset to previous state so scheduler retries
+                    if profile_obj.warmup_completed:
+                        profile_obj.status = "warmed"
+                    else:
+                        profile_obj.status = "created"
                     db.commit()
         except:
             pass
@@ -687,136 +978,99 @@ def warmup_multiple_profiles_task(self, profile_ids: List[int], duration_minutes
 @shared_task(base=BaseTask, bind=True, time_limit=900, soft_time_limit=840)
 def advanced_warmup_task(self, profile_id: int, warmup_strategy: Dict = None):
     """
-    Advanced warmup with custom strategy — uses the same realistic browsing helpers.
+    Advanced warmup with custom strategy — delegates to warmup_profile_task.
+    Kept for API compatibility.
     """
-    if not warmup_strategy:
-        warmup_strategy = {}
-
-    browser_manager = None
-    browser_id = None
-
-    try:
-        sites = warmup_strategy.get('sites', [])
-        if not sites:
-            sites = _build_warmup_site_list(profile_id, count=20)
-
-        search_queries = warmup_strategy.get('search_queries', YANDEX_SEARCH_QUERIES[:5])
-
-        logger.info(f"Starting advanced warmup for profile {profile_id} with {len(sites)} sites")
-
-        with get_db_session() as db:
-            profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
-            if not profile_obj:
-                raise ValueError(f"Profile {profile_id} not found")
-            profile_name = profile_obj.name
-            profile_obj.status = "warming_up"
-            db.commit()
-
-        browser_manager = BrowserManager()
-        proxy_manager = ProxyManager()
-        proxy_manager.load_proxies_from_db()
-        proxy_data = proxy_manager.get_available_proxy()
-
-        profile_generator = ProfileGenerator()
-        profile_data = profile_generator.generate_profile(profile_name)
-
-        browser_id = browser_manager.create_browser_session(profile_data, proxy_data)
-        driver = browser_manager.active_browsers.get(browser_id)
-        if not driver:
-            raise RuntimeError(f"Failed to get driver for session {browser_id}")
-
-        results = {
-            "sites_visited": 0,
-            "searches_performed": 0,
-            "total_time": 0,
-        }
-
-        start_time = time.time()
-
-        # Phase 1: Yandex search
-        if search_queries:
-            query = random.choice(search_queries)
-            if _perform_yandex_search(driver, query):
-                results["searches_performed"] += 1
-            time.sleep(random.uniform(2, 5))
-
-        # Phase 2: Visit sites
-        for i, site in enumerate(sites):
-            try:
-                if browser_manager.navigate_to_url(browser_id, site, timeout=20):
-                    visit_time = _visit_site_with_actions(driver, site, i, len(sites))
-                    results["sites_visited"] += 1
-                    logger.info(f"✅ [{results['sites_visited']}/{len(sites)}] {site} — {visit_time:.1f}s")
-                    time.sleep(random.uniform(1, 4))
-            except Exception as e:
-                logger.error(f"Error visiting {site}: {e}")
-                continue
-
-        results["total_time"] = round(time.time() - start_time, 1)
-
-        # Update profile
-        with get_db_session() as db:
-            profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
-            if profile_obj:
-                profile_obj.status = "warmed"
-                profile_obj.warmup_completed = True
-                profile_obj.warmup_sessions_count += 1
-                profile_obj.warmup_time_spent += max(1, int(results["total_time"] / 60))
-                profile_obj.last_used_at = datetime.utcnow()
-                db.commit()
-
-        logger.info(f"Advanced warmup completed for profile {profile_id}: {results}")
-        return results
-
-    except Exception as e:
-        logger.error(f"Error in advanced warmup: {e}")
-        raise
-
-    finally:
-        if browser_manager and browser_id:
-            try:
-                browser_manager.close_browser_session(browser_id)
-            except Exception as e:
-                logger.error(f"Error closing browser session: {e}")
+    # Just delegate to the main warmup task which handles stages
+    return warmup_profile_task(profile_id,
+                               sites_list=warmup_strategy.get('sites') if warmup_strategy else None)
 
 
 @shared_task(base=BaseTask)
 def periodic_rewarmup():
     """
-    Periodic re-warmup: picks profiles that haven't been warmed recently
-    and schedules warmup tasks for them. Keeps profiles "fresh" with
-    ongoing browsing history.
+    Multi-session warmup scheduler + profile freshness keeper.
     Runs every 2 hours via Celery Beat.
+    
+    1. Schedules NEXT warmup sessions for profiles in multi-session warmup pipeline
+       (stage < MIN_WARMUP_SESSIONS, not yet fully warmed)
+    2. Re-warms already warmed profiles that haven't been used in 24+ hours
     """
     try:
         now = datetime.utcnow()
-        # Re-warmup profiles that haven't been used in 24+ hours
-        stale_threshold = now - timedelta(hours=24)
-        batch_size = 10  # Warmup 10 profiles per cycle
+        scheduled_next = 0
+        scheduled_rewarm = 0
+        profile_ids_next = []
+        profile_ids_rewarm = []
 
         with get_db_session() as db:
+            # === Part 1: Multi-session warmup pipeline ===
+            # Find profiles that need their next warmup session:
+            # - Not fully warmed yet
+            # - Status is "created" (previous session completed, waiting for next)
+            # - warmup_stage > 0 (at least 1 session done)
+            # - Last used at least WARMUP_SESSION_INTERVAL_HOURS ago
+            interval_threshold = now - timedelta(hours=WARMUP_SESSION_INTERVAL_HOURS)
+
+            pipeline_profiles = db.query(BrowserProfile).filter(
+                BrowserProfile.warmup_completed == False,
+                BrowserProfile.is_active == True,
+                BrowserProfile.status == "created",
+                BrowserProfile.warmup_stage > 0,  # at least 1 session done
+                BrowserProfile.warmup_stage < MIN_WARMUP_SESSIONS + 1,  # not done yet
+                (BrowserProfile.last_used_at < interval_threshold) | (BrowserProfile.last_used_at.is_(None))
+            ).order_by(BrowserProfile.warmup_stage.asc(), BrowserProfile.last_used_at.asc().nullsfirst()).limit(15).all()
+
+            if pipeline_profiles:
+                profile_ids_next = [p.id for p in pipeline_profiles]
+                logger.info(
+                    f"📋 Found {len(pipeline_profiles)} profiles needing next warmup session: "
+                    f"{[(p.id, f'stage {p.warmup_stage}') for p in pipeline_profiles[:5]]}..."
+                )
+
+            # === Part 2: Re-warmup for already warmed profiles ===
+            # Prioritize profiles that haven't been through Maps warmup stages (stage < 3)
+            stale_threshold = now - timedelta(hours=4)  # more aggressive: 4h instead of 24h for catch-up
             stale_profiles = db.query(BrowserProfile).filter(
                 BrowserProfile.warmup_completed == True,
+                BrowserProfile.is_active == True,
                 BrowserProfile.status.in_(["warmed", "created"]),
                 (BrowserProfile.last_used_at < stale_threshold) | (BrowserProfile.last_used_at.is_(None))
-            ).order_by(BrowserProfile.last_used_at.asc().nullsfirst()).limit(batch_size).all()
+            ).order_by(
+                BrowserProfile.warmup_stage.asc(),  # low-stage profiles first (need Maps warmup)
+                BrowserProfile.last_used_at.asc().nullsfirst()
+            ).limit(20).all()
 
-            if not stale_profiles:
-                logger.info("📋 No stale profiles need re-warmup")
-                return {"re_warmed": 0}
+            if stale_profiles:
+                profile_ids_rewarm = [p.id for p in stale_profiles]
 
-            profile_ids = [p.id for p in stale_profiles]
-
-        # Schedule warmup tasks with staggered delays
-        scheduled = 0
-        for i, pid in enumerate(profile_ids):
-            delay_seconds = i * random.randint(30, 60)
+        # Schedule pipeline warmup tasks with staggered delays
+        for i, pid in enumerate(profile_ids_next):
+            delay_seconds = i * random.randint(20, 50)
             eta = now + timedelta(seconds=delay_seconds)
             warmup_profile_task.apply_async(args=[pid], eta=eta, queue='warmup')
-            scheduled += 1
+            scheduled_next += 1
 
-        logger.info(f"🔄 Scheduled re-warmup for {scheduled} stale profiles: {profile_ids}")
-        return {"re_warmed": scheduled, "profile_ids": profile_ids}
+        # Schedule re-warmup tasks
+        for i, pid in enumerate(profile_ids_rewarm):
+            delay_seconds = (len(profile_ids_next) + i) * random.randint(30, 60)
+            eta = now + timedelta(seconds=delay_seconds)
+            warmup_profile_task.apply_async(args=[pid], eta=eta, queue='warmup')
+            scheduled_rewarm += 1
+
+        if scheduled_next > 0:
+            logger.info(f"🔄 Scheduled {scheduled_next} next-stage warmup sessions: {profile_ids_next}")
+        if scheduled_rewarm > 0:
+            logger.info(f"🔄 Scheduled {scheduled_rewarm} re-warmup sessions: {profile_ids_rewarm}")
+        if scheduled_next == 0 and scheduled_rewarm == 0:
+            logger.info("📋 No warmup sessions needed right now")
+
+        return {
+            "pipeline_scheduled": scheduled_next,
+            "pipeline_profile_ids": profile_ids_next,
+            "rewarm_scheduled": scheduled_rewarm,
+            "rewarm_profile_ids": profile_ids_rewarm
+        }
 
     except Exception as e:
         logger.error(f"Error in periodic_rewarmup: {e}")

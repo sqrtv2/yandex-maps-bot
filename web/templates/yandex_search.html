@@ -1,0 +1,568 @@
+{% extends "base.html" %}
+
+{% block title %}Яндекс Поиск — Переходы из выдачи{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2"><i class="bi bi-search"></i> Яндекс Поиск — Переходы из выдачи</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <button class="btn btn-primary me-2" data-bs-toggle="modal" data-bs-target="#addTargetModal">
+            <i class="bi bi-plus-circle"></i> Добавить цель
+        </button>
+        <button class="btn btn-outline-secondary" onclick="loadTargets()">
+            <i class="bi bi-arrow-clockwise"></i> Обновить
+        </button>
+    </div>
+</div>
+
+<!-- Stats Cards -->
+<div class="row mb-4" id="statsCards">
+    <div class="col-md-3">
+        <div class="card text-white bg-primary shadow-sm">
+            <div class="card-body py-3">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h6 class="card-title mb-0">Всего целей</h6>
+                        <h3 class="mb-0" id="statTotal">0</h3>
+                    </div>
+                    <i class="bi bi-bullseye fs-1 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card text-white bg-success shadow-sm">
+            <div class="card-body py-3">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h6 class="card-title mb-0">Активных</h6>
+                        <h3 class="mb-0" id="statActive">0</h3>
+                    </div>
+                    <i class="bi bi-check-circle fs-1 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card text-white bg-info shadow-sm">
+            <div class="card-body py-3">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h6 class="card-title mb-0">Визитов сегодня</h6>
+                        <h3 class="mb-0" id="statTodayVisits">0</h3>
+                    </div>
+                    <i class="bi bi-graph-up fs-1 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card text-white bg-warning shadow-sm">
+            <div class="card-body py-3">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h6 class="card-title mb-0">Успешность</h6>
+                        <h3 class="mb-0" id="statSuccessRate">0%</h3>
+                    </div>
+                    <i class="bi bi-percent fs-1 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Targets Table -->
+<div class="card shadow-sm mb-4">
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover table-striped mb-0">
+                <thead class="table-dark">
+                    <tr>
+                        <th>ID</th>
+                        <th>Домен</th>
+                        <th>Ключевые слова</th>
+                        <th>Визитов/день</th>
+                        <th>Статистика</th>
+                        <th>Не найдено</th>
+                        <th>Статус</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody id="targetsTableBody">
+                    <tr><td colspan="8" class="text-center py-4"><div class="spinner-border text-primary"></div></td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Visit Logs -->
+<div class="card shadow-sm mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-journal-text"></i> Логи визитов</h5>
+        <button class="btn btn-sm btn-outline-secondary" onclick="loadLogs()">
+            <i class="bi bi-arrow-clockwise"></i>
+        </button>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+            <table class="table table-sm table-hover mb-0">
+                <thead class="table-light sticky-top">
+                    <tr>
+                        <th>Время</th>
+                        <th>Профиль</th>
+                        <th>Запрос</th>
+                        <th>Статус</th>
+                        <th>Детали</th>
+                    </tr>
+                </thead>
+                <tbody id="logsTableBody">
+                    <tr><td colspan="5" class="text-center py-3 text-muted">Загрузка...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Add Target Modal -->
+<div class="modal fade" id="addTargetModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-primary text-white">
+                <h5 class="modal-title"><i class="bi bi-plus-circle"></i> Новая цель для поиска</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="addTargetForm">
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Домен сайта <span class="text-danger">*</span></label>
+                            <input type="text" class="form-control" id="addDomain" placeholder="example.ru" required>
+                            <small class="text-muted">Без https:// и www.</small>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Название</label>
+                            <input type="text" class="form-control" id="addTitle" placeholder="Описание цели">
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Ключевые слова <span class="text-danger">*</span></label>
+                        <textarea class="form-control" id="addKeywords" rows="5" placeholder="Каждый ключ с новой строки&#10;ключ 1&#10;ключ 2&#10;ключ 3" required></textarea>
+                        <small class="text-muted">По одному ключевому слову на строку</small>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Визитов в день</label>
+                            <input type="number" class="form-control" id="addVisitsPerDay" value="10" min="1">
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Макс. страниц поиска</label>
+                            <input type="number" class="form-control" id="addMaxPages" value="3" min="1" max="10">
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Одновременных</label>
+                            <input type="number" class="form-control" id="addConcurrent" value="1" min="1" max="5">
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">Мин. интервал (мин)</label>
+                            <input type="number" class="form-control" id="addMinInterval" value="30" min="5">
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">Макс. интервал (мин)</label>
+                            <input type="number" class="form-control" id="addMaxInterval" value="120" min="10">
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">Мин. на сайте (сек)</label>
+                            <input type="number" class="form-control" id="addMinTime" value="30" min="5">
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">Макс. на сайте (сек)</label>
+                            <input type="number" class="form-control" id="addMaxTime" value="120" min="10">
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Заметки</label>
+                        <textarea class="form-control" id="addNotes" rows="2"></textarea>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                <button type="button" class="btn btn-primary" onclick="addTarget()">
+                    <i class="bi bi-plus-circle"></i> Добавить
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Edit Target Modal -->
+<div class="modal fade" id="editTargetModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-warning text-dark">
+                <h5 class="modal-title"><i class="bi bi-pencil"></i> Редактировать цель</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="editTargetForm">
+                    <input type="hidden" id="editId">
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Домен</label>
+                            <input type="text" class="form-control" id="editDomain" required>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">Название</label>
+                            <input type="text" class="form-control" id="editTitle">
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Ключевые слова</label>
+                        <textarea class="form-control" id="editKeywords" rows="5" required></textarea>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Визитов в день</label>
+                            <input type="number" class="form-control" id="editVisitsPerDay" min="1">
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Макс. страниц поиска</label>
+                            <input type="number" class="form-control" id="editMaxPages" min="1" max="10">
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">Одновременных</label>
+                            <input type="number" class="form-control" id="editConcurrent" min="1" max="5">
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">Мин. интервал (мин)</label>
+                            <input type="number" class="form-control" id="editMinInterval" min="5">
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">Макс. интервал (мин)</label>
+                            <input type="number" class="form-control" id="editMaxInterval" min="10">
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">Мин. на сайте (сек)</label>
+                            <input type="number" class="form-control" id="editMinTime" min="5">
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">Макс. на сайте (сек)</label>
+                            <input type="number" class="form-control" id="editMaxTime" min="10">
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Заметки</label>
+                        <textarea class="form-control" id="editNotes" rows="2"></textarea>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                <button type="button" class="btn btn-warning" onclick="updateTarget()">
+                    <i class="bi bi-save"></i> Сохранить
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Launch Modal -->
+<div class="modal fade" id="launchModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header bg-success text-white">
+                <h5 class="modal-title"><i class="bi bi-rocket"></i> Запуск поисковых визитов</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p>Домен: <strong id="launchDomain"></strong></p>
+                <div class="mb-3">
+                    <label class="form-label">Количество визитов</label>
+                    <input type="number" class="form-control" id="launchCount" value="5" min="1" max="50">
+                </div>
+                <input type="hidden" id="launchTargetId">
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                <button type="button" class="btn btn-success" onclick="doLaunch()">
+                    <i class="bi bi-rocket"></i> Запустить
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+let targets = [];
+
+document.addEventListener('DOMContentLoaded', () => {
+    loadTargets();
+    loadLogs();
+    setInterval(loadLogs, 15000);
+});
+
+async function loadTargets() {
+    try {
+        const resp = await apiCall('/yandex-search-targets');
+        targets = resp;
+        renderTargets();
+        updateStats();
+    } catch (err) {
+        console.error('Failed to load targets:', err);
+    }
+}
+
+function updateStats() {
+    const total = targets.length;
+    const active = targets.filter(t => t.is_active).length;
+    const todayVisits = targets.reduce((s, t) => s + (t.today_visits || 0), 0);
+    const totalVisits = targets.reduce((s, t) => s + (t.total_visits || 0), 0);
+    const successVisits = targets.reduce((s, t) => s + (t.successful_visits || 0), 0);
+    const rate = totalVisits > 0 ? Math.round(successVisits / totalVisits * 100) : 0;
+
+    document.getElementById('statTotal').textContent = total;
+    document.getElementById('statActive').textContent = active;
+    document.getElementById('statTodayVisits').textContent = todayVisits;
+    document.getElementById('statSuccessRate').textContent = rate + '%';
+}
+
+function renderTargets() {
+    const tbody = document.getElementById('targetsTableBody');
+    if (!targets.length) {
+        tbody.innerHTML = '<tr><td colspan="8" class="text-center py-4 text-muted">Нет целей. Нажмите "Добавить цель".</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = targets.map(t => {
+        const keywords = t.keywords_list || [];
+        const kwPreview = keywords.slice(0, 3).join(', ') + (keywords.length > 3 ? ` (+${keywords.length - 3})` : '');
+        const successRate = t.total_visits > 0 ? Math.round(t.successful_visits / t.total_visits * 100) : 0;
+        const statusBadge = t.is_active
+            ? '<span class="badge bg-success">Активна</span>'
+            : '<span class="badge bg-secondary">Пауза</span>';
+
+        return `<tr>
+            <td>${t.id}</td>
+            <td><strong>${t.domain}</strong></td>
+            <td>
+                <small class="text-muted" title="${keywords.join('\n')}">${kwPreview}</small>
+                <span class="badge bg-light text-dark ms-1">${t.keywords_count} шт.</span>
+            </td>
+            <td>
+                <span class="badge bg-info">${t.today_visits || 0}/${t.visits_per_day}</span>
+            </td>
+            <td>
+                <small>
+                    <span class="text-success">${t.successful_visits || 0}</span> /
+                    <span class="text-danger">${t.failed_visits || 0}</span> /
+                    <span class="text-muted">${t.total_visits || 0}</span>
+                    <br><span class="badge ${successRate >= 70 ? 'bg-success' : successRate >= 40 ? 'bg-warning' : 'bg-danger'}">${successRate}%</span>
+                </small>
+            </td>
+            <td>
+                <span class="badge bg-${t.not_found_count > 0 ? 'danger' : 'light text-dark'}">${t.not_found_count || 0}</span>
+            </td>
+            <td>${statusBadge}</td>
+            <td>
+                <div class="btn-group btn-group-sm">
+                    <button class="btn btn-success" onclick="showLaunchModal(${t.id}, '${t.domain}', ${t.visits_per_day})" title="Запустить">
+                        <i class="bi bi-rocket"></i>
+                    </button>
+                    <button class="btn btn-outline-primary" onclick="editTarget(${t.id})" title="Редактировать">
+                        <i class="bi bi-pencil"></i>
+                    </button>
+                    <button class="btn btn-outline-${t.is_active ? 'warning' : 'success'}" onclick="toggleTarget(${t.id})" title="${t.is_active ? 'Пауза' : 'Включить'}">
+                        <i class="bi bi-${t.is_active ? 'pause' : 'play'}"></i>
+                    </button>
+                    <button class="btn btn-outline-secondary" onclick="resetStats(${t.id})" title="Сбросить статистику">
+                        <i class="bi bi-arrow-counterclockwise"></i>
+                    </button>
+                    <button class="btn btn-outline-danger" onclick="deleteTarget(${t.id})" title="Удалить">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </div>
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+async function addTarget() {
+    const data = {
+        domain: document.getElementById('addDomain').value,
+        keywords: document.getElementById('addKeywords').value,
+        title: document.getElementById('addTitle').value,
+        visits_per_day: parseInt(document.getElementById('addVisitsPerDay').value) || 10,
+        max_search_pages: parseInt(document.getElementById('addMaxPages').value) || 3,
+        concurrent_visits: parseInt(document.getElementById('addConcurrent').value) || 1,
+        min_interval_minutes: parseInt(document.getElementById('addMinInterval').value) || 30,
+        max_interval_minutes: parseInt(document.getElementById('addMaxInterval').value) || 120,
+        min_time_on_site: parseInt(document.getElementById('addMinTime').value) || 30,
+        max_time_on_site: parseInt(document.getElementById('addMaxTime').value) || 120,
+        notes: document.getElementById('addNotes').value,
+    };
+
+    if (!data.domain || !data.keywords) {
+        alert('Домен и ключевые слова обязательны');
+        return;
+    }
+
+    try {
+        await apiCall('/yandex-search-targets', 'POST', data);
+        bootstrap.Modal.getInstance(document.getElementById('addTargetModal')).hide();
+        document.getElementById('addTargetForm').reset();
+        loadTargets();
+    } catch (err) {
+        alert('Ошибка: ' + (err.message || err));
+    }
+}
+
+function editTarget(id) {
+    const t = targets.find(x => x.id === id);
+    if (!t) return;
+    document.getElementById('editId').value = t.id;
+    document.getElementById('editDomain').value = t.domain;
+    document.getElementById('editTitle').value = t.title || '';
+    document.getElementById('editKeywords').value = t.keywords || '';
+    document.getElementById('editVisitsPerDay').value = t.visits_per_day;
+    document.getElementById('editMaxPages').value = t.max_search_pages;
+    document.getElementById('editConcurrent').value = t.concurrent_visits;
+    document.getElementById('editMinInterval').value = t.min_interval_minutes;
+    document.getElementById('editMaxInterval').value = t.max_interval_minutes;
+    document.getElementById('editMinTime').value = t.min_time_on_site;
+    document.getElementById('editMaxTime').value = t.max_time_on_site;
+    document.getElementById('editNotes').value = t.notes || '';
+    new bootstrap.Modal(document.getElementById('editTargetModal')).show();
+}
+
+async function updateTarget() {
+    const id = document.getElementById('editId').value;
+    const data = {
+        domain: document.getElementById('editDomain').value,
+        title: document.getElementById('editTitle').value,
+        keywords: document.getElementById('editKeywords').value,
+        visits_per_day: parseInt(document.getElementById('editVisitsPerDay').value),
+        max_search_pages: parseInt(document.getElementById('editMaxPages').value),
+        concurrent_visits: parseInt(document.getElementById('editConcurrent').value),
+        min_interval_minutes: parseInt(document.getElementById('editMinInterval').value),
+        max_interval_minutes: parseInt(document.getElementById('editMaxInterval').value),
+        min_time_on_site: parseInt(document.getElementById('editMinTime').value),
+        max_time_on_site: parseInt(document.getElementById('editMaxTime').value),
+        notes: document.getElementById('editNotes').value,
+    };
+
+    try {
+        await apiCall(`/yandex-search-targets/${id}`, 'PUT', data);
+        bootstrap.Modal.getInstance(document.getElementById('editTargetModal')).hide();
+        loadTargets();
+    } catch (err) {
+        alert('Ошибка: ' + (err.message || err));
+    }
+}
+
+async function toggleTarget(id) {
+    try {
+        await apiCall(`/yandex-search-targets/${id}/toggle`, 'POST');
+        loadTargets();
+    } catch (err) {
+        alert('Ошибка: ' + (err.message || err));
+    }
+}
+
+async function deleteTarget(id) {
+    if (!confirm('Удалить цель?')) return;
+    try {
+        await apiCall(`/yandex-search-targets/${id}`, 'DELETE');
+        loadTargets();
+    } catch (err) {
+        alert('Ошибка: ' + (err.message || err));
+    }
+}
+
+async function resetStats(id) {
+    if (!confirm('Сбросить статистику?')) return;
+    try {
+        await apiCall(`/yandex-search-targets/${id}/reset-stats`, 'POST');
+        loadTargets();
+    } catch (err) {
+        alert('Ошибка: ' + (err.message || err));
+    }
+}
+
+function showLaunchModal(id, domain, defaultCount) {
+    document.getElementById('launchTargetId').value = id;
+    document.getElementById('launchDomain').textContent = domain;
+    document.getElementById('launchCount').value = defaultCount || 5;
+    new bootstrap.Modal(document.getElementById('launchModal')).show();
+}
+
+async function doLaunch() {
+    const id = document.getElementById('launchTargetId').value;
+    const count = parseInt(document.getElementById('launchCount').value) || 5;
+
+    try {
+        const resp = await apiCall(`/yandex-search-targets/${id}/launch`, 'POST', { count });
+        bootstrap.Modal.getInstance(document.getElementById('launchModal')).hide();
+        alert(`Запущено ${resp.launched} визитов для ${resp.target}`);
+        loadTargets();
+        loadLogs();
+    } catch (err) {
+        alert('Ошибка запуска: ' + (err.detail || err.message || err));
+    }
+}
+
+async function loadLogs() {
+    try {
+        const logs = await apiCall('/yandex-search-logs?limit=30');
+        renderLogs(logs);
+    } catch (err) {
+        console.error('Failed to load logs:', err);
+    }
+}
+
+function renderLogs(logs) {
+    const tbody = document.getElementById('logsTableBody');
+    if (!logs.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="text-center py-3 text-muted">Нет логов</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = logs.map(t => {
+        const params = t.parameters || {};
+        const keyword = params.keyword || '—';
+        const domain = params.domain || '—';
+        const statusMap = {
+            'pending': '<span class="badge bg-secondary">Ожидает</span>',
+            'in_progress': '<span class="badge bg-primary"><span class="spinner-border spinner-border-sm me-1"></span>Выполняется</span>',
+            'completed': '<span class="badge bg-success">Успех</span>',
+            'failed': '<span class="badge bg-danger">Ошибка</span>',
+        };
+        const statusBadge = statusMap[t.status] || `<span class="badge bg-secondary">${t.status}</span>`;
+        const created = t.created_at ? new Date(t.created_at).toLocaleString('ru-RU') : '—';
+        
+        let details = '';
+        if (t.result) {
+            if (t.result.page_found) details += `стр.${t.result.page_found} поз.${t.result.position} `;
+            if (t.result.browse_time) details += `${Math.round(t.result.browse_time)}с на сайте`;
+        }
+        if (t.error_message) {
+            details = `<span class="text-danger">${t.error_message.substring(0, 60)}</span>`;
+        }
+
+        return `<tr>
+            <td><small>${created}</small></td>
+            <td><small>#${t.profile_id || '—'}</small></td>
+            <td><small><strong>${keyword}</strong> → ${domain}</small></td>
+            <td>${statusBadge}</td>
+            <td><small>${details}</small></td>
+        </tr>`;
+    }).join('');
+}
+</script>
+{% endblock %}

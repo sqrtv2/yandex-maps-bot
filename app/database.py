@@ -73,6 +73,7 @@ def create_tables():
             UserSettings,
             ProfileTargetVisit
         )
+        from .models.yandex_search_target import YandexSearchTarget
 
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables created successfully")

@@ -505,6 +505,20 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver) -> bool:
         logger.info(f"🔍 URL: {current_url[:120]}")
         
         # ============================================
+        # YANDEX KALEIDOSCOPE (slider puzzle) — check before silhouette/smartcaptcha
+        # ============================================
+        is_kaleidoscope = (
+            'kaleidoscope' in page_source_lower or
+            'captchaslider' in page_source_lower or
+            'kaleidoscopecanvas' in page_source_lower or
+            '/ru/kaleidoscope' in page_source_lower
+        )
+        
+        if is_kaleidoscope:
+            logger.info("🧩 Kaleidoscope (slider puzzle) detected! Solving via Capsola PazlCaptcha API...")
+            return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path)
+        
+        # ============================================
         # YANDEX SILHOUETTE / PAZL CAPTCHA (priority — detected before SmartCaptcha)
         # ============================================
         is_silhouette = (
@@ -829,14 +843,25 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str) -> bool:
                 logger.warning("❌ Checkbox captcha failed — no redirect, no image grid")
                 return False
         
-        # ШАГ 4: Check if this is a Silhouette captcha (redirect to PazlCaptcha solver)
+        # ШАГ 4: Detect captcha subtype (Kaleidoscope / Silhouette / Image grid)
         try:
             page_src_check = driver.page_source.lower()
+            
+            # 4a: Kaleidoscope (slider puzzle) → PazlCaptcha V1
+            if ('kaleidoscope' in page_src_check or
+                'captchaslider' in page_src_check or
+                'kaleidoscopecanvas' in page_src_check or
+                'captcha-slider' in page_src_check or
+                '/ru/kaleidoscope' in page_src_check):
+                logger.info("🧩 Kaleidoscope (slider puzzle) detected — using PazlCaptcha V1")
+                return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path)
+            
+            # 4b: Silhouette → SmartCaptcha
             if ('advancedcaptcha_silhouette' in page_src_check or
                 'advancedcaptcha-silhouettetask' in page_src_check or
                 'silhouette-container' in page_src_check or
                 '/silhouette' in page_src_check):
-                logger.info("🧩 Silhouette captcha detected after checkbox — switching to PazlCaptcha solver")
+                logger.info("🧩 Silhouette captcha detected after checkbox — switching to SmartCaptcha solver")
                 return _solve_yandex_silhouette_captcha(driver, screenshot_path)
         except:
             pass
@@ -925,29 +950,376 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str) -> bool:
         return False
 
 
-def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
-    """Solve Yandex Silhouette/PazlCaptcha using Capsola PazlCaptcha V1 API.
+def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str) -> bool:
+    """Solve Yandex Kaleidoscope (slider puzzle) captcha using Capsola PazlCaptcha API.
     
-    This captcha type shows an image with silhouettes that need to be clicked in order.
-    We send the full page HTML to Capsola PazlCaptcha V1 API.
-    The API returns coordinates of clicks to perform.
+    This captcha shows a scrambled 5x5 image grid with a slider (0 to ~42 steps).
+    Moving the slider applies tile swaps. The correct position assembles the puzzle.
     
-    Flow:
-    1. Get full page HTML
-    2. Send to Capsola PazlCaptcha V1
-    3. Parse result (coordinates)
-    4. Click on the image at returned coordinates
-    5. Submit the form
+    Strategy:
+    1. Get step from Capsola (V1 HTML first, then V2 image+permutations)
+    2. Set rep=step directly via JS and submit the form (no physical drag)
+    3. If failed, try step+1 on next captcha (Capsola can be off by 1)
+    4. Retry up to MAX_ATTEMPTS times
     """
     from app.config import settings
     from core.capsola_solver import create_capsola_solver
     
+    MAX_ATTEMPTS = 5
+    # Step adjustments to try: exact, +1, -1, exact, +1
+    STEP_ADJUSTMENTS = [0, 1, -1, 0, 1]
+    
     try:
         capsola = create_capsola_solver(settings.capsola_api_key)
         
-        # ШАГ 1: Получаем полный HTML страницы
-        page_html = driver.page_source
-        logger.info(f"🧩 Silhouette captcha: page HTML length = {len(page_html)}")
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            logger.info(f"🧩 Kaleidoscope attempt {attempt}/{MAX_ATTEMPTS}")
+            
+            # Save debug screenshot
+            try:
+                debug_ss = f"screenshots/kaleidoscope_debug_{int(time.time())}.png"
+                driver.save_screenshot(debug_ss)
+            except:
+                pass
+            
+            # Dump SSR_DATA for diagnostics
+            ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+            if ssr_data:
+                task_str = ssr_data.get('task', '')
+                image_src = ssr_data.get('imageSrc', '')
+                logger.info(f"📋 SSR_DATA: imageSrc={'yes' if image_src else 'no'}, task_len={len(task_str) if task_str else 0}")
+            else:
+                logger.warning("⚠️ No __SSR_DATA__ found!")
+            
+            step = None
+            
+            # === Get step from Capsola ===
+            # Try V1 (HTML) first — simpler and faster
+            page_html = driver.page_source
+            logger.info(f"📤 [V1] Sending HTML to Capsola PazlCaptcha ({len(page_html)} chars)...")
+            result = capsola.solve_pazl_captcha_v1(page_html, max_wait=120)
+            
+            if result and result.get('status') == 1:
+                answer = result.get('response', '')
+                logger.info(f"✅ [V1] Capsola PazlCaptcha answer: {answer}")
+                try:
+                    step = int(str(answer).strip())
+                except (ValueError, TypeError):
+                    logger.error(f"❌ [V1] Cannot parse step: {answer}")
+            else:
+                logger.warning(f"⚠️ [V1] PazlCaptcha V1 failed: {result}")
+            
+            # Try V2 if V1 didn't produce a step
+            if step is None:
+                v2_step = _get_kaleidoscope_v2_step(driver, capsola)
+                if v2_step is not None:
+                    step = v2_step
+            
+            if step is None:
+                logger.error(f"❌ No valid step from Capsola on attempt {attempt}")
+                if attempt < MAX_ATTEMPTS:
+                    logger.info("🔄 Refreshing page for new captcha...")
+                    driver.refresh()
+                    time.sleep(random.uniform(3, 6))
+                    continue
+                return False
+            
+            # Apply step adjustment for this attempt
+            adjustment = STEP_ADJUSTMENTS[(attempt - 1) % len(STEP_ADJUSTMENTS)]
+            adjusted_step = step + adjustment
+            logger.info(f"🔢 Capsola step: {step}, adjustment: {adjustment:+d}, submitting: {adjusted_step}")
+            
+            # Submit captcha with the adjusted step
+            solved = _move_kaleidoscope_slider(driver, adjusted_step)
+            if solved:
+                logger.info(f"🎉 Kaleidoscope solved on attempt {attempt} (step={adjusted_step}, adj={adjustment:+d})!")
+                return True
+            
+            logger.warning(f"⚠️ Kaleidoscope attempt {attempt} failed (step={adjusted_step})")
+            
+            if attempt < MAX_ATTEMPTS:
+                # After failed submission, Yandex redirects to new captcha page
+                time.sleep(random.uniform(1, 2))
+                
+                if not detect_captcha_or_block(driver):
+                    logger.info("🎉 Captcha disappeared after submit — solved!")
+                    return True
+                
+                page_src = driver.page_source.lower()
+                if 'kaleidoscope' not in page_src and 'captcha' not in page_src:
+                    logger.info("🔄 Different page after failed attempt — checking...")
+                    if not detect_captcha_or_block(driver):
+                        return True
+                    return False
+                
+                # Stay on current page — new captcha is already loaded (status=failed redirects to new captcha)
+                logger.info("🔄 New captcha loaded, retrying...")
+                time.sleep(random.uniform(1, 3))
+        
+        logger.error(f"❌ All {MAX_ATTEMPTS} kaleidoscope attempts failed")
+        return False
+        
+    except Exception as e:
+        logger.error(f"❌ Error solving Kaleidoscope: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def _get_kaleidoscope_v2_step(driver, capsola) -> int:
+    """Get kaleidoscope step via Capsola PazlCaptcha V2 (image + permutations)."""
+    try:
+        ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+        if not ssr_data:
+            logger.error("❌ [V2] No __SSR_DATA__ found")
+            return None
+        
+        image_src = ssr_data.get('imageSrc', '')
+        task_str = ssr_data.get('task', '')
+        
+        if not image_src or not task_str:
+            logger.error(f"❌ [V2] Missing imageSrc or task in SSR_DATA")
+            return None
+        
+        import json as json_mod
+        try:
+            permutations = json_mod.loads(task_str) if isinstance(task_str, str) else task_str
+        except:
+            logger.error(f"❌ [V2] Cannot parse task array: {task_str[:100]}")
+            return None
+        
+        import requests as req
+        cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+        resp = req.get(image_src, cookies=cookies, timeout=15, headers={
+            'User-Agent': driver.execute_script("return navigator.userAgent"),
+            'Referer': driver.current_url
+        })
+        
+        if resp.status_code != 200 or len(resp.content) < 100:
+            logger.error(f"❌ [V2] Failed to download image: {resp.status_code}")
+            return None
+        
+        image_data = resp.content
+        logger.info(f"📤 [V2] Sending image={len(image_data)}b, permutations={len(permutations)} items")
+        
+        result = capsola.solve_pazl_captcha_v2(image_data, permutations, max_wait=120)
+        
+        if not result or result.get('status') != 1:
+            logger.error(f"❌ [V2] PazlCaptcha V2 failed: {result}")
+            return None
+        
+        answer = result.get('response', '')
+        logger.info(f"✅ [V2] Capsola PazlCaptcha V2 answer: {answer}")
+        
+        try:
+            return int(str(answer).strip())
+        except (ValueError, TypeError):
+            logger.error(f"❌ [V2] Cannot parse step: {answer}")
+            return None
+        
+    except Exception as e:
+        logger.error(f"❌ [V2] Error: {e}")
+        return None
+
+
+def _move_kaleidoscope_slider(driver, step: int) -> bool:
+    """Set the kaleidoscope rep value and submit the form directly via JavaScript.
+    
+    Instead of physically dragging the slider (which fails to update React's internal state
+    and causes premature form.submit() with rep=0 on mouseup), we:
+    1. Wait for PoW (pdata) and fingerprint (rdata) fields to be computed
+    2. Set the hidden 'rep' input value directly to the target step
+    3. Submit the form via JS
+    4. Wait for redirect to determine success/failure
+    """
+    try:
+        # Get slider max value from __SSR_DATA__ task array
+        ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+        max_step = 42  # default
+        if ssr_data:
+            task_str = ssr_data.get('task', '')
+            try:
+                import json as json_mod
+                task_arr = json_mod.loads(task_str) if isinstance(task_str, str) else task_str
+                if isinstance(task_arr, list):
+                    max_step = len(task_arr) // 2
+                    logger.info(f"📋 Task array length: {len(task_arr)}, max_step: {max_step}")
+            except:
+                pass
+        
+        # Clamp step to valid range
+        step = max(0, min(step, max_step))
+        logger.info(f"🎯 Setting rep={step} (max={max_step})")
+        
+        # Wait for PoW (pdata) to be computed by page JavaScript
+        pdata_ready = False
+        for wait_i in range(15):
+            pdata = driver.execute_script(
+                "return document.querySelector('input[name=\"pdata\"]')?.value || '';"
+            )
+            if pdata and len(pdata) > 20:
+                logger.info(f"✅ PoW ready (pdata: {len(pdata)} chars)")
+                pdata_ready = True
+                break
+            time.sleep(1)
+            if wait_i % 3 == 2:
+                logger.info(f"⏳ Waiting for PoW computation... ({wait_i + 1}s)")
+        
+        if not pdata_ready:
+            logger.warning("⚠️ PoW (pdata) not computed after 15s, proceeding anyway")
+        
+        # Also check that rdata and picasso are present
+        form_status = driver.execute_script("""
+            var form = document.getElementById('advanced-captcha-form');
+            if (!form) {
+                var forms = document.querySelectorAll('form');
+                for (var i = 0; i < forms.length; i++) {
+                    if (forms[i].querySelector('input[name="rep"]')) {
+                        form = forms[i];
+                        break;
+                    }
+                }
+            }
+            if (!form) return {found: false};
+            return {
+                found: true,
+                repExists: !!form.querySelector('input[name="rep"]'),
+                rdataLen: (form.querySelector('input[name="rdata"]')?.value || '').length,
+                pdataLen: (form.querySelector('input[name="pdata"]')?.value || '').length,
+                picassoLen: (form.querySelector('input[name="picasso"]')?.value || '').length,
+                tdataLen: (form.querySelector('input[name="tdata"]')?.value || '').length,
+                formAction: (form.action || '').substring(0, 80)
+            };
+        """)
+        logger.info(f"📋 Form status: {form_status}")
+        
+        if not form_status or not form_status.get('found'):
+            logger.error("❌ Captcha form not found!")
+            return False
+        
+        # Small random delay to simulate "thinking" before submission
+        time.sleep(random.uniform(1.0, 3.0))
+        
+        # Set rep value and submit the form in one atomic JS call
+        pre_url = driver.current_url
+        submit_result = driver.execute_script(f"""
+            try {{
+                var form = document.getElementById('advanced-captcha-form');
+                if (!form) {{
+                    var forms = document.querySelectorAll('form');
+                    for (var i = 0; i < forms.length; i++) {{
+                        if (forms[i].querySelector('input[name="rep"]')) {{
+                            form = forms[i];
+                            break;
+                        }}
+                    }}
+                }}
+                if (!form) return {{success: false, error: 'Form not found'}};
+                
+                // Set rep value — remove readonly first
+                var repInput = form.querySelector('input[name="rep"]');
+                if (!repInput) return {{success: false, error: 'Rep input not found'}};
+                
+                repInput.removeAttribute('readonly');
+                repInput.value = '{step}';
+                
+                // Also update aria attributes on slider for consistency
+                var slider = document.querySelector('[role="slider"], #captcha-slider, .Thumb');
+                if (slider) {{
+                    slider.setAttribute('aria-valuenow', '{step}');
+                    slider.setAttribute('aria-valuetext', '{step}');
+                }}
+                
+                // Verify rep value was set
+                var finalRep = repInput.value;
+                
+                // Submit the form
+                form.submit();
+                
+                return {{
+                    success: true,
+                    repValue: finalRep
+                }};
+            }} catch(e) {{
+                return {{success: false, error: e.message}};
+            }}
+        """)
+        
+        logger.info(f"📨 Submit result: {submit_result}")
+        
+        if not submit_result or not submit_result.get('success'):
+            logger.error(f"❌ Form submission failed: {submit_result}")
+            return False
+        
+        # Wait for page navigation (form POST → redirect)
+        for wait_i in range(20):
+            time.sleep(1)
+            try:
+                new_url = driver.current_url
+                if new_url != pre_url:
+                    # Page changed — check result
+                    if 'status=failed' in new_url.lower():
+                        logger.warning(f"❌ Yandex returned status=failed for step={step}")
+                        return False
+                    
+                    if 'showcaptcha' not in new_url.lower() and 'checkcaptcha' not in new_url.lower():
+                        # Redirected away from captcha — success!
+                        logger.info(f"🎉 Redirected to: {new_url[:100]}")
+                        time.sleep(1)
+                        if not detect_captcha_or_block(driver):
+                            return True
+                        # New captcha appeared at destination — still a failure for this attempt
+                        logger.warning("⚠️ New captcha at redirect destination")
+                        return False
+                    
+                    if 'checkcaptcha' in new_url.lower():
+                        # Still processing
+                        logger.info(f"⏳ Processing... ({wait_i}s)")
+                        continue
+                    
+                    # Other showcaptcha URL without status=failed — new captcha
+                    logger.info(f"⏳ Redirected to new captcha: {new_url[:100]}")
+                    time.sleep(2)
+                    return False
+            except Exception as e:
+                logger.debug(f"URL check error: {e}")
+                pass
+        
+        # Timeout — check final state
+        if not detect_captcha_or_block(driver):
+            logger.info("🎉 Captcha gone after wait — solved!")
+            return True
+        
+        logger.warning(f"⚠️ Still on captcha after 20s wait")
+        return False
+        
+    except Exception as e:
+        logger.error(f"❌ Error in slider submission: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
+    """Solve Yandex Silhouette/PazlCaptcha using Capsola PazlCaptcha V1 API.
+    
+    This captcha type shows an image with silhouettes that need to be clicked in order.
+    It is actually a SmartCaptcha variant — two images (click area + task icons) and 
+    coordinate-based response, NOT a PazlCaptcha (puzzle permutation).
+    
+    Flow:
+    1. Extract silhouette image (click area) and task icons image
+    2. Download actual images from src URLs (better quality than screenshots)
+    3. Send to Capsola SmartCaptcha API
+    4. Parse coordinate result and click on the image
+    5. Submit the form
+    """
+    from app.config import settings
+    from core.capsola_solver import create_capsola_solver
+    import requests as req
+    
+    try:
+        capsola = create_capsola_solver(settings.capsola_api_key)
         
         # Save debug screenshot
         try:
@@ -955,32 +1327,119 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
             driver.save_screenshot(debug_ss)
             debug_html = debug_ss.replace('.png', '.html')
             with open(debug_html, 'w', encoding='utf-8') as f:
-                f.write(page_html)
+                f.write(driver.page_source)
             logger.info(f"📄 Silhouette debug saved: {debug_html}")
         except:
             pass
         
-        # ШАГ 2: Пробуем PazlCaptcha V1 (полный HTML)
-        logger.info("🔄 Sending Silhouette captcha to Capsola PazlCaptcha V1...")
-        result = capsola.solve_pazl_captcha_v1(page_html, max_wait=120)
+        # ШАГ 1: Extract the two images — silhouette (click area) and task icons
+        click_image_data = None  # main silhouette image 
+        task_image_data = None   # task icons strip
+        
+        # --- Try downloading images from src URLs first (best quality) ---
+        try:
+            # Get image URLs from __SSR_DATA__ or from img elements
+            image_src = None
+            task_image_src = None
+            
+            # Try __SSR_DATA__ first
+            ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+            if ssr_data and isinstance(ssr_data, dict):
+                image_src = ssr_data.get('imageSrc')
+                task_image_src = ssr_data.get('taskImageSrc')
+                logger.info(f"📋 SSR_DATA: imageSrc={'yes' if image_src else 'no'}, taskImageSrc={'yes' if task_image_src else 'no'}")
+            
+            # Fallback: get from img elements
+            if not image_src:
+                try:
+                    el = driver.find_element(By.CSS_SELECTOR, "[data-testid='silhouette-container'] img, .AdvancedCaptcha-ImageWrapper img")
+                    image_src = el.get_attribute('src')
+                except:
+                    pass
+            
+            if not task_image_src:
+                try:
+                    el = driver.find_element(By.CSS_SELECTOR, ".AdvancedCaptcha-SilhouetteTask img.TaskImage, .AdvancedCaptcha-SilhouetteTask img")
+                    task_image_src = el.get_attribute('src')
+                except:
+                    pass
+            
+            # Download images
+            if image_src and image_src.startswith('http'):
+                logger.info(f"📥 Downloading silhouette image from URL...")
+                cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+                resp = req.get(image_src, cookies=cookies, timeout=15, headers={
+                    'User-Agent': driver.execute_script("return navigator.userAgent"),
+                    'Referer': driver.current_url
+                })
+                if resp.status_code == 200 and len(resp.content) > 100:
+                    click_image_data = resp.content
+                    logger.info(f"✅ Downloaded silhouette image: {len(click_image_data)} bytes")
+            
+            if task_image_src and task_image_src.startswith('http'):
+                logger.info(f"📥 Downloading task icons image from URL...")
+                cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+                resp = req.get(task_image_src, cookies=cookies, timeout=15, headers={
+                    'User-Agent': driver.execute_script("return navigator.userAgent"),
+                    'Referer': driver.current_url
+                })
+                if resp.status_code == 200 and len(resp.content) > 100:
+                    task_image_data = resp.content
+                    logger.info(f"✅ Downloaded task icons image: {len(task_image_data)} bytes")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to download images from URLs: {e}")
+        
+        # --- Fallback: screenshot elements ---
+        if not click_image_data:
+            try:
+                for sel in ["[data-testid='silhouette-container'] img", ".AdvancedCaptcha-ImageWrapper img",
+                            ".AdvancedCaptcha-View img[alt='Image challenge']"]:
+                    try:
+                        el = driver.find_element(By.CSS_SELECTOR, sel)
+                        if el.is_displayed():
+                            click_image_data = el.screenshot_as_png
+                            logger.info(f"📸 Screenshot silhouette image via {sel}: {len(click_image_data)} bytes")
+                            break
+                    except:
+                        continue
+            except:
+                pass
+        
+        if not task_image_data:
+            try:
+                for sel in [".AdvancedCaptcha-SilhouetteTask img.TaskImage", 
+                            ".AdvancedCaptcha-SilhouetteTask img",
+                            ".AdvancedCaptcha img.TaskImage"]:
+                    try:
+                        el = driver.find_element(By.CSS_SELECTOR, sel)
+                        if el.is_displayed():
+                            task_image_data = el.screenshot_as_png
+                            logger.info(f"📸 Screenshot task icons via {sel}: {len(task_image_data)} bytes")
+                            break
+                    except:
+                        continue
+            except:
+                pass
+        
+        if not click_image_data or not task_image_data:
+            logger.error(f"❌ Could not extract silhouette images (click={'yes' if click_image_data else 'no'}, task={'yes' if task_image_data else 'no'})")
+            # Fallback to full screenshot approach
+            return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
+        
+        # ШАГ 2: Send to Capsola SmartCaptcha API (NOT PazlCaptcha!)
+        # For SmartCaptcha: click = main image (silhouette), task = task description icons
+        logger.info(f"🔄 Sending Silhouette as SmartCaptcha to Capsola (click={len(click_image_data)}b, task={len(task_image_data)}b)...")
+        result = capsola.solve_smart_captcha(click_image_data, task_image_data, max_wait=120)
         
         if not result or result.get('status') != 1:
-            logger.warning(f"⚠️ PazlCaptcha V1 failed: {result}")
-            
-            # Fallback: попробуем PazlCaptcha V2 (image + permutations)
-            logger.info("🔄 Trying PazlCaptcha V2 fallback...")
-            result = _try_pazl_captcha_v2(driver, capsola)
-            
-            if not result or result.get('status') != 1:
-                logger.error(f"❌ PazlCaptcha V2 also failed: {result}")
-                # Last fallback: try as SmartCaptcha
-                logger.info("🔄 Final fallback: trying as SmartCaptcha...")
-                return _solve_yandex_showcaptcha(driver, screenshot_path)
+            logger.warning(f"⚠️ SmartCaptcha failed for silhouette: {result}")
+            # Fallback to full screenshot
+            return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
         
         answer = result.get('response', '')
-        logger.info(f"✅ PazlCaptcha answer: {answer}")
+        logger.info(f"✅ SmartCaptcha silhouette answer: {answer}")
         
-        # ШАГ 3: Парсим и применяем результат
+        # ШАГ 3: Apply coordinate-based answer
         return _apply_silhouette_answer(driver, answer)
         
     except Exception as e:
@@ -1121,21 +1580,28 @@ def _apply_silhouette_answer(driver, answer) -> bool:
             
             if coord_pairs:
                 logger.info(f"📍 Found {len(coord_pairs)} coordinate pairs to click")
+                
+                # Selenium 4 uses center-based offset, Capsola returns top-left coords
+                img_size = image_element.size
+                cx = img_size['width'] / 2
+                cy = img_size['height'] / 2
+                logger.info(f"📐 Image size: {img_size['width']}x{img_size['height']}, center: ({cx:.0f}, {cy:.0f})")
+                
                 for i, (x_str, y_str) in enumerate(coord_pairs):
                     try:
                         x, y = float(x_str), float(y_str)
                         
-                        # Click relative to image element with slight random offset
-                        offset_x = random.randint(-1, 1)
-                        offset_y = random.randint(-1, 1)
+                        # Convert top-left based coords to center-based for Selenium 4
+                        offset_x = int(x - cx) + random.randint(-1, 1)
+                        offset_y = int(y - cy) + random.randint(-1, 1)
                         
                         ActionChains(driver)\
-                            .move_to_element_with_offset(image_element, int(x) + offset_x, int(y) + offset_y)\
+                            .move_to_element_with_offset(image_element, offset_x, offset_y)\
                             .pause(random.uniform(0.2, 0.5))\
                             .click()\
                             .perform()
                         
-                        logger.info(f"✅ Silhouette click {i+1}: ({x:.1f}, {y:.1f})")
+                        logger.info(f"✅ Silhouette click {i+1}: raw=({x:.1f}, {y:.1f}), offset=({offset_x}, {offset_y})")
                         time.sleep(random.uniform(0.3, 0.8))
                     except Exception as e:
                         logger.warning(f"Click error at ({x_str}, {y_str}): {e}")
@@ -1143,13 +1609,19 @@ def _apply_silhouette_answer(driver, answer) -> bool:
                 # Try "x1,y1;x2,y2" format or "x1,y1,x2,y2" format
                 parts = coords_str.replace(';', ',').split(',')
                 if len(parts) >= 2 and len(parts) % 2 == 0:
+                    img_size = image_element.size
+                    cx = img_size['width'] / 2
+                    cy = img_size['height'] / 2
                     for i in range(0, len(parts), 2):
                         try:
                             x = float(parts[i].strip())
                             y = float(parts[i+1].strip())
                             
+                            offset_x = int(x - cx)
+                            offset_y = int(y - cy)
+                            
                             ActionChains(driver)\
-                                .move_to_element_with_offset(image_element, int(x), int(y))\
+                                .move_to_element_with_offset(image_element, offset_x, offset_y)\
                                 .pause(random.uniform(0.2, 0.5))\
                                 .click()\
                                 .perform()
@@ -1310,13 +1782,23 @@ def _send_to_capsola_and_click(driver, capsola, click_image_data: bytes, task_im
             coord_pairs = re.findall(r'x=([\d.]+),\s*y=([\d.]+)', coords_str)
             
             if coord_pairs:
+                # Selenium 4: move_to_element_with_offset uses center-based coords
+                grid_cx = 0
+                grid_cy = 0
+                if grid_element:
+                    grid_size = grid_element.size
+                    grid_cx = grid_size.get('width', 0) / 2
+                    grid_cy = grid_size.get('height', 0) / 2
+                    logger.info(f"📐 Grid size: {grid_size.get('width')}x{grid_size.get('height')}")
+                
                 for x_str, y_str in coord_pairs:
                     try:
                         x, y = float(x_str), float(y_str)
                         
                         if grid_element:
+                            # Convert top-left coords to center-based offset
                             ActionChains(driver).move_to_element_with_offset(
-                                grid_element, int(x), int(y)
+                                grid_element, int(x - grid_cx), int(y - grid_cy)
                             ).click().perform()
                         else:
                             # Use JS to click at coordinates

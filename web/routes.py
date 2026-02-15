@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 
 from app.database import get_db
 from app.models import BrowserProfile, ProxyServer, Task, UserSettings, YandexMapTarget, ProfileTargetVisit
+from app.models.yandex_search_target import YandexSearchTarget
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,15 @@ async def yandex_targets_page(request: Request):
         return HTMLResponse("<h1>Templates not found</h1>")
 
     return templates.TemplateResponse("yandex_targets.html", {"request": request})
+
+
+@router.get("/yandex-search", response_class=HTMLResponse)
+async def yandex_search_page(request: Request):
+    """Yandex Search click-through targets management page."""
+    if not templates:
+        return HTMLResponse("<h1>Templates not found</h1>")
+
+    return templates.TemplateResponse("yandex_search.html", {"request": request})
 
 
 # Advanced API Routes
@@ -1332,4 +1342,279 @@ async def cancel_stalled_tasks(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Error cancelling stalled tasks: {e}")
         db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# Yandex Search Click-Through API
+# ============================================================
+
+@router.get("/api/yandex-search-targets")
+async def get_yandex_search_targets(db: Session = Depends(get_db)):
+    """Get all Yandex Search click-through targets."""
+    try:
+        targets = db.query(YandexSearchTarget).order_by(YandexSearchTarget.created_at.desc()).all()
+        return [t.to_dict() for t in targets]
+    except Exception as e:
+        logger.error(f"Error getting search targets: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/yandex-search-targets")
+async def create_yandex_search_target(body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Create a new Yandex Search target."""
+    try:
+        domain = body.get("domain", "").strip()
+        keywords = body.get("keywords", "").strip()
+        if not domain:
+            raise HTTPException(status_code=400, detail="Домен обязателен")
+        if not keywords:
+            raise HTTPException(status_code=400, detail="Ключевые слова обязательны")
+
+        # Clean domain
+        domain = domain.replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/")
+
+        target = YandexSearchTarget(
+            domain=domain,
+            keywords=keywords,
+            title=body.get("title", ""),
+            visits_per_day=body.get("visits_per_day", 10),
+            min_interval_minutes=body.get("min_interval_minutes", 30),
+            max_interval_minutes=body.get("max_interval_minutes", 120),
+            max_search_pages=body.get("max_search_pages", 3),
+            min_time_on_site=body.get("min_time_on_site", 30),
+            max_time_on_site=body.get("max_time_on_site", 120),
+            concurrent_visits=body.get("concurrent_visits", 1),
+            priority=body.get("priority", 5),
+            notes=body.get("notes", ""),
+        )
+        db.add(target)
+        db.commit()
+        db.refresh(target)
+        return target.to_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating search target: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/api/yandex-search-targets/{target_id}")
+async def update_yandex_search_target(target_id: int, body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Update a Yandex Search target."""
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+
+        updatable = [
+            "domain", "keywords", "title", "visits_per_day",
+            "min_interval_minutes", "max_interval_minutes",
+            "max_search_pages", "min_time_on_site", "max_time_on_site",
+            "concurrent_visits", "priority", "notes"
+        ]
+        for field in updatable:
+            if field in body:
+                val = body[field]
+                if field == "domain":
+                    val = val.replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/")
+                setattr(target, field, val)
+
+        db.commit()
+        db.refresh(target)
+        return target.to_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating search target: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/yandex-search-targets/{target_id}")
+async def delete_yandex_search_target(target_id: int, db: Session = Depends(get_db)):
+    """Delete a Yandex Search target."""
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+        db.delete(target)
+        db.commit()
+        return {"message": "Deleted", "id": target_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/yandex-search-targets/{target_id}/toggle")
+async def toggle_yandex_search_target(target_id: int, db: Session = Depends(get_db)):
+    """Toggle active status of a search target."""
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+        target.is_active = not target.is_active
+        db.commit()
+        return {"id": target_id, "is_active": target.is_active}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/yandex-search-targets/{target_id}/launch")
+async def launch_search_visits(target_id: int, body: Dict[str, Any] = None, db: Session = Depends(get_db)):
+    """Launch search click-through visits for a target."""
+    import random as _random
+
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+
+        body = body or {}
+        count = body.get("count", None) or target.visits_per_day or 5
+
+        # Pre-checks
+        try:
+            import redis
+            from app.config import settings as _settings
+            r = redis.Redis(host=_settings.redis_host, port=_settings.redis_port, socket_connect_timeout=2)
+            r.ping()
+        except Exception as redis_err:
+            raise HTTPException(status_code=503, detail=f"Redis недоступен: {redis_err}")
+
+        try:
+            from tasks.yandex_search import yandex_search_click_task
+        except ImportError as imp_err:
+            raise HTTPException(status_code=503, detail=f"Celery задачи недоступны: {imp_err}")
+
+        try:
+            from tasks.celery_app import celery_app as _celery
+            inspector = _celery.control.inspect(timeout=2)
+            active_workers = inspector.ping()
+            if not active_workers:
+                raise HTTPException(status_code=503, detail="Celery worker не запущен")
+        except HTTPException:
+            raise
+        except Exception as celery_err:
+            raise HTTPException(status_code=503, detail=f"Celery check failed: {celery_err}")
+
+        # Get warmed profiles
+        profiles = db.query(BrowserProfile).filter(
+            BrowserProfile.is_active == True,
+            BrowserProfile.warmup_completed == True,
+            BrowserProfile.status == "warmed"
+        ).all()
+
+        if not profiles:
+            raise HTTPException(status_code=400, detail="Нет прогретых профилей")
+
+        actual_count = min(count, len(profiles))
+        selected = _random.sample(profiles, actual_count)
+        keywords = target.get_keywords_list()
+
+        if not keywords:
+            raise HTTPException(status_code=400, detail="Нет ключевых слов")
+
+        search_params = {
+            'max_search_pages': target.max_search_pages,
+            'min_time_on_site': target.min_time_on_site,
+            'max_time_on_site': target.max_time_on_site,
+        }
+
+        launched = []
+        for idx, profile in enumerate(selected):
+            keyword = _random.choice(keywords)
+            task = Task(
+                name=f"Поиск '{keyword}' → {target.domain}",
+                task_type="yandex_search",
+                profile_id=profile.id,
+                target_url=f"https://yandex.ru/search/?text={keyword}",
+                parameters={
+                    'keyword': keyword,
+                    'domain': target.domain,
+                    'target_id': target.id,
+                    **search_params
+                },
+                priority="high",
+                status="pending"
+            )
+            db.add(task)
+            db.flush()
+
+            delay_seconds = idx * _random.randint(10, 30)
+
+            try:
+                yandex_search_click_task.apply_async(
+                    args=[profile.id, target.id, keyword, task.id, search_params],
+                    countdown=delay_seconds,
+                    queue='yandex'
+                )
+                task.status = "pending"
+                launched.append({
+                    "task_id": task.id,
+                    "profile_id": profile.id,
+                    "keyword": keyword,
+                    "delay": delay_seconds
+                })
+            except Exception as send_err:
+                task.status = "failed"
+                task.error_message = str(send_err)
+
+        db.commit()
+
+        return {
+            "message": f"Запущено {len(launched)} поисковых визитов",
+            "launched": len(launched),
+            "total_profiles": len(profiles),
+            "target": target.domain,
+            "tasks": launched
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error launching search visits: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/yandex-search-targets/{target_id}/reset-stats")
+async def reset_search_target_stats(target_id: int, db: Session = Depends(get_db)):
+    """Reset statistics for a search target."""
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+        target.total_visits = 0
+        target.successful_visits = 0
+        target.failed_visits = 0
+        target.not_found_count = 0
+        target.today_visits = 0
+        target.today_successful = 0
+        target.today_failed = 0
+        db.commit()
+        return {"message": "Stats reset", "id": target_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/yandex-search-logs")
+async def get_yandex_search_logs(db: Session = Depends(get_db), limit: int = 50):
+    """Get recent search click-through task logs."""
+    try:
+        tasks = db.query(Task).filter(
+            Task.task_type == "yandex_search"
+        ).order_by(Task.created_at.desc()).limit(limit).all()
+
+        return [t.to_dict() for t in tasks]
+    except Exception as e:
+        logger.error(f"Error getting search logs: {e}")
         raise HTTPException(status_code=500, detail=str(e))

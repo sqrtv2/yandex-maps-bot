@@ -13,6 +13,7 @@ from app.database import Base
 class TaskType(str, Enum):
     WARMUP = "warmup"
     YANDEX_VISIT = "yandex_visit"
+    YANDEX_SEARCH = "yandex_search"
     HEALTH_CHECK = "health_check"
     PROFILE_CREATION = "profile_creation"
 

@@ -151,6 +151,12 @@
                             </a>
                         </li>
                         <li class="nav-item">
+                            <a class="nav-link {% if 'yandex-search' in request.url.path %}active{% endif %}" href="/yandex-search">
+                                <i class="bi bi-search"></i>
+                                Яндекс Поиск
+                            </a>
+                        </li>
+                        <li class="nav-item">
                             <a class="nav-link {% if 'domains' in request.url.path %}active{% endif %}" href="/domains">
                                 <i class="bi bi-globe"></i>
                                 Domain Management

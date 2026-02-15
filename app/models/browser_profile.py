@@ -39,6 +39,8 @@ class BrowserProfile(Base):
     warmup_completed = Column(Boolean, default=False, index=True)
     warmup_sessions_count = Column(Integer, default=0)
     warmup_time_spent = Column(Integer, default=0)  # in minutes
+    warmup_stage = Column(Integer, default=0)  # 0=not started, 1-5=session number completed
+    first_warmup_at = Column(DateTime, nullable=True)  # when first warmup session was done
 
     # Proxy Settings
     proxy_host = Column(String(255), nullable=True)
@@ -106,7 +108,9 @@ class BrowserProfile(Base):
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'proxy_host': self.proxy_host,
             'proxy_port': self.proxy_port,
-            'proxy_type': self.proxy_type
+            'proxy_type': self.proxy_type,
+            'warmup_stage': self.warmup_stage or 0,
+            'first_warmup_at': self.first_warmup_at.isoformat() if self.first_warmup_at else None
         }
 
     def update_session_stats(self, success: bool = True):
@@ -125,20 +129,40 @@ class BrowserProfile(Base):
         return (self.successful_sessions / self.total_sessions) * 100
 
     def is_ready_for_tasks(self) -> bool:
-        """Check if profile is ready for Yandex Maps tasks."""
-        return (
-            self.status == "warmed" and
-            self.warmup_completed and
-            self.is_active
-        )
+        """Check if profile is ready for Yandex Maps tasks.
+        Requires 3+ warmup sessions and 6+ hours since first warmup.
+        """
+        if not (self.warmup_completed and self.is_active and self.status == "warmed"):
+            return False
+        return True
 
     def can_start_warmup(self) -> bool:
-        """Check if profile can start warmup process."""
-        return (
-            not self.warmup_completed and
-            self.is_active and
-            self.status in ["created", "active"]
-        )
+        """Check if profile can start next warmup session."""
+        if not self.is_active:
+            return False
+        if self.warmup_completed:
+            return False
+        return self.status in ["created", "active", "warmed"]
+
+    def needs_more_warmup(self) -> bool:
+        """Check if profile needs more warmup sessions before being fully warmed.
+        Requires 3+ sessions and 6+ hours since first warmup.
+        """
+        if self.warmup_completed:
+            return False
+        stage = self.warmup_stage or 0
+        if stage < 3:
+            return True
+        # Check time spread: at least 6 hours since first warmup
+        if self.first_warmup_at:
+            hours_since_first = (datetime.utcnow() - self.first_warmup_at).total_seconds() / 3600
+            if hours_since_first < 6:
+                return True  # needs to wait
+        return False  # 3+ sessions AND 6+ hours — can be marked warmed
+
+    def get_next_warmup_stage(self) -> int:
+        """Get the next warmup stage number (1-based)."""
+        return (self.warmup_stage or 0) + 1
 
     @classmethod
     def get_warmup_stats(cls, db):
