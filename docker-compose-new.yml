@@ -38,12 +38,13 @@ services:
     networks:
       - yandex_maps_network
 
-  # Celery worker for background tasks (scale with: docker compose up --scale celery_worker=3)
+  # Celery worker for warmup/default tasks
   celery_worker:
     build: .
+    container_name: yandex_maps_worker
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5 -Q default,warmup,yandex,proxy,maintenance
-    shm_size: '2gb'
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=25 -Q default,warmup,proxy,maintenance -n warmup@%h
+    shm_size: '8gb'
     environment:
       - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
       - YANDEX_BOT_REDIS_HOST=redis
@@ -71,8 +72,48 @@ services:
     deploy:
       resources:
         limits:
-          memory: 12G
+          memory: 48G
           cpus: '8'
+    networks:
+      - yandex_maps_network
+
+  # Celery worker for yandex visits only
+  celery_yandex:
+    build: .
+    container_name: yandex_maps_yandex_worker
+    init: true
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=3 -Q yandex -n yandex@%h
+    shm_size: '4gb'
+    environment:
+      - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
+      - YANDEX_BOT_REDIS_HOST=redis
+      - YANDEX_BOT_REDIS_PORT=6379
+      - YANDEX_BOT_DEBUG=false
+      - YANDEX_BOT_BROWSER_HEADLESS=true
+      - YANDEX_BOT_SAVE_SCREENSHOTS=false
+      - YANDEX_BOT_FAST_MODE=true
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./browser_profiles:/app/browser_profiles
+      - ./tasks:/app/tasks
+      - ./core:/app/core
+      - ./app:/app/app
+      - ./web:/app/web
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+          cpus: '4'
     networks:
       - yandex_maps_network
 
@@ -110,6 +151,8 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -123,6 +166,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: yandex_maps_redis
+    ports:
+      - "6379:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -140,8 +185,8 @@ services:
     build: .
     container_name: yandex_maps_flower
     command: celery -A tasks.celery_app flower --port=5555
-    expose:
-      - "5555"
+    ports:
+      - "5555:5555"
     environment:
       - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
       - YANDEX_BOT_REDIS_HOST=redis
@@ -164,9 +209,6 @@ services:
       - ./ssl:/etc/nginx/ssl:ro
     depends_on:
       - app
-      - flower
-      - grafana
-      - prometheus
     restart: unless-stopped
     networks:
       - yandex_maps_network
@@ -175,8 +217,8 @@ services:
   prometheus:
     image: prom/prometheus:latest
     container_name: yandex_maps_prometheus
-    expose:
-      - "9090"
+    ports:
+      - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -186,7 +228,6 @@ services:
       - '--web.console.libraries=/etc/prometheus/console_libraries'
       - '--web.console.templates=/etc/prometheus/consoles'
       - '--web.enable-lifecycle'
-      - '--web.external-url=/prometheus/'
     restart: unless-stopped
     networks:
       - yandex_maps_network
@@ -195,12 +236,10 @@ services:
   grafana:
     image: grafana/grafana:latest
     container_name: yandex_maps_grafana
-    expose:
-      - "3000"
+    ports:
+      - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin123
-      - GF_SERVER_ROOT_URL=http://localhost/grafana/
-      - GF_SERVER_SERVE_FROM_SUB_PATH=true
     volumes:
       - grafana_data:/var/lib/grafana
     depends_on:
@@ -221,4 +260,3 @@ volumes:
 
 networks:
   yandex_maps_network:
-    driver: bridge

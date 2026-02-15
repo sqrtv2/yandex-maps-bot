@@ -108,9 +108,13 @@ class YandexMapTarget(Base):
         return self.visits_per_day
     
     def is_action_enabled(self, action: str) -> bool:
-        """Check if specific action is enabled."""
+        """Check if specific action is enabled.
+        
+        If no actions are configured (enabled_actions is empty/NULL),
+        ALL actions are enabled by default.
+        """
         if not self.enabled_actions:
-            return False
+            return True  # All actions enabled by default
         return action in self.enabled_actions.split(',')
     
     def should_visit_now(self, current_time: datetime = None) -> tuple:

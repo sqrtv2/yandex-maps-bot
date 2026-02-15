@@ -18,6 +18,15 @@ echo ""
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
+# Remove stale PID file if the process is dead
+if [ -f logs/celery-beat.pid ]; then
+    OLD_PID=$(cat logs/celery-beat.pid 2>/dev/null)
+    if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "⚠️  Удалён устаревший PID-файл (процесс $OLD_PID не существует)"
+        rm -f logs/celery-beat.pid
+    fi
+fi
+
 # Start Celery Beat
 python3 -m celery -A tasks.celery_app.celery_app beat \
     --loglevel=info \

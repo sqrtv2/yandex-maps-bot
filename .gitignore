@@ -12,13 +12,13 @@ build/
 
 # Database
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
 dump.rdb
 
 # Celery
-celerybeat-schedule
-celerybeat-schedule-shm
-celerybeat-schedule-wal
+celerybeat-schedule*
 celerybeat.pid
 
 # Browser profiles (large, generated per-server)

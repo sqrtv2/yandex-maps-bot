@@ -125,7 +125,7 @@ class ProxyServer(Base):
         self._update_success_rate()
 
     def update_failure(self, error_message: str = None):
-        """Update statistics after failed request."""
+        """Update statistics after failed request. Proxy always stays working."""
         self.total_requests += 1
         self.failed_requests += 1
         self.consecutive_failures += 1
@@ -135,15 +135,9 @@ class ProxyServer(Base):
         if error_message:
             self.last_error_message = error_message
 
-        # Mark as not working after 3 consecutive failures
-        if self.consecutive_failures >= 3:
-            self.is_working = False
-            self.status = "failed"
-
-        # Ban proxy for 1 hour after 10 consecutive failures
-        if self.consecutive_failures >= 10:
-            self.status = "banned"
-            self.ban_until = datetime.utcnow() + timedelta(hours=1)
+        # Never ban or disable — proxy always stays available
+        self.is_working = True
+        self.status = "working"
 
         self._update_success_rate()
 
@@ -156,13 +150,11 @@ class ProxyServer(Base):
 
     def is_available(self) -> bool:
         """Check if proxy is available for use."""
-        if not self.is_active or not self.is_working:
+        if not self.is_active:
             return False
 
-        if self.status == "banned" and self.ban_until:
-            return datetime.utcnow() > self.ban_until
-
-        return self.status in ["unchecked", "working"]
+        # Proxy is always available if active
+        return True
 
     def needs_health_check(self) -> bool:
         """Check if proxy needs health check."""
@@ -172,15 +164,8 @@ class ProxyServer(Base):
         if not self.last_check_at:
             return True
 
-        # Check every 10 minutes for working proxies
-        if self.status == "working":
-            return datetime.utcnow() - self.last_check_at > timedelta(minutes=10)
-
-        # Check every 30 minutes for failed proxies
-        if self.status == "failed":
-            return datetime.utcnow() - self.last_check_at > timedelta(minutes=30)
-
-        return False
+        # Check every 10 minutes
+        return datetime.utcnow() - self.last_check_at > timedelta(minutes=10)
 
     def reset_ban(self):
         """Reset ban status."""

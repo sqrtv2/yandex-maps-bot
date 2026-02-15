@@ -102,6 +102,31 @@
     </div>
 </div>
 
+<!-- Process Monitor Alerts Panel -->
+<div class="row mb-4" id="processMonitorPanel" style="display: none;">
+    <div class="col-12">
+        <div class="card" id="processMonitorCard">
+            <div class="card-header d-flex justify-content-between align-items-center" id="processMonitorHeader">
+                <div>
+                    <h6 class="mb-0">
+                        <i class="bi bi-activity"></i> Мониторинг процессов
+                        <span class="badge bg-secondary ms-2" id="alertsCountBadge">0</span>
+                    </h6>
+                </div>
+                <div>
+                    <span class="badge me-2" id="celeryWorkerBadge">Worker: ?</span>
+                    <span class="badge me-2" id="celeryBeatBadge">Beat: ?</span>
+                    <span class="badge me-2" id="chromeBadge">Chrome: ?</span>
+                    <small class="text-muted" id="monitorLastChecked"></small>
+                </div>
+            </div>
+            <div class="card-body p-0" id="processMonitorBody">
+                <!-- Alerts will be injected here -->
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Filters and Search -->
 <div class="card mb-4">
     <div class="card-header">
@@ -280,8 +305,8 @@
                     <div class="row">
                         <div class="col-md-6">
                             <label for="profileCount" class="form-label">Number of Profiles</label>
-                            <input type="number" class="form-control" id="profileCount" min="1" max="50" value="5" required>
-                            <div class="form-text">Maximum 50 profiles at once</div>
+                            <input type="number" class="form-control" id="profileCount" min="1" max="10000" value="100" required>
+                            <div class="form-text">Up to 10 000 profiles at once</div>
                         </div>
                         <div class="col-md-6">
                             <label for="profileNamePrefix" class="form-label">Name Prefix</label>
@@ -380,8 +405,17 @@
                     <div class="mt-3">
                         <div class="alert alert-info">
                             <i class="bi bi-info-circle"></i>
-                            <strong>Note:</strong> Creating many profiles at once may take a few moments. Each profile will have unique fingerprints and parameters.
+                            <strong>Note:</strong> Profiles are created in batches of 500. Each profile gets unique fingerprints. Creating 10 000 profiles takes ~15-30 seconds.
                         </div>
+                    </div>
+
+                    <!-- Progress bar (hidden by default) -->
+                    <div id="bulkProgressContainer" class="mt-3" style="display:none;">
+                        <label class="form-label fw-bold">Creating profiles…</label>
+                        <div class="progress" style="height: 24px;">
+                            <div id="bulkProgressBar" class="progress-bar progress-bar-striped progress-bar-animated bg-success" role="progressbar" style="width: 0%">0%</div>
+                        </div>
+                        <small id="bulkProgressText" class="text-muted">0 / 0</small>
                     </div>
                 </form>
             </div>
@@ -410,6 +444,10 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // Update overall progress every 5 seconds
     setInterval(updateOverallProgress, 5000);
+
+    // Process monitor: check every 20 seconds
+    updateProcessMonitor();
+    setInterval(updateProcessMonitor, 20000);
 
     // Add event listeners for real-time filtering
     document.getElementById('searchProfiles').addEventListener('input', debounce(applyFilters, 500));
@@ -698,6 +736,181 @@ function refreshProfiles() {
     loadProfiles(currentPage);
 }
 
+// ============================================================
+// Process Monitor Functions
+// ============================================================
+
+function updateProcessMonitor() {
+    fetch('/api/process-monitor')
+        .then(response => response.json())
+        .then(data => renderProcessMonitor(data))
+        .catch(error => console.log('Process monitor error:', error));
+}
+
+function renderProcessMonitor(data) {
+    const panel = document.getElementById('processMonitorPanel');
+    const card = document.getElementById('processMonitorCard');
+    const header = document.getElementById('processMonitorHeader');
+    const body = document.getElementById('processMonitorBody');
+    const alertsBadge = document.getElementById('alertsCountBadge');
+
+    const summary = data.summary;
+    const alerts = data.alerts;
+
+    // Update header badges
+    const workerBadge = document.getElementById('celeryWorkerBadge');
+    workerBadge.textContent = `Worker: ${summary.celery_worker ? '✅' : '❌'}`;
+    workerBadge.className = `badge me-2 ${summary.celery_worker ? 'bg-success' : 'bg-danger'}`;
+
+    const beatBadge = document.getElementById('celeryBeatBadge');
+    beatBadge.textContent = `Beat: ${summary.celery_beat ? '✅' : '❌'}`;
+    beatBadge.className = `badge me-2 ${summary.celery_beat ? 'bg-success' : 'bg-danger'}`;
+
+    const chromeBadge = document.getElementById('chromeBadge');
+    chromeBadge.textContent = `Chrome: ${summary.chrome_processes} | Tasks: ${summary.celery_active_tasks}`;
+    chromeBadge.className = `badge me-2 ${summary.chrome_processes > summary.celery_active_tasks + 2 ? 'bg-warning text-dark' : 'bg-info'}`;
+
+    // Update last checked time
+    const lastChecked = document.getElementById('monitorLastChecked');
+    lastChecked.textContent = new Date(summary.checked_at).toLocaleTimeString();
+
+    // Update alerts count badge
+    alertsBadge.textContent = alerts.length;
+    alertsBadge.className = `badge ms-2 ${summary.danger_count > 0 ? 'bg-danger' : summary.warning_count > 0 ? 'bg-warning text-dark' : 'bg-success'}`;
+
+    // Show/hide panel based on alerts or always show for health status
+    panel.style.display = '';
+
+    // Update card border color
+    if (summary.danger_count > 0) {
+        card.className = 'card border-danger';
+        header.className = 'card-header d-flex justify-content-between align-items-center bg-danger bg-opacity-10';
+    } else if (summary.warning_count > 0) {
+        card.className = 'card border-warning';
+        header.className = 'card-header d-flex justify-content-between align-items-center bg-warning bg-opacity-10';
+    } else {
+        card.className = 'card border-success';
+        header.className = 'card-header d-flex justify-content-between align-items-center bg-success bg-opacity-10';
+    }
+
+    // Render alerts
+    if (alerts.length === 0) {
+        body.innerHTML = `
+            <div class="p-3 text-center text-success">
+                <i class="bi bi-check-circle-fill"></i> Все процессы работают нормально
+            </div>
+        `;
+        return;
+    }
+
+    let html = '<div class="list-group list-group-flush">';
+    for (const alert of alerts) {
+        const bgClass = alert.level === 'danger' ? 'list-group-item-danger' :
+                        alert.level === 'warning' ? 'list-group-item-warning' :
+                        'list-group-item-info';
+
+        let actionBtn = '';
+        if (alert.action === 'fix_stuck_profiles') {
+            actionBtn = `<button class="btn btn-sm btn-outline-danger ms-2" onclick="fixStuckProfiles()">
+                <i class="bi bi-wrench"></i> Исправить
+            </button>`;
+        } else if (alert.action === 'restart_error_profiles') {
+            actionBtn = `<button class="btn btn-sm btn-outline-warning ms-2" onclick="restartErrorProfiles()">
+                <i class="bi bi-arrow-repeat"></i> Перезапустить
+            </button>`;
+        } else if (alert.action === 'cleanup_chrome') {
+            actionBtn = `<button class="btn btn-sm btn-outline-warning ms-2" onclick="cleanupChrome()">
+                <i class="bi bi-trash"></i> Очистить
+            </button>`;
+        } else if (alert.action === 'cancel_stalled_tasks') {
+            actionBtn = `<button class="btn btn-sm btn-outline-danger ms-2" onclick="cancelStalledTasks()">
+                <i class="bi bi-x-circle"></i> Отменить
+            </button>`;
+        }
+
+        html += `
+            <div class="list-group-item ${bgClass} d-flex justify-content-between align-items-start">
+                <div>
+                    <strong><i class="bi bi-${alert.icon}"></i> ${alert.title}</strong>
+                    <div class="small mt-1">${alert.message}</div>
+                </div>
+                <div class="flex-shrink-0">
+                    ${actionBtn}
+                </div>
+            </div>
+        `;
+    }
+    html += '</div>';
+    body.innerHTML = html;
+}
+
+function fixStuckProfiles() {
+    if (!confirm('Сбросить зависшие профили в статус "created"?\nОни будут готовы к повторному прогреву.')) return;
+
+    fetch('/api/process-monitor/fix-stuck-profiles', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            showMonitorNotification('success', data.message);
+            updateProcessMonitor();
+            loadProfiles();
+        })
+        .catch(err => showMonitorNotification('danger', 'Ошибка: ' + err.message));
+}
+
+function restartErrorProfiles() {
+    if (!confirm('Сбросить профили с ошибками для повторного прогрева?')) return;
+
+    fetch('/api/process-monitor/restart-error-profiles', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            showMonitorNotification('success', data.message);
+            updateProcessMonitor();
+            loadProfiles();
+        })
+        .catch(err => showMonitorNotification('danger', 'Ошибка: ' + err.message));
+}
+
+function cleanupChrome() {
+    if (!confirm('Убить все зависшие Chrome-процессы?')) return;
+
+    fetch('/api/system/cleanup-chrome', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            showMonitorNotification('success', data.message);
+            updateProcessMonitor();
+        })
+        .catch(err => showMonitorNotification('danger', 'Ошибка: ' + err.message));
+}
+
+function cancelStalledTasks() {
+    if (!confirm('Отменить все зависшие задачи (>40 мин в статусе in_progress)?')) return;
+
+    fetch('/api/process-monitor/cancel-stalled-tasks', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            showMonitorNotification('success', data.message);
+            updateProcessMonitor();
+            loadProfiles();
+        })
+        .catch(err => showMonitorNotification('danger', 'Ошибка: ' + err.message));
+}
+
+function showMonitorNotification(type, message) {
+    const notification = document.createElement('div');
+    notification.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
+    notification.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 500px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);';
+    notification.innerHTML = `
+        <i class="bi bi-${type === 'success' ? 'check-circle-fill' : 'exclamation-triangle-fill'}"></i>
+        ${message}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    `;
+    document.body.appendChild(notification);
+    setTimeout(() => { if (notification.parentNode) notification.remove(); }, 6000);
+}
+
+// ============================================================
+
+
 function createProfile() {
     const formData = {
         name: document.getElementById('profileName').value,
@@ -895,14 +1108,45 @@ function editProfile(profileId) {
     alert('Edit functionality coming soon!');
 }
 
+// --- Bulk progress listener (WebSocket) ---
+let _bulkProgressHandler = null;
+function _startBulkProgressListener() {
+    _bulkProgressHandler = function(event) {
+        try {
+            const msg = JSON.parse(event.data);
+            if (msg && msg.type === 'bulk_progress') {
+                const bar = document.getElementById('bulkProgressBar');
+                const txt = document.getElementById('bulkProgressText');
+                if (bar) {
+                    bar.style.width = msg.percent + '%';
+                    bar.textContent = msg.percent + '%';
+                }
+                if (txt) {
+                    txt.textContent = `${msg.created.toLocaleString()} / ${msg.total.toLocaleString()}`;
+                }
+            }
+        } catch(_) { /* ignore non-JSON messages */ }
+    };
+    // Attach to the global WebSocket if available
+    if (window._ws) {
+        window._ws.addEventListener('message', _bulkProgressHandler);
+    }
+}
+function _stopBulkProgressListener() {
+    if (_bulkProgressHandler && window._ws) {
+        window._ws.removeEventListener('message', _bulkProgressHandler);
+    }
+    _bulkProgressHandler = null;
+}
+
 function bulkCreateProfiles() {
     const count = parseInt(document.getElementById('profileCount').value);
     const namePrefix = document.getElementById('profileNamePrefix').value;
     const autoStartWarmup = document.getElementById('autoStartWarmup').checked;
     const randomizeAll = document.getElementById('randomizeAll').checked;
 
-    if (count < 1 || count > 50) {
-        alert('Please enter a number between 1 and 50');
+    if (count < 1 || count > 10000) {
+        alert('Enter a number between 1 and 10 000');
         return;
     }
 
@@ -928,45 +1172,73 @@ function bulkCreateProfiles() {
         randomize_all: randomizeAll
     };
 
-    // Show loading state
+    // Show progress UI
+    const progressContainer = document.getElementById('bulkProgressContainer');
+    const bar = document.getElementById('bulkProgressBar');
+    const txt = document.getElementById('bulkProgressText');
+    progressContainer.style.display = 'block';
+    bar.style.width = '0%';
+    bar.textContent = '0%';
+    txt.textContent = `0 / ${count.toLocaleString()}`;
+
+    // Show loading state on button
     const createBtn = document.querySelector('#bulkCreateModal .btn-success');
+    const cancelBtn = document.querySelector('#bulkCreateModal .btn-secondary');
     const originalText = createBtn.innerHTML;
-    createBtn.innerHTML = '<i class="spinner-border spinner-border-sm"></i> Creating...';
+    createBtn.innerHTML = '<i class="spinner-border spinner-border-sm"></i> Creating…';
     createBtn.disabled = true;
+    if (cancelBtn) cancelBtn.disabled = true;
+
+    // Listen for WS progress updates
+    _startBulkProgressListener();
+
+    // Use a generous timeout for large batches (5 min)
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 300000);
 
     fetch('/api/profiles-bulk-create', {
         method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(requestData)
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestData),
+        signal: controller.signal
     })
     .then(response => {
-        if (!response.ok) {
-            throw new Error('Network response was not ok');
-        }
+        clearTimeout(timeoutId);
+        if (!response.ok) return response.json().then(e => { throw new Error(e.detail || 'Server error'); });
         return response.json();
     })
     .then(result => {
-        bootstrap.Modal.getInstance(document.getElementById('bulkCreateModal')).hide();
-        loadProfiles();
-        document.getElementById('bulkCreateForm').reset();
+        // Fill the bar to 100%
+        bar.style.width = '100%';
+        bar.textContent = '100%';
+        bar.classList.remove('progress-bar-animated');
+        txt.textContent = `${result.created_count.toLocaleString()} / ${count.toLocaleString()} — done!`;
 
-        // Reset default values
-        document.getElementById('profileCount').value = 5;
-        document.getElementById('profileNamePrefix').value = 'Profile-';
-        document.getElementById('randomizeAll').checked = true;
+        setTimeout(() => {
+            bootstrap.Modal.getInstance(document.getElementById('bulkCreateModal')).hide();
+            progressContainer.style.display = 'none';
+            bar.classList.add('progress-bar-animated');
+            loadProfiles();
 
-        alert(`Successfully created ${result.created_count} profiles!${result.warmup_started ? ' Warmup started automatically.' : ''}`);
+            document.getElementById('bulkCreateForm').reset();
+            document.getElementById('profileCount').value = 100;
+            document.getElementById('profileNamePrefix').value = 'Profile-';
+            document.getElementById('randomizeAll').checked = true;
+
+            alert(`Successfully created ${result.created_count.toLocaleString()} profiles (IDs ${result.first_id}–${result.last_id})${result.warmup_started ? '\nWarmup started automatically.' : ''}`);
+        }, 600);
     })
     .catch(error => {
+        clearTimeout(timeoutId);
         console.error('Error creating profiles:', error);
         alert('Error creating profiles: ' + error.message);
+        progressContainer.style.display = 'none';
     })
     .finally(() => {
-        // Restore button state
+        _stopBulkProgressListener();
         createBtn.innerHTML = originalText;
         createBtn.disabled = false;
+        if (cancelBtn) cancelBtn.disabled = false;
     });
 }
 

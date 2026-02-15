@@ -22,16 +22,15 @@ class ProfileGenerator:
 
     def _load_fingerprint_data(self):
         """Load fingerprint data for generation."""
+        # Всегда используем российские таймзоны и язык для Яндекс-визитов
         self.timezones = [
-            "Europe/Moscow", "Europe/London", "Europe/Berlin", "Europe/Paris",
-            "America/New_York", "America/Chicago", "America/Los_Angeles",
-            "Asia/Tokyo", "Asia/Shanghai", "Asia/Seoul", "Asia/Bangkok",
-            "Australia/Sydney", "Europe/Kiev", "Europe/Warsaw"
+            "Europe/Moscow", "Europe/Moscow", "Europe/Moscow",
+            "Europe/Samara", "Asia/Yekaterinburg", "Europe/Volgograd",
         ]
 
         self.languages = [
-            "en-US", "ru-RU", "de-DE", "fr-FR", "es-ES", "it-IT",
-            "ja-JP", "ko-KR", "zh-CN", "pt-BR", "pl-PL", "nl-NL"
+            "ru-RU", "ru-RU", "ru-RU", "ru-RU",
+            "ru,en-US;q=0.9,en;q=0.8",
         ]
 
         self.screen_resolutions = [
@@ -283,37 +282,21 @@ class ProfileGenerator:
         return plugin_list
 
     def _generate_chrome_flags(self) -> List[str]:
-        """Generate Chrome command line flags for stealth."""
+        """Generate Chrome command line flags for stealth.
+        
+        Only include flags that a normal Chrome user would have.
+        Avoid automation-revealing flags like --disable-web-security,
+        --metrics-recording-only, etc.
+        """
+        # These are safe flags that don't reveal automation
         flags = [
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-background-timer-throttling",
-            "--disable-renderer-backgrounding",
-            "--disable-backgrounding-occluded-windows",
             "--disable-features=TranslateUI",
-            "--disable-ipc-flooding-protection",
-            "--disable-background-networking",
-            "--disable-client-side-phishing-detection",
-            "--disable-default-apps",
-            "--disable-hang-monitor",
             "--disable-popup-blocking",
             "--disable-prompt-on-repost",
-            "--disable-sync",
-            "--disable-web-security",
-            "--metrics-recording-only",
-            "--no-sandbox",
-            "--safebrowsing-disable-auto-update",
-            "--use-mock-keychain",
-            "--disable-dev-shm-usage"
         ]
-
-        # Randomly include/exclude some flags
-        selected_flags = []
-        for flag in flags:
-            if random.random() > 0.2:  # 80% chance to include each flag
-                selected_flags.append(flag)
-
-        return selected_flags
+        return flags
 
     def _get_platform_from_ua(self) -> str:
         """Determine platform from user agent."""

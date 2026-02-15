@@ -9,8 +9,8 @@ pkill -9 -f "celery.*worker" 2>/dev/null
 # Wait for processes to stop
 sleep 2
 
-# Read concurrency from config or use default
-CONCURRENCY=${CELERY_WORKER_CONCURRENCY:-4}
+# Read concurrency from config or use default (3 threads for warmup)
+CONCURRENCY=${CELERY_WORKER_CONCURRENCY:-3}
 
 echo "📊 Configuration:"
 echo "   - Concurrency: $CONCURRENCY parallel workers"

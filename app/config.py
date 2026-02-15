@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     celery_timezone: str = Field(default="UTC", description="Celery timezone")
     celery_enable_utc: bool = Field(default=True, description="Enable UTC for Celery")
     celery_worker_concurrency: int = Field(
-        default=12, 
+        default=3, 
         description="Number of parallel Celery worker processes"
     )
 
@@ -83,9 +83,9 @@ class Settings(BaseSettings):
     browser_binary_path: Optional[str] = Field(default=None, description="Custom browser binary path")
     browser_user_data_dir: str = Field(default="./browser_profiles", description="Browser profiles directory")
     browser_download_dir: str = Field(default="./downloads", description="Browser downloads directory")
-    browser_headless: bool = Field(default=False, description="Run browser in headless mode")
+    browser_headless: bool = Field(default=True, description="Run browser in headless mode")
     browser_timeout: int = Field(default=30, description="Browser timeout in seconds")
-    max_browser_instances: int = Field(default=16, description="Maximum concurrent browser instances")
+    max_browser_instances: int = Field(default=3, description="Maximum concurrent browser instances")
 
     # Anti-Captcha Configuration
     anticaptcha_api_key: str = Field(default="", description="Anti-captcha API key")
@@ -115,13 +115,13 @@ class Settings(BaseSettings):
         ],
         description="Sites for profile warmup"
     )
-    warmup_duration_minutes: int = Field(default=5, description="Warmup duration in minutes")
-    warmup_min_page_time: int = Field(default=10, description="Minimum time per page during warmup")
-    warmup_max_page_time: int = Field(default=30, description="Maximum time per page during warmup")
+    warmup_duration_minutes: int = Field(default=2, description="Warmup duration in minutes (fast mode)")
+    warmup_min_page_time: int = Field(default=2, description="Minimum time per page during warmup")
+    warmup_max_page_time: int = Field(default=10, description="Maximum time per page during warmup")
 
     # Yandex Maps Configuration
-    yandex_min_visit_time: int = Field(default=30, description="Minimum visit time on Yandex Maps")
-    yandex_max_visit_time: int = Field(default=90, description="Maximum visit time on Yandex Maps")
+    yandex_min_visit_time: int = Field(default=10, description="Minimum visit time on Yandex Maps")
+    yandex_max_visit_time: int = Field(default=20, description="Maximum visit time on Yandex Maps")
     yandex_actions: list = Field(
         default=["scroll", "click_photos", "read_reviews", "click_contacts"],
         description="Available actions on Yandex Maps"

@@ -1428,39 +1428,61 @@ def perform_yandex_visit_actions(browser_manager: BrowserManager, browser_id: st
     }
 
     try:
-        # Initial page scroll to see content
+        # Build list of possible actions and RANDOMIZE order
+        possible_actions = []
+
         if 'scroll' in params['actions'] and random.random() < params['scroll_probability']:
+            possible_actions.append('page_scroll')
+
+        if 'view_photos' in params['actions'] and random.random() < params['photo_click_probability']:
+            possible_actions.append('view_photos')
+
+        if 'read_reviews' in params['actions'] and random.random() < params['review_read_probability']:
+            possible_actions.append('read_reviews')
+
+        if 'click_contacts' in params['actions'] and random.random() < params['contact_click_probability']:
+            possible_actions.append('click_contacts')
+
+        if 'view_map' in params['actions'] and random.random() < params['map_interaction_probability']:
+            possible_actions.append('view_map')
+        # Always start with a scroll to look natural
+        if 'page_scroll' in possible_actions:
+            possible_actions.remove('page_scroll')
             scroll_count = perform_realistic_scrolling(driver)
             results['scroll_actions'] += scroll_count
             results['actions_performed'].append('page_scroll')
+            time.sleep(random.uniform(0.5, 2.0))
 
-        # View photos if available
-        if 'view_photos' in params['actions'] and random.random() < params['photo_click_probability']:
-            if click_photos_section(driver):
-                results['clicks_performed'] += 1
-                results['elements_interacted'] += 1
-                results['actions_performed'].append('viewed_photos')
-                time.sleep(random.uniform(3, 8))  # Spend time viewing photos
+        # Shuffle remaining actions for random order
+        random.shuffle(possible_actions)
 
-        # Read reviews
-        if 'read_reviews' in params['actions'] and random.random() < params['review_read_probability']:
-            reviews_read = read_reviews_section(driver)
-            if reviews_read > 0:
-                results['elements_interacted'] += reviews_read
-                results['actions_performed'].append(f'read_{reviews_read}_reviews')
+        for action_name in possible_actions:
+            # Random micro-pause between actions (like a human thinking)
+            time.sleep(random.uniform(1.0, 3.0))
 
-        # Click contact information
-        if 'click_contacts' in params['actions'] and random.random() < params['contact_click_probability']:
-            if click_contact_info(driver):
-                results['clicks_performed'] += 1
-                results['elements_interacted'] += 1
-                results['actions_performed'].append('viewed_contacts')
+            if action_name == 'view_photos':
+                if click_photos_section(driver):
+                    results['clicks_performed'] += 1
+                    results['elements_interacted'] += 1
+                    results['actions_performed'].append('viewed_photos')
+                    time.sleep(random.uniform(3, 8))
 
-        # Interact with map
-        if 'view_map' in params['actions'] and random.random() < params['map_interaction_probability']:
-            if interact_with_map(driver):
-                results['actions_performed'].append('map_interaction')
-                results['elements_interacted'] += 1
+            elif action_name == 'read_reviews':
+                reviews_read = read_reviews_section(driver)
+                if reviews_read > 0:
+                    results['elements_interacted'] += reviews_read
+                    results['actions_performed'].append(f'read_{reviews_read}_reviews')
+
+            elif action_name == 'click_contacts':
+                if click_contact_info(driver):
+                    results['clicks_performed'] += 1
+                    results['elements_interacted'] += 1
+                    results['actions_performed'].append('viewed_contacts')
+
+            elif action_name == 'view_map':
+                if interact_with_map(driver):
+                    results['actions_performed'].append('map_interaction')
+                    results['elements_interacted'] += 1
 
         # Random additional scrolling
         if random.random() < 0.5:
@@ -1470,7 +1492,7 @@ def perform_yandex_visit_actions(browser_manager: BrowserManager, browser_id: st
         logger.info(f"Performed {len(results['actions_performed'])} actions on Yandex Maps profile")
 
     except Exception as e:
-        logger.error(f"Error performing Yandex visit actions: {e}")
+        logger.error(f"Error performing Yandex visit actions: {e}", exc_info=True)
 
     return results
 
@@ -1496,18 +1518,26 @@ def perform_realistic_scrolling(driver, max_scrolls: int = 5) -> int:
             if current_position > total_height - viewport_height:
                 current_position = total_height - viewport_height
 
-            driver.execute_script(f"window.scrollTo(0, {current_position});")
+            # Smooth scroll in small increments (like mouse wheel)
+            steps = random.randint(4, 10)
+            prev_pos = driver.execute_script("return window.pageYOffset") or 0
+            step_size = (current_position - prev_pos) / steps
+            for s in range(steps):
+                intermediate = int(prev_pos + step_size * (s + 1))
+                driver.execute_script(f"window.scrollTo({{top: {intermediate}, behavior: 'smooth'}});")
+                time.sleep(random.uniform(0.02, 0.06))
+
             scroll_count += 1
 
             # Pause to "read" content
-            pause_time = random.uniform(1, 3)
+            pause_time = random.uniform(1.5, 4)
             time.sleep(pause_time)
 
             # Sometimes scroll back up a bit
             if random.random() < 0.3:
                 back_scroll = random.randint(100, 300)
                 current_position = max(0, current_position - back_scroll)
-                driver.execute_script(f"window.scrollTo(0, {current_position});")
+                driver.execute_script(f"window.scrollTo({{top: {current_position}, behavior: 'smooth'}});")
                 time.sleep(random.uniform(0.5, 1.5))
 
         return scroll_count
@@ -1531,10 +1561,12 @@ def click_photos_section(driver) -> bool:
             try:
                 photos = driver.find_elements(By.CSS_SELECTOR, selector)
                 if photos and len(photos) > 0:
-                    # Click on first available photo
+                    # Click on first available photo using real mouse events
                     photo = photos[0]
                     if photo.is_displayed() and photo.is_enabled():
-                        driver.execute_script("arguments[0].click();", photo)
+                        ActionChains(driver).move_to_element(photo).pause(
+                            random.uniform(0.1, 0.3)
+                        ).click().perform()
                         logger.info("Clicked on photo")
 
                         # Wait for photo viewer to load
@@ -1604,9 +1636,9 @@ def read_reviews_section(driver) -> int:
         for i, review in enumerate(reviews[:3]):
             try:
                 if review.is_displayed():
-                    # Scroll to review
-                    driver.execute_script("arguments[0].scrollIntoView(true);", review)
-                    time.sleep(random.uniform(0.5, 1.5))
+                    # Smooth scroll to review
+                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", review)
+                    time.sleep(random.uniform(0.8, 2.0))
 
                     # "Read" review (pause time based on estimated length)
                     try:
@@ -1646,12 +1678,14 @@ def click_contact_info(driver) -> bool:
                 if elements:
                     element = elements[0]
                     if element.is_displayed() and element.is_enabled():
-                        # Scroll to element
-                        driver.execute_script("arguments[0].scrollIntoView(true);", element)
-                        time.sleep(random.uniform(0.5, 1.5))
+                        # Smooth scroll to element
+                        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element)
+                        time.sleep(random.uniform(0.8, 1.5))
 
-                        # Click element
-                        driver.execute_script("arguments[0].click();", element)
+                        # Click with real mouse events
+                        ActionChains(driver).move_to_element(element).pause(
+                            random.uniform(0.1, 0.3)
+                        ).click().perform()
                         logger.info("Clicked contact information")
 
                         # Wait a bit
@@ -1681,23 +1715,22 @@ def interact_with_map(driver) -> bool:
             try:
                 map_element = driver.find_element(By.CSS_SELECTOR, selector)
                 if map_element.is_displayed():
-                    # Scroll to map
-                    driver.execute_script("arguments[0].scrollIntoView(true);", map_element)
+                    # Smooth scroll to map
+                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", map_element)
                     time.sleep(random.uniform(1, 2))
 
                     # Get map dimensions
                     size = map_element.size
                     if size['width'] > 100 and size['height'] > 100:
-                        # Perform random clicks on map
-                        actions = ActionChains(driver)
-
+                        # Perform random clicks on map with separate ActionChains
                         for _ in range(random.randint(1, 3)):
                             x_offset = random.randint(10, size['width'] - 10)
                             y_offset = random.randint(10, size['height'] - 10)
 
-                            actions.move_to_element_with_offset(map_element, x_offset, y_offset)
-                            actions.click()
-                            actions.perform()
+                            # Each interaction is a separate ActionChain (not chained)
+                            ActionChains(driver).move_to_element_with_offset(
+                                map_element, x_offset, y_offset
+                            ).pause(random.uniform(0.1, 0.3)).click().perform()
 
                             time.sleep(random.uniform(1, 2))
 
@@ -1729,18 +1762,24 @@ def perform_passive_browsing(browser_manager: BrowserManager, browser_id: str, d
             if action == 'scroll_small':
                 scroll_distance = random.randint(50, 200)
                 direction = random.choice([1, -1])  # Up or down
-                driver.execute_script(f"window.scrollBy(0, {scroll_distance * direction});")
+                driver.execute_script(f"window.scrollBy({{top: {scroll_distance * direction}, behavior: 'smooth'}});")
 
             elif action == 'mouse_move':
-                # Move mouse to random position
-                actions = ActionChains(driver)
-                viewport_width = driver.execute_script("return window.innerWidth")
-                viewport_height = driver.execute_script("return window.innerHeight")
+                # Move mouse to ABSOLUTE position via body element
+                try:
+                    body = driver.find_element(By.TAG_NAME, 'body')
+                    viewport_width = driver.execute_script("return window.innerWidth")
+                    viewport_height = driver.execute_script("return window.innerHeight")
 
-                x = random.randint(100, viewport_width - 100)
-                y = random.randint(100, viewport_height - 100)
+                    x = random.randint(50, max(100, viewport_width - 50))
+                    y = random.randint(50, max(100, viewport_height - 50))
 
-                actions.move_by_offset(x, y).perform()
+                    # Move to body first (resets position), then offset
+                    ActionChains(driver).move_to_element_with_offset(
+                        body, x, y
+                    ).perform()
+                except Exception:
+                    pass
 
             elif action == 'pause_long':
                 # Longer pause as if reading
@@ -1748,8 +1787,8 @@ def perform_passive_browsing(browser_manager: BrowserManager, browser_id: str, d
                 continue
 
             elif action == 'scroll_up':
-                # Scroll back to top sometimes
-                driver.execute_script("window.scrollTo(0, 0);")
+                # Smooth scroll back to top sometimes
+                driver.execute_script("window.scrollTo({top: 0, behavior: 'smooth'});")
 
             # Random pause between actions
             time.sleep(random.uniform(2, 6))

@@ -2,6 +2,7 @@
 Main FastAPI application for Yandex Maps Profile Visitor system.
 """
 import os
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any
@@ -10,14 +11,22 @@ from datetime import datetime
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 import uvicorn
 
 from .config import settings
 from .database import get_db, create_tables, db_manager, get_db_session
 from .models import BrowserProfile, ProxyServer, Task, UserSettings
+
+# Import auth
+from web.auth import (
+    is_authenticated, requires_auth, check_credentials,
+    create_session, destroy_session, SESSION_COOKIE_NAME, PUBLIC_PATHS
+)
 
 # Import web routes
 from web.routes import router as web_router
@@ -56,6 +65,135 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Track background processes started by the server
+_background_processes: list = []
+
+
+def _ensure_redis():
+    """Ensure Redis is running and reachable."""
+    try:
+        import redis as _redis
+        r = _redis.Redis(
+            host=settings.redis_host,
+            port=settings.redis_port,
+            socket_connect_timeout=5
+        )
+        r.ping()
+        logger.info("✅ Redis is already running")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Redis не запущен или недоступен: {e}")
+        # In Docker, Redis is a separate service — don't try to start it locally
+        if settings.redis_host != "localhost":
+            logger.error("Redis should be running as a Docker service. Check docker compose.")
+            return False
+        # Local development: try to start redis-server
+        import subprocess, shutil
+        logger.warning("⚠️  Attempting to start redis-server locally...")
+        redis_bin = shutil.which("redis-server")
+        if not redis_bin:
+            logger.error("❌ redis-server not found in PATH. Install Redis first.")
+            return False
+        try:
+            subprocess.Popen(
+                [redis_bin, "--daemonize", "yes"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            import time
+            time.sleep(1)
+            r = _redis.Redis(host=settings.redis_host, port=settings.redis_port, socket_connect_timeout=2)
+            r.ping()
+            logger.info("✅ Redis started successfully")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to start Redis: {e}")
+            return False
+
+
+def _start_celery_worker():
+    """Start Celery worker as a background process."""
+    import subprocess, sys
+    project_dir = os.path.join(os.path.dirname(__file__), "..")
+    project_dir = os.path.abspath(project_dir)
+    log_dir = os.path.join(project_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Kill existing workers to avoid duplicates
+    subprocess.run(["pkill", "-9", "-f", "celery.*worker"], capture_output=True)
+    import time; time.sleep(1)
+
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "celery",
+            "-A", "tasks.celery_app.celery_app",
+            "worker",
+            "--loglevel=info",
+            "--concurrency=3",
+            "--queues=default,warmup,yandex,proxy,maintenance",
+            f"--logfile={os.path.join(log_dir, 'celery.log')}",
+            f"--pidfile={os.path.join(log_dir, 'celery.pid')}",
+        ],
+        cwd=project_dir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    _background_processes.append(proc)
+    logger.info(f"✅ Celery worker started (PID: {proc.pid})")
+    return proc
+
+
+def _start_celery_beat():
+    """Start Celery beat scheduler as a background process."""
+    import subprocess, sys
+    project_dir = os.path.join(os.path.dirname(__file__), "..")
+    project_dir = os.path.abspath(project_dir)
+    log_dir = os.path.join(project_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Kill existing beat to avoid duplicates
+    subprocess.run(["pkill", "-9", "-f", "celery.*beat"], capture_output=True)
+    import time; time.sleep(1)
+
+    # Remove stale pidfile
+    pid_file = os.path.join(log_dir, "celery-beat.pid")
+    if os.path.exists(pid_file):
+        os.remove(pid_file)
+
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "celery",
+            "-A", "tasks.celery_app.celery_app",
+            "beat",
+            "--loglevel=info",
+            f"--logfile={os.path.join(log_dir, 'celery-beat.log')}",
+            f"--pidfile={pid_file}",
+        ],
+        cwd=project_dir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    _background_processes.append(proc)
+    logger.info(f"✅ Celery beat started (PID: {proc.pid})")
+    return proc
+
+
+def _stop_background_processes():
+    """Stop all background processes started by the server."""
+    import subprocess
+    for proc in _background_processes:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+            logger.info(f"Stopped background process PID {proc.pid}")
+        except Exception:
+            proc.kill()
+            logger.info(f"Force-killed background process PID {proc.pid}")
+    _background_processes.clear()
+    # Also kill any leftover celery processes
+    subprocess.run(["pkill", "-9", "-f", "celery.*worker"], capture_output=True)
+    subprocess.run(["pkill", "-9", "-f", "celery.*beat"], capture_output=True)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -71,10 +209,33 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize database: {e}")
         raise
 
+    # --- Auto-start infrastructure ---
+    logger.info("🚀 Starting background services...")
+
+    # 1. Redis
+    redis_ok = _ensure_redis()
+    if not redis_ok:
+        logger.error("❌ Redis is required but could not be started!")
+
+    # 2. Celery Worker
+    if redis_ok:
+        _start_celery_worker()
+
+    # 3. Celery Beat
+    if redis_ok:
+        _start_celery_beat()
+
+    if redis_ok:
+        logger.info("✅ All background services started successfully!")
+    else:
+        logger.warning("⚠️  Server started but background services are unavailable (no Redis)")
+
     yield
 
     # Shutdown
     logger.info("Shutting down Yandex Maps Profile Visitor system...")
+    _stop_background_processes()
+    logger.info("All background processes stopped.")
 
 
 # Create FastAPI app
@@ -94,6 +255,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Auth middleware — redirects unauthenticated users to /login
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        # Skip auth for public paths, static files, and websocket
+        if path in PUBLIC_PATHS or path.startswith("/static") or path.startswith("/ws"):
+            return await call_next(request)
+        if not is_authenticated(request):
+            # For API calls return 401 instead of redirect
+            if path.startswith("/api/"):
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Not authenticated"}
+                )
+            return RedirectResponse(url="/login", status_code=302)
+        return await call_next(request)
+
+app.add_middleware(AuthMiddleware)
+
+
 # Mount static files
 static_path = os.path.join(os.path.dirname(__file__), "..", "web", "static")
 if os.path.exists(static_path):
@@ -103,6 +286,52 @@ if os.path.exists(static_path):
 templates_path = os.path.join(os.path.dirname(__file__), "..", "web", "templates")
 if os.path.exists(templates_path):
     templates = Jinja2Templates(directory=templates_path)
+
+
+# --- Login / Logout routes ---
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    """Show login form."""
+    if is_authenticated(request):
+        return RedirectResponse(url="/", status_code=302)
+    return templates.TemplateResponse("login.html", {"request": request, "error": None, "username": None})
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    """Process login form."""
+    form = await request.form()
+    username = form.get("username", "")
+    password = form.get("password", "")
+
+    if check_credentials(username, password):
+        token = create_session(username)
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=token,
+            max_age=60 * 60 * 24 * 7,  # 7 days
+            httponly=True,
+            samesite="lax",
+        )
+        return response
+    else:
+        return templates.TemplateResponse("login.html", {
+            "request": request,
+            "error": "Неверный логин или пароль",
+            "username": username,
+        })
+
+
+@app.get("/logout")
+async def logout(request: Request):
+    """Logout and clear session."""
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    destroy_session(token)
+    response = RedirectResponse(url="/login", status_code=302)
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
 
 # Include web routes
 app.include_router(web_router)
@@ -523,7 +752,7 @@ async def clear_all_profiles(db: Session = Depends(get_db)):
 
 @app.post("/api/profiles-bulk-create")
 async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depends(get_db)):
-    """Create multiple browser profiles at once."""
+    """Create multiple browser profiles at once (up to 10 000)."""
     try:
         import random
         from fake_useragent import UserAgent
@@ -535,164 +764,175 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
         randomize_all = request_data.get("randomize_all", True)
 
         # Validate count
-        if count < 1 or count > 50:
-            raise HTTPException(status_code=400, detail="Count must be between 1 and 50")
+        if count < 1 or count > 10000:
+            raise HTTPException(status_code=400, detail="Count must be between 1 and 10 000")
 
-        # Predefined options for randomization
+        # Predefined options for randomization — only Russian locales for Yandex
         viewports = [
             (1366, 768), (1920, 1080), (1440, 900), (1536, 864),
             (1280, 720), (1600, 1200), (2560, 1440), (1024, 768)
         ]
 
         timezones = [
-            "Europe/Moscow", "America/New_York", "Europe/London",
-            "Asia/Tokyo", "Europe/Paris", "America/Los_Angeles",
-            "Australia/Sydney", "Asia/Shanghai", "Europe/Berlin",
-            "America/Chicago", "Europe/Rome", "Asia/Seoul"
+            "Europe/Moscow", "Europe/Moscow", "Europe/Moscow",
+            "Europe/Samara", "Asia/Yekaterinburg", "Europe/Volgograd",
         ]
 
         languages = [
-            "ru-RU", "en-US", "en-GB", "ja-JP", "fr-FR", "de-DE",
-            "es-ES", "it-IT", "pt-BR", "ko-KR", "zh-CN", "ar-SA"
+            "ru-RU", "ru-RU", "ru-RU", "ru-RU",
+            "ru,en-US;q=0.9,en;q=0.8",
         ]
 
         platforms = ["Win32", "MacIntel", "Linux x86_64"]
 
-        # Initialize UserAgent for generating realistic user agents
+        # Pre-generate a pool of user-agents (much faster than calling ua per profile)
         ua = UserAgent()
+        UA_POOL_SIZE = min(count, 200)
+        ua_pool = []
+        for _ in range(UA_POOL_SIZE):
+            try:
+                ua_pool.append(ua.random)
+            except Exception:
+                ua_pool.append(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
 
-        created_profiles = []
+        user_agent_type = config.get("user_agent_type", "generate")
 
-        for i in range(1, count + 1):
-            # Generate profile name
-            profile_name = f"{name_prefix}{i}"
+        # Determine fixed values when randomize_all is off
+        fixed_width = int(config.get("viewport_width", 1366)) if config.get("viewport_width") not in (None, "random") else None
+        fixed_height = int(config.get("viewport_height", 768)) if config.get("viewport_height") not in (None, "random") else None
+        fixed_tz = config.get("timezone") if config.get("timezone") != "random" else None
+        fixed_lang = config.get("language") if config.get("language") != "random" else None
+        fixed_plat = config.get("platform") if config.get("platform") != "random" else None
 
-            # Get configuration values
-            if randomize_all or config.get("viewport_width") == "random":
-                width, height = random.choice(viewports)
-            else:
-                width = int(config.get("viewport_width", 1366))
-                height = int(config.get("viewport_height", 768))
+        BATCH_SIZE = 500
+        total_created = 0
+        first_id = None
+        last_id = None
 
-            if randomize_all or config.get("timezone") == "random":
-                timezone = random.choice(timezones)
-            else:
-                timezone = config.get("timezone", "Europe/Moscow")
+        # Find the current max profile number for this prefix to avoid collisions
+        existing_max = (
+            db.query(func.max(BrowserProfile.id)).scalar() or 0
+        )
 
-            if randomize_all or config.get("language") == "random":
-                language = random.choice(languages)
-            else:
-                language = config.get("language", "ru-RU")
+        for batch_start in range(0, count, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, count)
+            batch_size = batch_end - batch_start
+            rows = []
 
-            if randomize_all or config.get("platform") == "random":
-                platform = random.choice(platforms)
-            else:
-                platform = config.get("platform", "Win32")
+            for i in range(batch_start + 1, batch_end + 1):
+                profile_name = f"{name_prefix}{existing_max + i}"
 
-            # Generate user agent
-            user_agent_type = config.get("user_agent_type", "generate")
-            if user_agent_type == "generate" or randomize_all:
-                try:
-                    if platform == "Win32":
-                        user_agent = ua.chrome
-                    elif platform == "MacIntel":
-                        user_agent = ua.safari
-                    else:
-                        user_agent = ua.firefox
-                except:
-                    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            elif user_agent_type == "chrome":
-                user_agent = ua.chrome if hasattr(ua, 'chrome') else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            elif user_agent_type == "firefox":
-                user_agent = ua.firefox if hasattr(ua, 'firefox') else "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0"
-            elif user_agent_type == "safari":
-                user_agent = ua.safari if hasattr(ua, 'safari') else "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-            else:
-                user_agent = ua.random if hasattr(ua, 'random') else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                if randomize_all:
+                    w, h = random.choice(viewports)
+                    tz = random.choice(timezones)
+                    lang = random.choice(languages)
+                    plat = random.choice(platforms)
+                else:
+                    w = fixed_width or random.choice(viewports)[0]
+                    h = fixed_height or random.choice(viewports)[1]
+                    tz = fixed_tz or random.choice(timezones)
+                    lang = fixed_lang or random.choice(languages)
+                    plat = fixed_plat or random.choice(platforms)
 
-            # Create profile
-            profile = BrowserProfile(
-                name=profile_name,
-                user_agent=user_agent,
-                viewport_width=width,
-                viewport_height=height,
-                timezone=timezone,
-                language=language,
-                platform=platform,
-                status="created",
-                is_active=True
-            )
+                ua_str = random.choice(ua_pool)
 
-            db.add(profile)
-            created_profiles.append(profile)
+                rows.append({
+                    "name": profile_name,
+                    "user_agent": ua_str,
+                    "viewport_width": w,
+                    "viewport_height": h,
+                    "timezone": tz,
+                    "language": lang,
+                    "platform": plat,
+                    "status": "created",
+                    "is_active": True,
+                    "warmup_completed": False,
+                    "warmup_sessions_count": 0,
+                    "warmup_time_spent": 0,
+                    "total_sessions": 0,
+                    "successful_sessions": 0,
+                    "failed_sessions": 0,
+                    "webrtc_leak_protect": True,
+                    "geolocation_enabled": False,
+                    "notifications_enabled": False,
+                })
 
-        # Commit all profiles
+            # Bulk insert this batch
+            db.bulk_insert_mappings(BrowserProfile, rows)
+            db.flush()  # get IDs assigned
+            total_created += batch_size
+
+            # Track first/last id
+            if first_id is None:
+                first_id = existing_max + 1
+
+            # Send progress via WebSocket
+            pct = int(total_created * 100 / count)
+            await manager.broadcast(json.dumps({
+                "type": "bulk_progress",
+                "created": total_created,
+                "total": count,
+                "percent": pct
+            }))
+
         db.commit()
 
-        # Refresh profiles to get IDs
-        for profile in created_profiles:
-            db.refresh(profile)
+        # Get the actual id range of newly created profiles
+        last_id_row = db.query(func.max(BrowserProfile.id)).scalar()
+        first_id_row = last_id_row - total_created + 1 if last_id_row else None
 
-        # Broadcast notification
-        await manager.broadcast(f"Bulk created {len(created_profiles)} profiles")
+        logger.info(f"Bulk created {total_created} profiles (ids {first_id_row}-{last_id_row})")
+        await manager.broadcast(f"Bulk created {total_created} profiles")
 
         # Auto-start warmup for all created profiles if requested
         warmup_started = False
         warmup_task_ids = []
 
-        if auto_start_warmup and created_profiles:
+        if auto_start_warmup and total_created > 0 and first_id_row:
             try:
-                # Update all created profiles to warming_up status
-                profile_ids = []
-                for profile in created_profiles:
-                    profile.status = "warming_up"
-                    profile_ids.append(profile.id)
+                profile_ids = list(range(first_id_row, last_id_row + 1))
 
+                # Mark as warming_up in bulk
+                db.query(BrowserProfile).filter(
+                    BrowserProfile.id.between(first_id_row, last_id_row)
+                ).update({"status": "warming_up"}, synchronize_session=False)
                 db.commit()
 
-                # Start warmup tasks
                 if CELERY_AVAILABLE:
-                    # Use bulk warmup task for efficiency
                     try:
                         task_result = warmup_multiple_profiles_task.delay(profile_ids, duration_minutes=30)
                         warmup_task_ids.append(task_result.id)
                         warmup_started = True
-                        logger.info(f"Auto-started bulk warmup task {task_result.id} for {len(profile_ids)} new profiles")
-                        await manager.broadcast(f"Bulk created {len(created_profiles)} profiles and started warmup")
+                        logger.info(f"Auto-started bulk warmup for {len(profile_ids)} profiles")
                     except Exception as bulk_error:
                         logger.warning(f"Bulk warmup failed, trying individual tasks: {bulk_error}")
-                        # Fallback: start individual warmup tasks
-                        for profile_id in profile_ids:
+                        for pid in profile_ids:
                             try:
-                                task_result = warmup_profile_task.delay(profile_id, duration_minutes=30)
-                                warmup_task_ids.append(task_result.id)
-                            except Exception as single_error:
-                                logger.error(f"Failed to start warmup for profile {profile_id}: {single_error}")
-
-                        if warmup_task_ids:
-                            warmup_started = True
-                            logger.info(f"Auto-started {len(warmup_task_ids)} individual warmup tasks")
-                            await manager.broadcast(f"Bulk created {len(created_profiles)} profiles and started {len(warmup_task_ids)} warmup tasks")
+                                r = warmup_profile_task.delay(pid, duration_minutes=30)
+                                warmup_task_ids.append(r.id)
+                            except Exception:
+                                pass
+                        warmup_started = bool(warmup_task_ids)
                 else:
-                    logger.warning(f"Celery not available, warmup simulation mode for {len(profile_ids)} profiles")
                     warmup_started = "simulation"
-                    await manager.broadcast(f"Bulk created {len(created_profiles)} profiles (warmup simulation)")
 
             except Exception as warmup_error:
-                logger.error(f"Failed to start warmup for bulk created profiles: {warmup_error}")
-                # Revert warmup status but keep the profiles
-                for profile in created_profiles:
-                    profile.status = "created"
+                logger.error(f"Failed to start warmup for bulk profiles: {warmup_error}")
+                db.query(BrowserProfile).filter(
+                    BrowserProfile.id.between(first_id_row, last_id_row)
+                ).update({"status": "created"}, synchronize_session=False)
                 db.commit()
                 warmup_started = False
-                await manager.broadcast(f"Bulk created {len(created_profiles)} profiles (warmup failed)")
-        elif not auto_start_warmup:
-            await manager.broadcast(f"Bulk created {len(created_profiles)} profiles (no warmup)")
 
         return {
             "message": "Profiles created successfully",
-            "created_count": len(created_profiles),
-            "profiles": [profile.to_dict() for profile in created_profiles],
+            "created_count": total_created,
+            "first_id": first_id_row,
+            "last_id": last_id_row,
             "warmup_started": warmup_started,
             "warmup_task_ids": warmup_task_ids,
             "auto_start_warmup": auto_start_warmup

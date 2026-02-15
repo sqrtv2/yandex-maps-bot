@@ -85,9 +85,17 @@ celery_app.conf.update(
             'task': 'tasks.yandex_maps.daily_stats_reset',
             'schedule': crontab(minute=0, hour=0),  # Daily at midnight UTC
         },
+        'yandex-cleanup-used-profiles': {
+            'task': 'tasks.yandex_maps.cleanup_used_profiles',
+            'schedule': crontab(minute='*/30'),  # Every 30 minutes
+        },
         'process-health-check': {
             'task': 'tasks.warmup.auto_fix_stuck_processes',
             'schedule': crontab(minute='*/10'),  # Every 10 minutes
+        },
+        'periodic-rewarmup': {
+            'task': 'tasks.warmup.periodic_rewarmup',
+            'schedule': crontab(minute=0, hour='*/2'),  # Every 2 hours
         },
     }
 )

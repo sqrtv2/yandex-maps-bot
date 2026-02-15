@@ -103,9 +103,12 @@
             <span class="navbar-toggler-icon"></span>
         </button>
         <div class="navbar-nav">
-            <div class="nav-item text-nowrap">
+            <div class="nav-item text-nowrap d-flex">
                 <a class="nav-link px-3" href="#" onclick="location.reload()">
                     <i class="bi bi-arrow-clockwise"></i> Refresh
+                </a>
+                <a class="nav-link px-3 text-warning" href="/logout">
+                    <i class="bi bi-box-arrow-right"></i> Выйти
                 </a>
             </div>
         </div>
@@ -230,6 +233,7 @@
     <!-- WebSocket for real-time updates -->
     <script>
         let ws = null;
+        window._ws = null;  // expose globally for page-specific listeners
 
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -237,6 +241,7 @@
 
             try {
                 ws = new WebSocket(wsUrl);
+                window._ws = ws;
 
                 ws.onopen = function(event) {
                     console.log('WebSocket connected');

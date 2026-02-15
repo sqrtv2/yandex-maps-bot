@@ -70,12 +70,28 @@ class UserSettings(Base):
     def get_default_settings(cls):
         """Get default system settings."""
         return [
-            # Anti-Captcha Settings
+            # Capsola SmartCaptcha Settings
+            {
+                'setting_key': 'capsola_api_key',
+                'setting_value': '9f8a1a9b-4322-4b8a-91ec-49192cdbaeb9',
+                'setting_type': 'string',
+                'description': 'API ключ Capsola Cloud для решения Yandex SmartCaptcha',
+                'category': 'anticaptcha'
+            },
+            {
+                'setting_key': 'capsola_enabled',
+                'setting_value': 'true',
+                'setting_type': 'bool',
+                'description': 'Включить решение SmartCaptcha через Capsola',
+                'category': 'anticaptcha'
+            },
+
+            # Anti-Captcha Settings (classic image captcha)
             {
                 'setting_key': 'anticaptcha_api_key',
                 'setting_value': '',
                 'setting_type': 'string',
-                'description': 'API key for anti-captcha service',
+                'description': 'API key for anti-captcha service (2captcha/anticaptcha) for classic image captcha',
                 'category': 'anticaptcha'
             },
             {

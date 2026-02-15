@@ -8,7 +8,8 @@ from sqlalchemy.orm import Session
 from typing import List, Dict, Any
 import os
 import logging
-from datetime import datetime
+import subprocess
+from datetime import datetime, timedelta
 
 from app.database import get_db
 from app.models import BrowserProfile, ProxyServer, Task, UserSettings, YandexMapTarget, ProfileTargetVisit
@@ -88,26 +89,41 @@ async def yandex_targets_page(request: Request):
 
 @router.get("/api/profiles/stats")
 async def get_profile_stats(db: Session = Depends(get_db)):
-    """Get detailed profile statistics."""
+    """Get detailed profile statistics (optimised — pure SQL, no full table load)."""
+    from sqlalchemy import func, case
     try:
-        profiles = db.query(BrowserProfile).all()
+        # Single aggregation query instead of loading all rows into Python
+        row = db.query(
+            func.count(BrowserProfile.id).label('total'),
+            func.sum(case((BrowserProfile.is_active == True, 1), else_=0)).label('active'),
+            func.sum(case((BrowserProfile.warmup_completed == True, 1), else_=0)).label('warmed'),
+            func.sum(case(
+                (BrowserProfile.warmup_completed == True, case((BrowserProfile.is_active == True, 1), else_=0)),
+                else_=0
+            )).label('ready_for_tasks'),
+        ).first()
 
         stats = {
-            "total": len(profiles),
-            "active": sum(1 for p in profiles if p.is_active),
-            "warmed": sum(1 for p in profiles if p.warmup_completed),
-            "ready_for_tasks": sum(1 for p in profiles if p.is_ready_for_tasks()),
+            "total": row.total or 0,
+            "active": int(row.active or 0),
+            "warmed": int(row.warmed or 0),
+            "ready_for_tasks": int(row.ready_for_tasks or 0),
             "by_status": {}
         }
 
-        # Count by status
-        for profile in profiles:
-            status = profile.status
-            stats["by_status"][status] = stats["by_status"].get(status, 0) + 1
+        # Status counts via GROUP BY
+        status_rows = db.query(
+            BrowserProfile.status, func.count(BrowserProfile.id)
+        ).group_by(BrowserProfile.status).all()
+        stats["by_status"] = {status: cnt for status, cnt in status_rows}
 
-        # Calculate average success rates
-        success_rates = [p.get_success_rate() for p in profiles if p.total_sessions > 0]
-        stats["average_success_rate"] = sum(success_rates) / len(success_rates) if success_rates else 0
+        # Average success rate via SQL
+        avg_row = db.query(
+            func.avg(
+                BrowserProfile.successful_sessions * 100.0 / BrowserProfile.total_sessions
+            )
+        ).filter(BrowserProfile.total_sessions > 0).first()
+        stats["average_success_rate"] = round(float(avg_row[0] or 0), 2)
 
         return stats
 
@@ -286,6 +302,60 @@ async def visit_yandex_profile(profile_id: int, visit_data: Dict[str, Any], db: 
         raise HTTPException(status_code=500, detail="Failed to create visit task")
 
 
+@router.post("/api/proxies/test-all")
+async def test_all_proxies(db: Session = Depends(get_db)):
+    """Test all proxy servers."""
+    try:
+        import asyncio
+        from core.proxy_manager import ProxyManager
+
+        proxies = db.query(ProxyServer).filter(ProxyServer.is_active == True).all()
+        if not proxies:
+            return {"message": "No active proxies to test", "results": {"total": 0, "working": 0, "failed": 0}}
+
+        proxy_manager = ProxyManager()
+        results = {"total": 0, "working": 0, "failed": 0, "details": []}
+
+        for proxy in proxies:
+            proxy_data = {
+                'id': proxy.id,
+                'host': proxy.host,
+                'port': proxy.port,
+                'username': proxy.username,
+                'password': proxy.password,
+                'proxy_type': proxy.proxy_type,
+            }
+
+            loop = asyncio.get_event_loop()
+            success, response_time, error_message = await loop.run_in_executor(
+                None, lambda pd=proxy_data: proxy_manager.test_proxy(pd, timeout=15)
+            )
+
+            if success:
+                proxy.update_success(response_time)
+                results["working"] += 1
+            else:
+                proxy.update_failure(error_message)
+                results["failed"] += 1
+            results["total"] += 1
+
+            results["details"].append({
+                "proxy_id": proxy.id,
+                "name": proxy.name,
+                "status": "working" if success else "failed",
+                "response_time_ms": round(response_time, 2),
+                "error": error_message if not success else None
+            })
+
+        db.commit()
+        return {"message": f"Tested {results['total']} proxies: {results['working']} working, {results['failed']} failed", "results": results}
+
+    except Exception as e:
+        logger.error(f"Error testing all proxies: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to test proxies: {str(e)}")
+
+
 @router.post("/api/proxies/{proxy_id}/test")
 async def test_proxy(proxy_id: int, db: Session = Depends(get_db)):
     """Test a proxy server connection."""
@@ -294,19 +364,46 @@ async def test_proxy(proxy_id: int, db: Session = Depends(get_db)):
         if not proxy:
             raise HTTPException(status_code=404, detail="Proxy not found")
 
-        # Create health check task
-        task = Task.create_health_check_task(proxy_id=proxy_id)
-        db.add(task)
+        # Actually test the proxy connection
+        import asyncio
+        from core.proxy_manager import ProxyManager
+
+        proxy_manager = ProxyManager()
+        proxy_data = {
+            'id': proxy.id,
+            'host': proxy.host,
+            'port': proxy.port,
+            'username': proxy.username,
+            'password': proxy.password,
+            'proxy_type': proxy.proxy_type,
+        }
+
+        # Run the sync test in a thread pool to not block the event loop
+        loop = asyncio.get_event_loop()
+        success, response_time, error_message = await loop.run_in_executor(
+            None, lambda: proxy_manager.test_proxy(proxy_data, timeout=15)
+        )
+
+        # Update proxy status in database
+        if success:
+            proxy.update_success(response_time)
+        else:
+            proxy.update_failure(error_message)
         db.commit()
 
-        return {"message": "Proxy test started", "task_id": task.id}
+        return {
+            "status": "working" if success else "failed",
+            "response_time_ms": round(response_time, 2),
+            "error": error_message if not success else None,
+            "proxy_id": proxy_id
+        }
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error testing proxy {proxy_id}: {e}")
         db.rollback()
-        raise HTTPException(status_code=500, detail="Failed to test proxy")
+        raise HTTPException(status_code=500, detail=f"Failed to test proxy: {str(e)}")
 
 
 @router.get("/api/settings/categories")
@@ -591,13 +688,221 @@ async def visit_target_now(target_id: int, visit_params: Dict[str, Any] = None, 
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/api/yandex-targets/{target_id}/launch-visits")
+async def launch_visits(target_id: int, body: Dict[str, Any] = None, db: Session = Depends(get_db)):
+    """Launch multiple visits for a target using different profiles.
+    
+    Body params:
+        count (int, optional): Number of visits to launch. Defaults to target's visits_per_day.
+    """
+    import random as _random
+
+    def _log_error_task(db_session, error_msg: str, target_url: str = "", profile_id: int = None):
+        """Create a failed Task record so the error appears in Visit Logs."""
+        try:
+            err_task = Task(
+                name=f"Ошибка запуска визита",
+                task_type="yandex_visit",
+                status="failed",
+                target_url=target_url,
+                profile_id=profile_id,
+                error_message=error_msg,
+                created_at=datetime.utcnow(),
+                completed_at=datetime.utcnow(),
+            )
+            err_task.add_log(f"ОШИБКА: {error_msg}")
+            db_session.add(err_task)
+            db_session.commit()
+        except Exception as log_err:
+            logger.error(f"Failed to log error task: {log_err}")
+
+    try:
+        target = db.query(YandexMapTarget).filter(YandexMapTarget.id == target_id).first()
+        if not target:
+            _log_error_task(db, f"Цель с ID {target_id} не найдена")
+            raise HTTPException(status_code=404, detail="Target not found")
+
+        target_url = target.url or ""
+        count = (body or {}).get("count", None) or target.visits_per_day or 10
+
+        # --- Pre-check: Redis connectivity ---
+        try:
+            import redis
+            from app.config import settings as _settings
+            r = redis.Redis(host=_settings.redis_host, port=_settings.redis_port, socket_connect_timeout=2)
+            r.ping()
+        except Exception as redis_err:
+            error_msg = f"Redis не запущен или недоступен: {redis_err}. Запустите: redis-server"
+            _log_error_task(db, error_msg, target_url)
+            raise HTTPException(status_code=503, detail=error_msg)
+
+        # --- Pre-check: Celery tasks import ---
+        try:
+            from tasks.yandex_maps import visit_yandex_maps_profile_task
+        except ImportError as imp_err:
+            error_msg = f"Celery задачи недоступны: {imp_err}"
+            _log_error_task(db, error_msg, target_url)
+            raise HTTPException(status_code=503, detail=error_msg)
+
+        # --- Pre-check: Celery worker availability ---
+        try:
+            from tasks.celery_app import celery_app as _celery
+            inspector = _celery.control.inspect(timeout=2)
+            active_workers = inspector.ping()
+            if not active_workers:
+                error_msg = "Celery worker не запущен. Запустите: celery -A tasks.celery_app:celery_app worker"
+                _log_error_task(db, error_msg, target_url)
+                raise HTTPException(status_code=503, detail=error_msg)
+        except HTTPException:
+            raise
+        except Exception as celery_err:
+            error_msg = f"Не удалось проверить Celery worker: {celery_err}"
+            _log_error_task(db, error_msg, target_url)
+            raise HTTPException(status_code=503, detail=error_msg)
+
+        # Get warmed profiles
+        profiles = db.query(BrowserProfile).filter(
+            BrowserProfile.is_active == True,
+            BrowserProfile.warmup_completed == True,
+            BrowserProfile.status == "warmed"
+        ).all()
+
+        if not profiles:
+            error_msg = "Нет прогретых профилей. Сначала завершите нагул."
+            _log_error_task(db, error_msg, target_url)
+            raise HTTPException(status_code=400, detail=error_msg)
+
+        # Filter out profiles that already visited this target
+        visited_profile_ids = db.query(ProfileTargetVisit.profile_id).filter(
+            ProfileTargetVisit.target_id == target_id,
+            ProfileTargetVisit.status == "completed"
+        ).all()
+        visited_ids = {row[0] for row in visited_profile_ids}
+
+        available_profiles = [p for p in profiles if p.id not in visited_ids]
+
+        if not available_profiles:
+            error_msg = f"Все профили уже посещали эту карту ({len(visited_ids)} из {len(profiles)}). Сбросьте визиты."
+            _log_error_task(db, error_msg, target_url)
+            raise HTTPException(status_code=400, detail=error_msg)
+
+        # Limit count to available profiles
+        actual_count = min(count, len(available_profiles))
+        selected = _random.sample(available_profiles, actual_count)
+
+        task_params = {
+            'min_visit_time': target.min_visit_duration,
+            'max_visit_time': target.max_visit_duration,
+            'actions': target.enabled_actions.split(',') if target.enabled_actions else []
+        }
+
+        launched = []
+        for idx, profile in enumerate(selected):
+            task = Task.create_yandex_visit_task(
+                profile_id=profile.id,
+                target_url=target.url,
+                parameters=task_params
+            )
+            db.add(task)
+            db.flush()
+
+            # Stagger launches: 5-15 seconds between each visit
+            delay_seconds = idx * _random.randint(5, 15)
+
+            try:
+                visit_yandex_maps_profile_task.apply_async(
+                    args=[profile.id, target.url, task_params, task.id],
+                    countdown=delay_seconds,
+                    queue='yandex'
+                )
+            except Exception as delay_err:
+                task.status = "failed"
+                task.error_message = f"Не удалось отправить задачу в Celery: {delay_err}"
+                task.add_log(f"ОШИБКА: {task.error_message}")
+                task.completed_at = datetime.utcnow()
+                db.flush()
+                logger.error(f"Failed to dispatch task for profile {profile.id}: {delay_err}")
+                continue
+
+            launched.append({
+                "task_id": task.id,
+                "profile_id": profile.id,
+                "profile_name": profile.name,
+                "delay": delay_seconds,
+            })
+
+        target.last_visit_at = datetime.utcnow()
+        db.commit()
+
+        if not launched:
+            raise HTTPException(
+                status_code=500,
+                detail="Не удалось запустить ни одного визита. Проверьте Redis и Celery worker."
+            )
+
+        return {
+            "message": f"Запущено {len(launched)} из {count} визитов",
+            "launched": len(launched),
+            "requested": count,
+            "available_profiles": len(available_profiles),
+            "tasks": launched,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error launching visits for target {target_id}: {e}")
+        db.rollback()
+        _log_error_task(db, f"Неожиданная ошибка: {e}", target_url=getattr(target, 'url', '') if 'target' in dir() else '')
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/api/yandex-targets/{target_id}/visits-per-day")
+async def update_visits_per_day(target_id: int, body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Update visits_per_day for a target."""
+    try:
+        target = db.query(YandexMapTarget).filter(YandexMapTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+
+        new_value = body.get("visits_per_day")
+        if new_value is None or int(new_value) < 1:
+            raise HTTPException(status_code=400, detail="visits_per_day must be >= 1")
+
+        target.visits_per_day = int(new_value)
+        db.commit()
+
+        return {"message": f"Настройка обновлена: {target.visits_per_day} визитов/день", "visits_per_day": target.visits_per_day}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating visits_per_day for target {target_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/visit-logs")
 async def get_visit_logs(limit: int = 30, db: Session = Depends(get_db)):
     """Get recent visit task logs for real-time progress display."""
     try:
+        from sqlalchemy import case, func
+        
+        # Priority: in_progress first, then recently completed/failed, pending last
+        status_priority = case(
+            (Task.status == 'in_progress', 0),
+            (Task.status == 'completed', 1),
+            (Task.status == 'failed', 1),
+            (Task.status == 'pending', 2),
+            else_=3
+        )
+        
+        # Sort by status priority, then by most recent activity
         tasks = db.query(Task).filter(
             Task.task_type == "yandex_visit"
-        ).order_by(Task.created_at.desc()).limit(limit).all()
+        ).order_by(
+            status_priority,
+            func.coalesce(Task.started_at, Task.created_at).desc()
+        ).limit(limit).all()
         
         result = []
         for t in tasks:
@@ -676,5 +981,355 @@ async def reset_target_visits(target_id: int, db: Session = Depends(get_db)):
         return {"message": f"Сброшено {deleted} записей. Все профили снова могут посещать эту карту."}
     except Exception as e:
         logger.error(f"Error resetting visits for target {target_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/system/cleanup-chrome")
+async def cleanup_chrome_processes():
+    """Kill all orphaned Chrome/chromedriver processes."""
+    try:
+        from core.browser_manager import cleanup_orphaned_chrome
+        killed = cleanup_orphaned_chrome()
+        return {"message": f"Убито {killed} процессов Chrome/chromedriver", "killed": killed}
+    except Exception as e:
+        logger.error(f"Error cleaning up Chrome processes: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# Process Monitor API — detects stuck/hung processes
+# ============================================================
+
+@router.get("/api/process-monitor")
+async def get_process_monitor(db: Session = Depends(get_db)):
+    """
+    Comprehensive process health monitor.
+    Detects stuck warmup profiles, orphaned Chrome processes,
+    Celery worker/beat issues, and stalled tasks.
+    """
+    alerts = []  # list of {level: 'danger'|'warning'|'info', title: str, message: str, action: str|None}
+    now = datetime.utcnow()
+
+    # ── 1. Stuck warmup profiles (status=warming_up for too long) ──
+    stuck_threshold_minutes = 15  # warmup task has 5-min time_limit, so 15 min = definitely stuck
+    try:
+        from sqlalchemy import func, case
+        stuck_cutoff = now - timedelta(minutes=stuck_threshold_minutes)
+        # Filter directly in SQL — never loads thousands of non-stuck rows
+        warming_profiles = db.query(BrowserProfile).filter(
+            BrowserProfile.status == "warming_up",
+            func.coalesce(BrowserProfile.updated_at, BrowserProfile.created_at) < stuck_cutoff
+        ).limit(50).all()  # cap to avoid loading too many even if all stuck
+
+        stuck_profiles = []
+        for p in warming_profiles:
+            last_change = p.updated_at or p.created_at
+            stuck_profiles.append({
+                "id": p.id,
+                "name": p.name,
+                "stuck_minutes": int((now - last_change).total_seconds() / 60),
+                "updated_at": last_change.isoformat()
+            })
+
+        if stuck_profiles:
+            names = ", ".join(p["name"] for p in stuck_profiles[:5])
+            extra = f" и ещё {len(stuck_profiles) - 5}" if len(stuck_profiles) > 5 else ""
+            alerts.append({
+                "level": "danger",
+                "icon": "exclamation-triangle-fill",
+                "title": f"🔴 Зависшие профили: {len(stuck_profiles)} шт.",
+                "message": f"Профили в статусе 'warming_up' более {stuck_threshold_minutes} мин: {names}{extra}. Процесс прогрева вероятно завис.",
+                "action": "fix_stuck_profiles",
+                "data": stuck_profiles
+            })
+    except Exception as e:
+        logger.error(f"Process monitor - stuck profiles check error: {e}")
+
+    # ── 2. Failed/error profiles ──
+    try:
+        error_profiles = db.query(BrowserProfile).filter(
+            BrowserProfile.status == "error"
+        ).all()
+        if error_profiles:
+            alerts.append({
+                "level": "warning",
+                "icon": "exclamation-circle",
+                "title": f"⚠️ Профили с ошибками: {len(error_profiles)} шт.",
+                "message": f"Профили в статусе 'error' — можно перезапустить прогрев.",
+                "action": "restart_error_profiles",
+                "data": [{"id": p.id, "name": p.name} for p in error_profiles[:10]]
+            })
+    except Exception as e:
+        logger.error(f"Process monitor - error profiles check: {e}")
+
+    # ── 3. Orphaned Chrome processes ──
+    chrome_count = 0
+    chromedriver_count = 0
+    try:
+        import psutil
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
+            try:
+                name = (proc.info.get('name') or '').lower()
+                cmdline = ' '.join(proc.info.get('cmdline') or [])
+                if ('chrome' in name and 'chromedriver' not in name
+                        and 'browser_profiles' in cmdline):
+                    chrome_count += 1
+                elif 'chromedriver' in name:
+                    chromedriver_count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+        # Chrome processes without active Celery tasks = likely orphaned
+        active_celery_tasks = 0
+        try:
+            from tasks.celery_app import celery_app
+            inspector = celery_app.control.inspect(timeout=2)
+            active = inspector.active()
+            if active:
+                for w, tasks in active.items():
+                    active_celery_tasks += len(tasks)
+        except:
+            pass
+
+        # Heuristic: each warmup task uses 1 Chrome + 1 chromedriver
+        expected_chrome = active_celery_tasks
+        orphaned_estimate = max(0, chrome_count - expected_chrome)
+
+        if orphaned_estimate > 2:
+            alerts.append({
+                "level": "warning",
+                "icon": "window-x",
+                "title": f"⚠️ Лишние Chrome-процессы: ~{orphaned_estimate}",
+                "message": f"Chrome: {chrome_count}, ChromeDriver: {chromedriver_count}, активных задач: {active_celery_tasks}. Возможно есть зависшие браузеры.",
+                "action": "cleanup_chrome",
+                "data": {"chrome": chrome_count, "chromedriver": chromedriver_count, "active_tasks": active_celery_tasks}
+            })
+    except ImportError:
+        # psutil not installed — try basic check
+        try:
+            result = subprocess.run(['pgrep', '-f', 'chrome.*browser_profiles'], capture_output=True, text=True, timeout=3)
+            if result.stdout.strip():
+                chrome_count = len(result.stdout.strip().split('\n'))
+        except:
+            pass
+
+    # ── 4. Celery Worker health ──
+    celery_worker_online = False
+    celery_active_tasks = 0
+    try:
+        from tasks.celery_app import celery_app
+        inspector = celery_app.control.inspect(timeout=3)
+        ping = inspector.ping()
+        if ping:
+            celery_worker_online = True
+            active = inspector.active()
+            if active:
+                for w, tasks in active.items():
+                    celery_active_tasks += len(tasks)
+        else:
+            alerts.append({
+                "level": "danger",
+                "icon": "cpu",
+                "title": "🔴 Celery Worker не отвечает!",
+                "message": "Worker не запущен или не отвечает. Прогрев и задачи не будут выполняться.",
+                "action": None,
+                "data": None
+            })
+    except Exception as e:
+        alerts.append({
+            "level": "danger",
+            "icon": "cpu",
+            "title": "🔴 Celery Worker недоступен",
+            "message": f"Не удалось проверить статус: {str(e)[:100]}",
+            "action": None,
+            "data": None
+        })
+
+    # ── 5. Celery Beat health ──
+    celery_beat_running = False
+    try:
+        import psutil
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                cmdline = ' '.join(proc.info.get('cmdline') or [])
+                if 'celery' in cmdline and 'beat' in cmdline:
+                    celery_beat_running = True
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except ImportError:
+        try:
+            result = subprocess.run(['pgrep', '-f', 'celery.*beat'], capture_output=True, text=True, timeout=3)
+            celery_beat_running = bool(result.stdout.strip())
+        except:
+            pass
+
+    if not celery_beat_running:
+        alerts.append({
+            "level": "warning",
+            "icon": "clock-history",
+            "title": "⚠️ Celery Beat не запущен",
+            "message": "Планировщик периодических задач не работает. Автоматические визиты Яндекс Карт и обслуживание не будут запускаться по расписанию.",
+            "action": None,
+            "data": None
+        })
+
+    # ── 6. Stalled tasks (in_progress for too long) ──
+    try:
+        stalled_threshold = timedelta(minutes=40)  # tasks have 35-min time limit
+        stalled_tasks = db.query(Task).filter(
+            Task.status == "in_progress",
+            Task.started_at.isnot(None),
+            Task.started_at < (now - stalled_threshold)
+        ).all()
+
+        if stalled_tasks:
+            alerts.append({
+                "level": "warning",
+                "icon": "hourglass-split",
+                "title": f"⚠️ Зависшие задачи: {len(stalled_tasks)} шт.",
+                "message": f"Задачи в статусе 'in_progress' более 40 мин. Возможно процесс завис.",
+                "action": "cancel_stalled_tasks",
+                "data": [{"id": t.id, "name": t.name, "type": t.task_type,
+                          "started": t.started_at.isoformat() if t.started_at else None} for t in stalled_tasks[:10]]
+            })
+    except Exception as e:
+        logger.error(f"Process monitor - stalled tasks check: {e}")
+
+    # ── 7. Warmup progress stalled (no progress for long time) ──
+    try:
+        warming_count = db.query(BrowserProfile).filter(BrowserProfile.status == "warming_up").count()
+        warmed_count = db.query(BrowserProfile).filter(BrowserProfile.warmup_completed == True).count()
+        total_count = db.query(BrowserProfile).count()
+
+        if warming_count == 0 and warmed_count < total_count and total_count > 0 and celery_worker_online:
+            pending_count = total_count - warmed_count - warming_count
+            if pending_count > 0:
+                alerts.append({
+                    "level": "info",
+                    "icon": "info-circle",
+                    "title": f"ℹ️ Прогрев на паузе: {pending_count} профилей ожидают",
+                    "message": f"Прогрето: {warmed_count}/{total_count}. Нет активных задач прогрева. Нажмите 'Warm All' для продолжения.",
+                    "action": None,
+                    "data": None
+                })
+    except Exception as e:
+        logger.error(f"Process monitor - warmup progress check: {e}")
+
+    # ── Summary ──
+    summary = {
+        "status": "healthy" if not any(a["level"] == "danger" for a in alerts) else "critical",
+        "alerts_count": len(alerts),
+        "danger_count": sum(1 for a in alerts if a["level"] == "danger"),
+        "warning_count": sum(1 for a in alerts if a["level"] == "warning"),
+        "info_count": sum(1 for a in alerts if a["level"] == "info"),
+        "celery_worker": celery_worker_online,
+        "celery_beat": celery_beat_running,
+        "celery_active_tasks": celery_active_tasks,
+        "chrome_processes": chrome_count,
+        "chromedriver_processes": chromedriver_count,
+        "checked_at": now.isoformat()
+    }
+
+    return {
+        "summary": summary,
+        "alerts": alerts
+    }
+
+
+@router.post("/api/process-monitor/fix-stuck-profiles")
+async def fix_stuck_profiles(db: Session = Depends(get_db)):
+    """Reset stuck warming_up profiles back to 'created' so they can be re-warmed."""
+    try:
+        stuck_threshold = timedelta(minutes=15)
+        now = datetime.utcnow()
+
+        stuck = db.query(BrowserProfile).filter(
+            BrowserProfile.status == "warming_up",
+            BrowserProfile.updated_at < (now - stuck_threshold)
+        ).all()
+
+        fixed_count = 0
+        for p in stuck:
+            p.status = "created" if not p.warmup_completed else "warmed"
+            p.updated_at = now
+            fixed_count += 1
+
+        db.commit()
+
+        return {
+            "message": f"Исправлено {fixed_count} зависших профилей. Они готовы к повторному прогреву.",
+            "fixed_count": fixed_count,
+            "fixed_profiles": [{"id": p.id, "name": p.name} for p in stuck]
+        }
+    except Exception as e:
+        logger.error(f"Error fixing stuck profiles: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/process-monitor/restart-error-profiles")
+async def restart_error_profiles(db: Session = Depends(get_db)):
+    """Reset error profiles back to 'created' for re-warmup."""
+    try:
+        error_profiles = db.query(BrowserProfile).filter(
+            BrowserProfile.status == "error"
+        ).all()
+
+        fixed_count = 0
+        for p in error_profiles:
+            p.status = "created"
+            p.updated_at = datetime.utcnow()
+            fixed_count += 1
+
+        db.commit()
+
+        return {
+            "message": f"Сброшено {fixed_count} профилей с ошибками. Готовы к повторному прогреву.",
+            "fixed_count": fixed_count
+        }
+    except Exception as e:
+        logger.error(f"Error restarting error profiles: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/process-monitor/cancel-stalled-tasks")
+async def cancel_stalled_tasks(db: Session = Depends(get_db)):
+    """Cancel tasks that have been in_progress too long."""
+    try:
+        stalled_threshold = timedelta(minutes=40)
+        now = datetime.utcnow()
+
+        stalled = db.query(Task).filter(
+            Task.status == "in_progress",
+            Task.started_at.isnot(None),
+            Task.started_at < (now - stalled_threshold)
+        ).all()
+
+        cancelled_count = 0
+        for t in stalled:
+            t.status = "failed"
+            t.error_message = "Автоматически отменена: задача зависла (>40 мин)"
+            t.completed_at = now
+            cancelled_count += 1
+
+            # Try to revoke Celery task
+            if t.celery_task_id:
+                try:
+                    from tasks.celery_app import celery_app
+                    celery_app.control.revoke(t.celery_task_id, terminate=True)
+                except:
+                    pass
+
+        db.commit()
+
+        return {
+            "message": f"Отменено {cancelled_count} зависших задач.",
+            "cancelled_count": cancelled_count
+        }
+    except Exception as e:
+        logger.error(f"Error cancelling stalled tasks: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))

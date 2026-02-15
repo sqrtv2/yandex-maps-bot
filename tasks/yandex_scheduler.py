@@ -158,8 +158,9 @@ def schedule_yandex_visits():
                         # Select profile from available (not yet visited) profiles
                         profile = available_profiles[i % len(available_profiles)]
                         
-                        # Add small random delay between concurrent visits (0-10 seconds)
-                        delay_seconds = random.randint(0, 10) if i > 0 else 0
+                        # Spread visits across the entire 5-minute window (0-280s)
+                        # so they don't all start at once — looks more natural
+                        delay_seconds = random.randint(0, 280)
                         
                         # Create Task record for UI visibility
                         task_record = Task(
@@ -342,3 +343,111 @@ def daily_stats_reset():
             'status': 'error',
             'error': str(e)
         }
+
+
+@shared_task(name='tasks.yandex_maps.cleanup_used_profiles')
+def cleanup_used_profiles():
+    """
+    Удаляет профили, которые посетили ВСЕ активные цели.
+    Удаляет: запись из БД (browser_profiles) + папку с диска.
+    Запускается каждые 30 минут через celery beat.
+    """
+    import os
+    import shutil
+    from sqlalchemy import func
+    from app.config import settings
+
+    logger.info("🧹 Starting cleanup of fully-used profiles...")
+
+    try:
+        with get_db_session() as db:
+            # Count active targets
+            active_targets = db.query(YandexMapTarget).filter(
+                YandexMapTarget.is_active == True
+            ).all()
+            active_target_ids = [t.id for t in active_targets]
+            num_targets = len(active_target_ids)
+
+            if num_targets == 0:
+                logger.info("No active targets — nothing to clean up")
+                return {'status': 'skipped', 'reason': 'no_active_targets'}
+
+            # Find profiles that visited ALL active targets
+            fully_used_subq = (
+                db.query(ProfileTargetVisit.profile_id)
+                .filter(ProfileTargetVisit.target_id.in_(active_target_ids))
+                .group_by(ProfileTargetVisit.profile_id)
+                .having(func.count(func.distinct(ProfileTargetVisit.target_id)) >= num_targets)
+                .subquery()
+            )
+
+            fully_used_profiles = (
+                db.query(BrowserProfile)
+                .filter(BrowserProfile.id.in_(db.query(fully_used_subq.c.profile_id)))
+                .all()
+            )
+
+            if not fully_used_profiles:
+                logger.info(f"✅ No fully-used profiles to clean (targets: {num_targets})")
+                return {
+                    'status': 'success',
+                    'deleted_profiles': 0,
+                    'deleted_dirs': 0,
+                    'active_targets': num_targets
+                }
+
+            deleted_profiles = 0
+            deleted_dirs = 0
+            errors = []
+
+            for profile in fully_used_profiles:
+                profile_name = profile.name
+                profile_id = profile.id
+
+                try:
+                    # 1) Delete profile_target_visits records
+                    db.query(ProfileTargetVisit).filter(
+                        ProfileTargetVisit.profile_id == profile_id
+                    ).delete(synchronize_session=False)
+
+                    # 2) Nullify profile_id in tasks table (preserve task history)
+                    db.query(Task).filter(
+                        Task.profile_id == profile_id
+                    ).update({Task.profile_id: None}, synchronize_session=False)
+
+                    # 3) Delete profile from DB
+                    db.delete(profile)
+                    deleted_profiles += 1
+
+                    # 4) Delete folder from disk
+                    profile_dir = os.path.join(settings.browser_user_data_dir, profile_name)
+                    if os.path.exists(profile_dir):
+                        shutil.rmtree(profile_dir, ignore_errors=True)
+                        deleted_dirs += 1
+                        logger.info(f"🗑️ Deleted profile {profile_name} (id={profile_id}) + disk folder")
+                    else:
+                        logger.info(f"🗑️ Deleted profile {profile_name} (id={profile_id}), no folder on disk")
+
+                except Exception as e:
+                    errors.append(f"{profile_name}: {e}")
+                    logger.warning(f"⚠️ Error deleting profile {profile_name}: {e}")
+
+            db.commit()
+
+            logger.info(
+                f"🧹 Cleanup done: {deleted_profiles} profiles deleted from DB, "
+                f"{deleted_dirs} directories removed from disk"
+            )
+
+            result = {
+                'status': 'success',
+                'deleted_profiles': deleted_profiles,
+                'deleted_dirs': deleted_dirs,
+                'active_targets': num_targets,
+                'errors': errors if errors else None
+            }
+            return result
+
+    except Exception as e:
+        logger.error(f"❌ Cleanup error: {e}", exc_info=True)
+        return {'status': 'error', 'error': str(e)}

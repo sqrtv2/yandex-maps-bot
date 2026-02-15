@@ -28,10 +28,9 @@ class ProxyManager:
         self.failure_counts = {}  # proxy_id -> failure_count
         self.ban_until = {}  # proxy_id -> unban_timestamp
         self.test_urls = [
-            "http://httpbin.org/ip",
-            "https://api.ipify.org?format=json",
-            "http://checkip.amazonaws.com/",
-            "https://ipinfo.io/json"
+            "https://yandex.ru",
+            "https://maps.yandex.ru",
+            "https://yandex.ru/maps",
         ]
 
     def load_proxies_from_db(self) -> int:
@@ -100,28 +99,18 @@ class ProxyManager:
                 if proxy_id in exclude_ids:
                     continue
 
-                # Skip banned proxies
-                if proxy_id in self.ban_until and current_time < self.ban_until[proxy_id]:
-                    continue
-
-                # Skip proxies with too many recent failures
-                if proxy_id in self.failure_counts and self.failure_counts[proxy_id] >= 5:
-                    continue
-
-                # Check if proxy should be considered working
-                if not proxy_data.get('is_working', True):
-                    # Give failed proxies a chance after some time
-                    last_check = proxy_data.get('last_check_at')
-                    if last_check:
-                        time_since_check = current_time - last_check.timestamp()
-                        if time_since_check < 1800:  # 30 minutes
-                            continue
-
+                # All active proxies are always available
                 available_proxies.append((proxy_id, proxy_data))
 
             if not available_proxies:
-                logger.warning("No available proxies found")
-                return None
+                logger.warning("No available proxies found — auto-resetting all proxies")
+                self._auto_reset_all_proxies()
+                # Retry once after reset
+                for proxy_id, proxy_data in self.active_proxies.items():
+                    if proxy_id not in (exclude_ids or []):
+                        available_proxies.append((proxy_id, proxy_data))
+                if not available_proxies:
+                    return None
 
             # Sort by last used time (least recently used first)
             available_proxies.sort(key=lambda x: self.last_used.get(x[0], 0))
@@ -137,8 +126,34 @@ class ProxyManager:
             logger.error(f"Error getting available proxy: {e}")
             return None
 
-    def test_proxy(self, proxy_data: Dict, timeout: int = 10) -> Tuple[bool, float, str]:
-        """Test proxy connectivity and speed."""
+    def _auto_reset_all_proxies(self):
+        """Reset all proxies when none are available — prevents complete proxy starvation."""
+        try:
+            logger.info("Auto-resetting all proxy states (failure counts, bans)")
+            self.failure_counts.clear()
+            self.ban_until.clear()
+
+            with get_db_session() as db:
+                proxies = db.query(ProxyServer).filter(
+                    ProxyServer.is_active == True
+                ).all()
+                for proxy in proxies:
+                    proxy.consecutive_failures = 0
+                    proxy.is_working = True
+                    proxy.status = "unchecked"
+                    proxy.ban_until = None
+
+                    # Update local cache
+                    if proxy.id in self.active_proxies:
+                        self.active_proxies[proxy.id]['is_working'] = True
+                db.commit()
+
+            logger.info(f"Auto-reset {len(self.active_proxies)} proxies")
+        except Exception as e:
+            logger.error(f"Error auto-resetting proxies: {e}")
+
+    def test_proxy(self, proxy_data: Dict, timeout: int = 15) -> Tuple[bool, float, str]:
+        """Test proxy connectivity and speed using Yandex domains."""
         proxy_url = self.get_proxy_url(proxy_data)
         proxies = self.get_proxy_dict(proxy_data)
 
@@ -151,51 +166,38 @@ class ProxyManager:
                 test_url,
                 proxies=proxies,
                 timeout=timeout,
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                allow_redirects=False,
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
             )
 
             response_time = (time.time() - start_time) * 1000  # Convert to milliseconds
 
-            if response.status_code == 200:
-                # Try to get IP from response to verify proxy is working
-                try:
-                    if "ipify" in test_url:
-                        ip = response.json().get('ip', '')
-                    elif "ipinfo" in test_url:
-                        ip = response.json().get('ip', '')
-                    elif "httpbin" in test_url:
-                        ip = response.json().get('origin', '')
-                    else:
-                        ip = response.text.strip()
-
-                    if ip and ip != "":
-                        logger.info(f"Proxy {proxy_data['host']}:{proxy_data['port']} working, IP: {ip}, Response time: {response_time:.2f}ms")
-                        return True, response_time, ""
-                    else:
-                        error_message = "No IP returned from test"
-                except Exception as parse_error:
-                    error_message = f"Error parsing response: {parse_error}"
-
+            # Accept 2xx and 3xx as success (Yandex often redirects)
+            if response.status_code < 400:
+                logger.info(f"Proxy {proxy_data['host']}:{proxy_data['port']} working, HTTP {response.status_code}, Response time: {response_time:.2f}ms")
+                return True, response_time, ""
+            elif response.status_code in (403, 407):
+                error_message = f"Proxy auth/ACL error HTTP {response.status_code}"
             else:
                 error_message = f"HTTP {response.status_code}: {response.text[:100]}"
 
         except requests.exceptions.ProxyError as e:
-            error_message = f"Proxy error: {str(e)}"
+            error_message = f"Proxy error: {str(e)[:200]}"
         except requests.exceptions.ConnectTimeout as e:
-            error_message = f"Connection timeout: {str(e)}"
+            error_message = f"Connection timeout: {str(e)[:200]}"
         except requests.exceptions.ReadTimeout as e:
-            error_message = f"Read timeout: {str(e)}"
+            error_message = f"Read timeout: {str(e)[:200]}"
         except requests.exceptions.ConnectionError as e:
-            error_message = f"Connection error: {str(e)}"
+            error_message = f"Connection error: {str(e)[:200]}"
         except Exception as e:
-            error_message = f"Unexpected error: {str(e)}"
+            error_message = f"Unexpected error: {str(e)[:200]}"
 
         response_time = (time.time() - start_time) * 1000
         logger.warning(f"Proxy {proxy_data['host']}:{proxy_data['port']} failed: {error_message}")
         return False, response_time, error_message
 
-    async def test_proxy_async(self, proxy_data: Dict, timeout: int = 10) -> Tuple[bool, float, str]:
-        """Async version of proxy testing."""
+    async def test_proxy_async(self, proxy_data: Dict, timeout: int = 15) -> Tuple[bool, float, str]:
+        """Async version of proxy testing using Yandex domains."""
         proxy_url = self.get_proxy_url(proxy_data)
         test_url = random.choice(self.test_urls)
         start_time = time.time()
@@ -210,27 +212,17 @@ class ProxyManager:
                 async with session.get(
                     test_url,
                     proxy=proxy_url,
-                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                    allow_redirects=False,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
                 ) as response:
                     response_time = (time.time() - start_time) * 1000
 
-                    if response.status == 200:
-                        text = await response.text()
-                        try:
-                            if "ipify" in test_url or "ipinfo" in test_url:
-                                import json
-                                data = json.loads(text)
-                                ip = data.get('ip', '')
-                            else:
-                                ip = text.strip()
-
-                            if ip:
-                                logger.info(f"Proxy {proxy_data['host']}:{proxy_data['port']} working, IP: {ip}")
-                                return True, response_time, ""
-                            else:
-                                error_message = "No IP returned from test"
-                        except Exception as parse_error:
-                            error_message = f"Error parsing response: {parse_error}"
+                    # Accept 2xx and 3xx as success
+                    if response.status < 400:
+                        logger.info(f"Proxy {proxy_data['host']}:{proxy_data['port']} working, HTTP {response.status}")
+                        return True, response_time, ""
+                    elif response.status in (403, 407):
+                        error_message = f"Proxy auth/ACL error HTTP {response.status}"
                     else:
                         error_message = f"HTTP {response.status}"
 
@@ -241,7 +233,7 @@ class ProxyManager:
         except aiohttp.ClientConnectorError:
             error_message = "Connection error"
         except Exception as e:
-            error_message = f"Async error: {str(e)}"
+            error_message = f"Async error: {str(e)[:200]}"
 
         response_time = (time.time() - start_time) * 1000
         return False, response_time, error_message
@@ -262,12 +254,6 @@ class ProxyManager:
                             del self.ban_until[proxy_id]
                     else:
                         proxy.update_failure(error_message)
-                        # Increment local failure count
-                        self.failure_counts[proxy_id] = self.failure_counts.get(proxy_id, 0) + 1
-
-                        # Ban proxy temporarily after too many failures
-                        if self.failure_counts[proxy_id] >= 10:
-                            self.ban_until[proxy_id] = time.time() + 3600  # Ban for 1 hour
 
                     db.commit()
 

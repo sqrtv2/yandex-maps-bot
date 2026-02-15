@@ -186,13 +186,13 @@ function loadProxies() {
                     <td><span class="badge bg-secondary">${proxy.proxy_type.toUpperCase()}</span></td>
                     <td><span class="badge bg-${getProxyStatusColor(proxy.status)}">${proxy.status}</span></td>
                     <td>${proxy.response_time_ms || '-'}ms</td>
-                    <td>${proxy.usage_count}</td>
+                    <td>${proxy.times_used || 0}</td>
                     <td>
-                        <span class="badge bg-${proxy.usage_count > 0 ? 'success' : 'secondary'}">
-                            ${proxy.usage_count > 0 ? Math.round((proxy.successful_requests / proxy.usage_count) * 100) + '%' : 'N/A'}
+                        <span class="badge bg-${proxy.times_used > 0 ? 'success' : 'secondary'}">
+                            ${proxy.times_used > 0 ? Math.round((proxy.successful_requests / proxy.total_requests) * 100) + '%' : 'N/A'}
                         </span>
                     </td>
-                    <td>${proxy.last_checked ? new Date(proxy.last_checked).toLocaleString() : 'Never'}</td>
+                    <td>${proxy.last_check_at ? new Date(proxy.last_check_at).toLocaleString() : 'Never'}</td>
                     <td>
                         <div class="btn-group btn-group-sm">
                             <button class="btn btn-outline-primary" onclick="testProxy(${proxy.id})" title="Test Proxy">
@@ -220,7 +220,8 @@ function updateProxyStats(proxies) {
     const total = proxies.length;
     const working = proxies.filter(p => p.status === 'working').length;
     const failed = proxies.filter(p => p.status === 'failed').length;
-    const avgTime = total > 0 ? Math.round(proxies.reduce((sum, p) => sum + (p.response_time_ms || 0), 0) / total) : 0;
+    const proxiesWithTime = proxies.filter(p => p.response_time_ms > 0);
+    const avgTime = proxiesWithTime.length > 0 ? Math.round(proxiesWithTime.reduce((sum, p) => sum + (p.response_time_ms || 0), 0) / proxiesWithTime.length) : 0;
 
     document.getElementById('totalProxies').textContent = total;
     document.getElementById('workingProxies').textContent = working;
@@ -273,29 +274,56 @@ function createProxy() {
 }
 
 function testProxy(proxyId) {
+    // Find the button and show loading state
+    const btn = document.querySelector(`button[onclick="testProxy(${proxyId})"]`);
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+    }
     fetch(`/api/proxies/${proxyId}/test`, {method: 'POST'})
         .then(response => response.json())
         .then(result => {
-            alert(`Proxy test result: ${result.status}`);
+            if (result.status === 'working') {
+                alert(`✅ Proxy working! Response time: ${result.response_time_ms}ms`);
+            } else {
+                alert(`❌ Proxy failed: ${result.error || 'Unknown error'}`);
+            }
             loadProxies();
         })
         .catch(error => {
             console.error('Error testing proxy:', error);
-            alert('Error testing proxy');
+            alert('Error testing proxy: ' + error.message);
+        })
+        .finally(() => {
+            if (btn) {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="bi bi-check"></i>';
+            }
         });
 }
 
 function testAllProxies() {
     if (confirm('Test all proxies? This may take a few minutes.')) {
+        const btn = document.querySelector('button[onclick="testAllProxies()"]');
+        if (btn) {
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Testing...';
+        }
         fetch('/api/proxies/test-all', {method: 'POST'})
             .then(response => response.json())
             .then(result => {
-                alert('All proxies tested!');
+                alert(result.message || 'All proxies tested!');
                 loadProxies();
             })
             .catch(error => {
                 console.error('Error testing proxies:', error);
-                alert('Error testing proxies');
+                alert('Error testing proxies: ' + error.message);
+            })
+            .finally(() => {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="bi bi-check-circle"></i> Test All';
+                }
             });
     }
 }

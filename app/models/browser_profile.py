@@ -19,7 +19,7 @@ class BrowserProfile(Base):
     viewport_width = Column(Integer, default=1366)
     viewport_height = Column(Integer, default=768)
     timezone = Column(String(100), default="Europe/Moscow")
-    language = Column(String(10), default="ru-RU")
+    language = Column(String(50), default="ru-RU")
     platform = Column(String(50), default="Win32")
 
     # Fingerprinting Data

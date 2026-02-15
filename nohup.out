@@ -1,0 +1,35 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/celery/__main__.py", line 19, in <module>
+    main()
+    ~~~~^^
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/celery/__main__.py", line 14, in main
+    from celery.bin.celery import main as _main
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/celery/bin/celery.py", line 14, in <module>
+    from celery.app.utils import find_app
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/celery/app/__init__.py", line 6, in <module>
+    from .base import Celery
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/celery/app/base.py", line 16, in <module>
+    from dateutil.parser import isoparse
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/dateutil/parser/__init__.py", line 2, in <module>
+    from ._parser import parse, parser, parserinfo, ParserError
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/dateutil/parser/_parser.py", line 50, in <module>
+    from .. import tz
+  File "<frozen importlib._bootstrap>", line 1412, in _handle_fromlist
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/dateutil/__init__.py", line 16, in __getattr__
+    return importlib.import_module("." + name, __name__)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/importlib/__init__.py", line 88, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/dateutil/tz/__init__.py", line 2, in <module>
+    from .tz import *
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/dateutil/tz/tz.py", line 874, in <module>
+    class tzrange(tzrangebase):
+    ...<158 lines>...
+            return self._dst_base_offset_
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/dateutil/tz/tz.py", line 1031, in tzrange
+    @property
+     ^^^^^^^^
+KeyboardInterrupt
