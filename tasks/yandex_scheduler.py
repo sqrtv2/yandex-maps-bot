@@ -40,7 +40,7 @@ def schedule_yandex_visits():
     
     # Don't flood the queue — check how many tasks are already queued
     try:
-        queue_len = (r.llen('yandex_maps') or 0) + (r.llen('yandex') or 0)
+        queue_len = r.llen('yandex_maps') or 0
         if queue_len > 20:
             logger.warning(f"⏭️ Yandex Maps queue already has {queue_len} tasks, skipping scheduling")
             return {'status': 'skipped', 'reason': f'queue_full ({queue_len})', 'scheduled': 0}
