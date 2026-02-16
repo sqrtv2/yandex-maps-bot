@@ -95,6 +95,300 @@ async def yandex_search_page(request: Request):
     return templates.TemplateResponse("yandex_search.html", {"request": request})
 
 
+@router.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request):
+    """Worker and system settings page."""
+    if not templates:
+        return HTMLResponse("<h1>Templates not found</h1>")
+
+    return templates.TemplateResponse("settings.html", {"request": request})
+
+
+# Worker Management API
+
+@router.get("/api/workers/status")
+async def get_workers_status(db: Session = Depends(get_db)):
+    """Get status of all celery workers and queue lengths."""
+    try:
+        import redis as _redis
+        from app.config import settings as _s
+        r = _redis.Redis(host=_s.redis_host, port=_s.redis_port)
+        
+        # Get queue lengths
+        queues = {}
+        for q_name in ['warmup', 'yandex_maps', 'yandex_search', 'default', 'proxy', 'maintenance']:
+            queues[q_name] = r.llen(q_name) or 0
+        
+        # Also check legacy 'yandex' queue
+        legacy_yandex = r.llen('yandex') or 0
+        if legacy_yandex > 0:
+            queues['yandex_maps'] += legacy_yandex
+        
+        # Get worker info from celery inspect
+        from tasks.celery_app import celery_app
+        inspect = celery_app.control.inspect(timeout=5)
+        
+        active_tasks = {}
+        worker_stats = {}
+        
+        try:
+            active = inspect.active() or {}
+            stats = inspect.stats() or {}
+            
+            for worker_name, tasks in active.items():
+                active_tasks[worker_name] = len(tasks)
+            
+            for worker_name, st in stats.items():
+                worker_stats[worker_name] = {
+                    'concurrency': st.get('pool', {}).get('max-concurrency', 0),
+                    'total_tasks': st.get('total', {})
+                }
+        except Exception as e:
+            logger.warning(f"Could not inspect workers: {e}")
+        
+        # Get settings from DB
+        worker_settings = {}
+        settings_keys = [
+            'worker_warmup_concurrency', 'worker_yandex_maps_concurrency', 'worker_yandex_search_concurrency',
+            'worker_warmup_enabled', 'worker_yandex_maps_enabled', 'worker_yandex_search_enabled',
+            'worker_warmup_memory_limit', 'worker_yandex_maps_memory_limit', 'worker_yandex_search_memory_limit'
+        ]
+        for key in settings_keys:
+            setting = db.query(UserSettings).filter(UserSettings.setting_key == key).first()
+            if setting:
+                worker_settings[key] = setting.get_typed_value()
+        
+        return {
+            'queues': queues,
+            'active_tasks': active_tasks,
+            'worker_stats': worker_stats,
+            'settings': worker_settings
+        }
+    except Exception as e:
+        logger.error(f"Error getting worker status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/workers/apply")
+async def apply_worker_settings(data: Dict[str, Any], db: Session = Depends(get_db)):
+    """Save worker settings and generate docker-compose restart command."""
+    try:
+        # Update settings in DB
+        for key, value in data.items():
+            setting = db.query(UserSettings).filter(UserSettings.setting_key == key).first()
+            if setting:
+                setting.set_typed_value(value)
+            else:
+                # Create new setting
+                setting_type = 'int' if isinstance(value, int) else ('bool' if isinstance(value, bool) else 'string')
+                new_setting = UserSettings(
+                    setting_key=key,
+                    setting_value=str(value),
+                    setting_type=setting_type,
+                    category='workers',
+                    description=f'Worker setting: {key}'
+                )
+                db.add(new_setting)
+        db.commit()
+        
+        # Read back the updated settings
+        warmup_conc = int(data.get('worker_warmup_concurrency', 5))
+        maps_conc = int(data.get('worker_yandex_maps_concurrency', 3))
+        search_conc = int(data.get('worker_yandex_search_concurrency', 3))
+        warmup_enabled = data.get('worker_warmup_enabled', True)
+        maps_enabled = data.get('worker_yandex_maps_enabled', True)
+        search_enabled = data.get('worker_yandex_search_enabled', True)
+        warmup_mem = int(data.get('worker_warmup_memory_limit', 16))
+        maps_mem = int(data.get('worker_yandex_maps_memory_limit', 8))
+        search_mem = int(data.get('worker_yandex_search_memory_limit', 8))
+        
+        return {
+            'status': 'saved',
+            'message': 'Настройки сохранены. Для применения нужно перезапустить воркеры.',
+            'settings': {
+                'warmup': {'concurrency': warmup_conc, 'enabled': warmup_enabled, 'memory_gb': warmup_mem},
+                'yandex_maps': {'concurrency': maps_conc, 'enabled': maps_enabled, 'memory_gb': maps_mem},
+                'yandex_search': {'concurrency': search_conc, 'enabled': search_enabled, 'memory_gb': search_mem},
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error applying worker settings: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/workers/restart")
+async def restart_workers(db: Session = Depends(get_db)):
+    """Restart celery workers with updated concurrency settings from DB."""
+    try:
+        # Read settings from DB
+        def get_setting(key, default):
+            s = db.query(UserSettings).filter(UserSettings.setting_key == key).first()
+            return s.get_typed_value() if s else default
+        
+        warmup_conc = get_setting('worker_warmup_concurrency', 5)
+        maps_conc = get_setting('worker_yandex_maps_concurrency', 3)
+        search_conc = get_setting('worker_yandex_search_concurrency', 3)
+        warmup_enabled = get_setting('worker_warmup_enabled', True)
+        maps_enabled = get_setting('worker_yandex_maps_enabled', True)
+        search_enabled = get_setting('worker_yandex_search_enabled', True)
+        warmup_mem = get_setting('worker_warmup_memory_limit', 16)
+        maps_mem = get_setting('worker_yandex_maps_memory_limit', 8)
+        search_mem = get_setting('worker_yandex_search_memory_limit', 8)
+        
+        # Generate docker-compose override file dynamically
+        import yaml
+        
+        compose_override = {'services': {}}
+        
+        if warmup_enabled:
+            compose_override['services']['celery_warmup'] = {
+                'build': '.',
+                'init': True,
+                'command': f'celery -A tasks.celery_app worker --loglevel=info --concurrency={warmup_conc} -Q default,warmup,proxy,maintenance -n warmup@%h',
+                'shm_size': '2gb',
+                'environment': [
+                    'YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot',
+                    'YANDEX_BOT_REDIS_HOST=redis',
+                    'YANDEX_BOT_REDIS_PORT=6379',
+                    'YANDEX_BOT_DEBUG=false',
+                    'YANDEX_BOT_BROWSER_HEADLESS=true',
+                    'YANDEX_BOT_SAVE_SCREENSHOTS=false',
+                    'YANDEX_BOT_FAST_MODE=true',
+                ],
+                'volumes': [
+                    './data:/app/data', './logs:/app/logs', './browser_profiles:/app/browser_profiles',
+                    './tasks:/app/tasks', './core:/app/core', './app:/app/app', './web:/app/web',
+                ],
+                'depends_on': ['postgres', 'redis'],
+                'restart': 'unless-stopped',
+                'deploy': {'resources': {'limits': {'memory': f'{warmup_mem}G'}}},
+                'networks': ['yandex_maps_network'],
+            }
+        
+        if maps_enabled:
+            compose_override['services']['celery_yandex_maps'] = {
+                'build': '.',
+                'init': True,
+                'command': f'celery -A tasks.celery_app worker --loglevel=info --concurrency={maps_conc} -Q yandex_maps -n yandex_maps@%h',
+                'shm_size': '2gb',
+                'environment': [
+                    'YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot',
+                    'YANDEX_BOT_REDIS_HOST=redis',
+                    'YANDEX_BOT_REDIS_PORT=6379',
+                    'YANDEX_BOT_DEBUG=false',
+                    'YANDEX_BOT_BROWSER_HEADLESS=true',
+                    'YANDEX_BOT_SAVE_SCREENSHOTS=false',
+                    'YANDEX_BOT_FAST_MODE=true',
+                ],
+                'volumes': [
+                    './data:/app/data', './logs:/app/logs', './screenshots:/app/screenshots',
+                    './browser_profiles:/app/browser_profiles',
+                    './tasks:/app/tasks', './core:/app/core', './app:/app/app', './web:/app/web',
+                ],
+                'depends_on': ['postgres', 'redis'],
+                'restart': 'unless-stopped',
+                'deploy': {'resources': {'limits': {'memory': f'{maps_mem}G'}}},
+                'networks': ['yandex_maps_network'],
+            }
+        
+        if search_enabled:
+            compose_override['services']['celery_yandex_search'] = {
+                'build': '.',
+                'init': True,
+                'command': f'celery -A tasks.celery_app worker --loglevel=info --concurrency={search_conc} -Q yandex_search -n yandex_search@%h',
+                'shm_size': '2gb',
+                'environment': [
+                    'YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot',
+                    'YANDEX_BOT_REDIS_HOST=redis',
+                    'YANDEX_BOT_REDIS_PORT=6379',
+                    'YANDEX_BOT_DEBUG=false',
+                    'YANDEX_BOT_BROWSER_HEADLESS=true',
+                    'YANDEX_BOT_SAVE_SCREENSHOTS=false',
+                    'YANDEX_BOT_FAST_MODE=true',
+                ],
+                'volumes': [
+                    './data:/app/data', './logs:/app/logs', './screenshots:/app/screenshots',
+                    './browser_profiles:/app/browser_profiles',
+                    './tasks:/app/tasks', './core:/app/core', './app:/app/app', './web:/app/web',
+                ],
+                'depends_on': ['postgres', 'redis'],
+                'restart': 'unless-stopped',
+                'deploy': {'resources': {'limits': {'memory': f'{search_mem}G'}}},
+                'networks': ['yandex_maps_network'],
+            }
+        
+        # Write the override file
+        override_path = '/app/docker-compose.workers.yml'
+        try:
+            with open(override_path, 'w') as f:
+                yaml.dump(compose_override, f, default_flow_style=False)
+        except Exception:
+            # Fallback path if /app is not writable
+            override_path = './docker-compose.workers.yml'
+            with open(override_path, 'w') as f:
+                yaml.dump(compose_override, f, default_flow_style=False)
+        
+        # Execute restart via subprocess
+        import subprocess
+        
+        # Stop old workers
+        stop_cmds = [
+            'docker compose stop celery_worker celery_yandex 2>/dev/null || true',
+            'docker compose rm -f celery_worker celery_yandex 2>/dev/null || true',
+        ]
+        
+        for cmd in stop_cmds:
+            try:
+                subprocess.run(cmd, shell=True, timeout=30, capture_output=True)
+            except Exception as e:
+                logger.warning(f"Stop command failed: {cmd}: {e}")
+
+        # Start new workers using override
+        start_cmd = f'docker compose -f docker-compose.yml -f {override_path} up -d celery_warmup celery_yandex_maps celery_yandex_search 2>&1'
+        try:
+            result = subprocess.run(start_cmd, shell=True, timeout=120, capture_output=True, text=True)
+            output = result.stdout + result.stderr
+        except Exception as e:
+            output = str(e)
+        
+        return {
+            'status': 'restarting',
+            'message': f'Воркеры перезапускаются с новыми настройками',
+            'output': output,
+            'settings': {
+                'warmup': {'concurrency': warmup_conc, 'enabled': warmup_enabled},
+                'yandex_maps': {'concurrency': maps_conc, 'enabled': maps_enabled},
+                'yandex_search': {'concurrency': search_conc, 'enabled': search_enabled},
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error restarting workers: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/workers/queues")
+async def get_queue_details():
+    """Get detailed queue information."""
+    try:
+        import redis as _redis
+        from app.config import settings as _s
+        r = _redis.Redis(host=_s.redis_host, port=_s.redis_port)
+        
+        queues = {}
+        for q_name in ['warmup', 'yandex_maps', 'yandex_search', 'yandex', 'default', 'proxy', 'maintenance']:
+            length = r.llen(q_name) or 0
+            queues[q_name] = {
+                'length': length,
+                'active': length > 0
+            }
+        
+        return queues
+    except Exception as e:
+        logger.error(f"Error getting queue details: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Advanced API Routes
 
 @router.get("/api/profiles/stats")
@@ -823,7 +1117,7 @@ async def launch_visits(target_id: int, body: Dict[str, Any] = None, db: Session
                 visit_yandex_maps_profile_task.apply_async(
                     args=[profile.id, target.url, task_params, task.id],
                     countdown=delay_seconds,
-                    queue='yandex'
+                    queue='yandex_maps'
                 )
             except Exception as delay_err:
                 task.status = "failed"
@@ -1553,7 +1847,7 @@ async def launch_search_visits(target_id: int, body: Dict[str, Any] = None, db: 
                 yandex_search_click_task.apply_async(
                     args=[profile.id, target.id, keyword, task.id, search_params],
                     countdown=delay_seconds,
-                    queue='yandex'
+                    queue='yandex_search'
                 )
                 task.status = "pending"
                 launched.append({

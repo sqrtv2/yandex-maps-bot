@@ -9,7 +9,7 @@ set -e
 # Configuration — edit these
 APP_DIR="/home/$USER/yandex-maps-bot"
 BRANCH="main"
-COMPOSE_PROFILES="postgres redis app celery_worker celery_beat"
+COMPOSE_PROFILES="postgres redis app celery_warmup celery_yandex_maps celery_yandex_search celery_beat"
 
 # Colors
 GREEN='\033[0;32m'

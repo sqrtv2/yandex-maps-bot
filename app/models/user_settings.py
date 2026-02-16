@@ -284,6 +284,71 @@ class UserSettings(Base):
                 'category': 'security'
             },
 
+            # Worker Queue Concurrency Settings
+            {
+                'setting_key': 'worker_warmup_concurrency',
+                'setting_value': '5',
+                'setting_type': 'int',
+                'description': 'Количество параллельных потоков прогрева профилей',
+                'category': 'workers'
+            },
+            {
+                'setting_key': 'worker_yandex_maps_concurrency',
+                'setting_value': '3',
+                'setting_type': 'int',
+                'description': 'Количество параллельных потоков кликов по Яндекс Картам',
+                'category': 'workers'
+            },
+            {
+                'setting_key': 'worker_yandex_search_concurrency',
+                'setting_value': '3',
+                'setting_type': 'int',
+                'description': 'Количество параллельных потоков кликов по Яндекс Выдаче',
+                'category': 'workers'
+            },
+            {
+                'setting_key': 'worker_warmup_enabled',
+                'setting_value': 'true',
+                'setting_type': 'bool',
+                'description': 'Включить воркер прогрева профилей',
+                'category': 'workers'
+            },
+            {
+                'setting_key': 'worker_yandex_maps_enabled',
+                'setting_value': 'true',
+                'setting_type': 'bool',
+                'description': 'Включить воркер кликов по Яндекс Картам',
+                'category': 'workers'
+            },
+            {
+                'setting_key': 'worker_yandex_search_enabled',
+                'setting_value': 'true',
+                'setting_type': 'bool',
+                'description': 'Включить воркер кликов по Яндекс Выдаче',
+                'category': 'workers'
+            },
+            {
+                'setting_key': 'worker_warmup_memory_limit',
+                'setting_value': '16',
+                'setting_type': 'int',
+                'description': 'Лимит памяти (ГБ) для воркера прогрева',
+                'category': 'workers'
+            },
+            {
+                'setting_key': 'worker_yandex_maps_memory_limit',
+                'setting_value': '8',
+                'setting_type': 'int',
+                'description': 'Лимит памяти (ГБ) для воркера Яндекс Карт',
+                'category': 'workers'
+            },
+            {
+                'setting_key': 'worker_yandex_search_memory_limit',
+                'setting_value': '8',
+                'setting_type': 'int',
+                'description': 'Лимит памяти (ГБ) для воркера Яндекс Поиска',
+                'category': 'workers'
+            },
+
             # Logging & Monitoring
             {
                 'setting_key': 'log_level',

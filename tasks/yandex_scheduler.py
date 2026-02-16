@@ -40,9 +40,9 @@ def schedule_yandex_visits():
     
     # Don't flood the queue — check how many tasks are already queued
     try:
-        queue_len = r.llen('yandex') or 0
+        queue_len = (r.llen('yandex_maps') or 0) + (r.llen('yandex') or 0)
         if queue_len > 20:
-            logger.warning(f"⏭️ Yandex queue already has {queue_len} tasks, skipping scheduling")
+            logger.warning(f"⏭️ Yandex Maps queue already has {queue_len} tasks, skipping scheduling")
             return {'status': 'skipped', 'reason': f'queue_full ({queue_len})', 'scheduled': 0}
     except Exception as qe:
         logger.warning(f"Could not check queue length: {qe}")
@@ -178,7 +178,7 @@ def schedule_yandex_visits():
                             args=[profile.id, target.url, visit_params],
                             kwargs={'task_id': task_record.id},
                             countdown=delay_seconds,
-                            queue='yandex'
+                            queue='yandex_maps'
                         )
                         
                         scheduled_count += 1
@@ -280,7 +280,7 @@ def force_visit_target(target_id: int, profile_id: Optional[int] = None):
             # Schedule immediate visit
             result = visit_yandex_maps_profile_task.apply_async(
                 args=[profile.id, target.url, visit_params],
-                queue='yandex'
+                queue='yandex_maps'
             )
             
             logger.info(f"✅ Forced visit scheduled: {target.title} with profile {profile.id}")

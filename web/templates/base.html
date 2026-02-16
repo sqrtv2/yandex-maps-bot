@@ -169,6 +169,12 @@
                     </h6>
                     <ul class="nav flex-column mb-2">
                         <li class="nav-item">
+                            <a class="nav-link {% if 'settings' in request.url.path %}active{% endif %}" href="/settings">
+                                <i class="bi bi-sliders"></i>
+                                Настройки воркеров
+                            </a>
+                        </li>
+                        <li class="nav-item">
                             <a class="nav-link" href="#" data-bs-toggle="modal" data-bs-target="#settingsModal">
                                 <i class="bi bi-gear"></i>
                                 Configuration

@@ -1,0 +1,531 @@
+{% extends "base.html" %}
+
+{% block title %}Настройки воркеров — Yandex Maps Bot{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2"><i class="bi bi-sliders"></i> Настройки воркеров</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <button class="btn btn-sm btn-outline-secondary me-2" onclick="loadWorkerStatus()">
+            <i class="bi bi-arrow-clockwise"></i> Обновить
+        </button>
+    </div>
+</div>
+
+<!-- Status Cards Row -->
+<div class="row mb-4" id="statusCards">
+    <div class="col-md-4">
+        <div class="card stats-card border-primary">
+            <div class="card-body">
+                <div class="d-flex align-items-center">
+                    <div class="flex-shrink-0">
+                        <i class="bi bi-fire text-primary" style="font-size: 2rem;"></i>
+                    </div>
+                    <div class="flex-grow-1 ms-3">
+                        <h6 class="card-subtitle text-muted">Прогрев профилей</h6>
+                        <h4 class="card-title mb-0">
+                            <span id="warmupQueueLen">-</span> <small class="text-muted">в очереди</small>
+                        </h4>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card stats-card border-success">
+            <div class="card-body">
+                <div class="d-flex align-items-center">
+                    <div class="flex-shrink-0">
+                        <i class="bi bi-geo-alt-fill text-success" style="font-size: 2rem;"></i>
+                    </div>
+                    <div class="flex-grow-1 ms-3">
+                        <h6 class="card-subtitle text-muted">Яндекс Карты</h6>
+                        <h4 class="card-title mb-0">
+                            <span id="mapsQueueLen">-</span> <small class="text-muted">в очереди</small>
+                        </h4>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card stats-card border-warning">
+            <div class="card-body">
+                <div class="d-flex align-items-center">
+                    <div class="flex-shrink-0">
+                        <i class="bi bi-search text-warning" style="font-size: 2rem;"></i>
+                    </div>
+                    <div class="flex-grow-1 ms-3">
+                        <h6 class="card-subtitle text-muted">Яндекс Поиск</h6>
+                        <h4 class="card-title mb-0">
+                            <span id="searchQueueLen">-</span> <small class="text-muted">в очереди</small>
+                        </h4>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Workers Configuration -->
+<div class="row">
+    <!-- Warmup Worker -->
+    <div class="col-lg-4 mb-4">
+        <div class="card h-100">
+            <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-fire"></i> Прогрев профилей</span>
+                <div class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox" id="warmupEnabled" checked>
+                </div>
+            </div>
+            <div class="card-body">
+                <p class="text-muted small">Прогрев браузерных профилей перед использованием в задачах. Профили посещают популярные сайты для набора cookies и истории.</p>
+                
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Потоки (concurrency)</label>
+                    <div class="input-group">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('warmupConcurrency', -1)">−</button>
+                        <input type="number" class="form-control text-center" id="warmupConcurrency" value="5" min="1" max="50">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('warmupConcurrency', 1)">+</button>
+                    </div>
+                    <small class="text-muted">Сколько профилей прогревать одновременно</small>
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Лимит памяти (ГБ)</label>
+                    <div class="input-group">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('warmupMemory', -1)">−</button>
+                        <input type="number" class="form-control text-center" id="warmupMemory" value="16" min="1" max="128">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('warmupMemory', 1)">+</button>
+                    </div>
+                    <small class="text-muted">~2 ГБ на поток рекомендуется</small>
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Очереди</label>
+                    <div>
+                        <span class="badge bg-primary">warmup</span>
+                        <span class="badge bg-secondary">default</span>
+                        <span class="badge bg-info">proxy</span>
+                        <span class="badge bg-dark">maintenance</span>
+                    </div>
+                </div>
+
+                <div class="alert alert-light border small mb-0">
+                    <strong>Активных задач:</strong> <span id="warmupActiveTasks">-</span><br>
+                    <strong>Всего выполнено:</strong> <span id="warmupTotalTasks">-</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Yandex Maps Worker -->
+    <div class="col-lg-4 mb-4">
+        <div class="card h-100">
+            <div class="card-header bg-success text-white d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-geo-alt-fill"></i> Яндекс Карты</span>
+                <div class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox" id="mapsEnabled" checked>
+                </div>
+            </div>
+            <div class="card-body">
+                <p class="text-muted small">Клики по карточкам организаций на Яндекс Картах. Просмотр фото, чтение отзывов, скролл, взаимодействие с картой.</p>
+                
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Потоки (concurrency)</label>
+                    <div class="input-group">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('mapsConcurrency', -1)">−</button>
+                        <input type="number" class="form-control text-center" id="mapsConcurrency" value="3" min="1" max="50">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('mapsConcurrency', 1)">+</button>
+                    </div>
+                    <small class="text-muted">Сколько визитов на карты одновременно</small>
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Лимит памяти (ГБ)</label>
+                    <div class="input-group">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('mapsMemory', -1)">−</button>
+                        <input type="number" class="form-control text-center" id="mapsMemory" value="8" min="1" max="128">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('mapsMemory', 1)">+</button>
+                    </div>
+                    <small class="text-muted">~2 ГБ на поток рекомендуется</small>
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Очередь</label>
+                    <div>
+                        <span class="badge bg-success">yandex_maps</span>
+                    </div>
+                </div>
+
+                <div class="alert alert-light border small mb-0">
+                    <strong>Активных задач:</strong> <span id="mapsActiveTasks">-</span><br>
+                    <strong>Всего выполнено:</strong> <span id="mapsTotalTasks">-</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Yandex Search Worker -->
+    <div class="col-lg-4 mb-4">
+        <div class="card h-100">
+            <div class="card-header bg-warning text-dark d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-search"></i> Яндекс Поиск</span>
+                <div class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox" id="searchEnabled" checked>
+                </div>
+            </div>
+            <div class="card-body">
+                <p class="text-muted small">Клики по выдаче Яндекса на целевой сайт. Поиск по ключевым словам, нахождение сайта в выдаче и переход.</p>
+                
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Потоки (concurrency)</label>
+                    <div class="input-group">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('searchConcurrency', -1)">−</button>
+                        <input type="number" class="form-control text-center" id="searchConcurrency" value="3" min="1" max="50">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('searchConcurrency', 1)">+</button>
+                    </div>
+                    <small class="text-muted">Сколько кликов по выдаче одновременно</small>
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Лимит памяти (ГБ)</label>
+                    <div class="input-group">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('searchMemory', -1)">−</button>
+                        <input type="number" class="form-control text-center" id="searchMemory" value="8" min="1" max="128">
+                        <button class="btn btn-outline-secondary" onclick="adjustValue('searchMemory', 1)">+</button>
+                    </div>
+                    <small class="text-muted">~2 ГБ на поток рекомендуется</small>
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Очередь</label>
+                    <div>
+                        <span class="badge bg-warning text-dark">yandex_search</span>
+                    </div>
+                </div>
+
+                <div class="alert alert-light border small mb-0">
+                    <strong>Активных задач:</strong> <span id="searchActiveTasks">-</span><br>
+                    <strong>Всего выполнено:</strong> <span id="searchTotalTasks">-</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Action Buttons -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-body d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <div>
+                    <p class="mb-0 text-muted">
+                        <i class="bi bi-info-circle"></i>
+                        После изменения настроек нажмите «Сохранить», затем «Перезапустить воркеры» для применения.
+                    </p>
+                </div>
+                <div class="d-flex gap-2">
+                    <button class="btn btn-primary" onclick="saveWorkerSettings()" id="btnSave">
+                        <i class="bi bi-save"></i> Сохранить настройки
+                    </button>
+                    <button class="btn btn-warning" onclick="restartWorkers()" id="btnRestart">
+                        <i class="bi bi-arrow-repeat"></i> Перезапустить воркеры
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Architecture Diagram -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-diagram-3"></i> Архитектура очередей
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-bordered text-center align-middle mb-0">
+                        <thead class="table-dark">
+                            <tr>
+                                <th>Тип задачи</th>
+                                <th>Очередь</th>
+                                <th>Воркер</th>
+                                <th>Потоки</th>
+                                <th>Статус</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><i class="bi bi-fire text-primary"></i> Прогрев профилей</td>
+                                <td><span class="badge bg-primary">warmup</span> <span class="badge bg-secondary">default</span></td>
+                                <td>celery_warmup</td>
+                                <td id="archWarmupConc">-</td>
+                                <td id="archWarmupStatus"><span class="badge bg-secondary">—</span></td>
+                            </tr>
+                            <tr>
+                                <td><i class="bi bi-geo-alt-fill text-success"></i> Клики по Яндекс Картам</td>
+                                <td><span class="badge bg-success">yandex_maps</span></td>
+                                <td>celery_yandex_maps</td>
+                                <td id="archMapsConc">-</td>
+                                <td id="archMapsStatus"><span class="badge bg-secondary">—</span></td>
+                            </tr>
+                            <tr>
+                                <td><i class="bi bi-search text-warning"></i> Клики по Яндекс Выдаче</td>
+                                <td><span class="badge bg-warning text-dark">yandex_search</span></td>
+                                <td>celery_yandex_search</td>
+                                <td id="archSearchConc">-</td>
+                                <td id="archSearchStatus"><span class="badge bg-secondary">—</span></td>
+                            </tr>
+                            <tr class="table-light">
+                                <td><i class="bi bi-tools text-muted"></i> Обслуживание</td>
+                                <td><span class="badge bg-info">proxy</span> <span class="badge bg-dark">maintenance</span></td>
+                                <td colspan="3" class="text-muted">Обрабатывается воркером прогрева</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Live Workers Info -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-activity"></i> Активные воркеры Celery</span>
+                <button class="btn btn-sm btn-outline-secondary" onclick="loadWorkerStatus()">
+                    <i class="bi bi-arrow-clockwise"></i>
+                </button>
+            </div>
+            <div class="card-body">
+                <div id="workersInfo">
+                    <div class="text-center text-muted py-3">
+                        <div class="spinner-border spinner-border-sm me-2" role="status"></div>
+                        Загрузка информации о воркерах...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Restart Log -->
+<div class="row mb-4" id="restartLogSection" style="display: none;">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header bg-dark text-white">
+                <i class="bi bi-terminal"></i> Лог перезапуска
+            </div>
+            <div class="card-body">
+                <pre id="restartLog" class="bg-dark text-light p-3 rounded" style="max-height: 300px; overflow-y: auto;"></pre>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    // Load current settings and status
+    async function loadWorkerStatus() {
+        try {
+            const resp = await fetch('/api/workers/status');
+            const data = await resp.json();
+            
+            // Update queue counts
+            document.getElementById('warmupQueueLen').textContent = (data.queues?.warmup || 0) + (data.queues?.default || 0);
+            document.getElementById('mapsQueueLen').textContent = data.queues?.yandex_maps || 0;
+            document.getElementById('searchQueueLen').textContent = data.queues?.yandex_search || 0;
+            
+            // Update settings inputs from DB
+            if (data.settings) {
+                if (data.settings.worker_warmup_concurrency !== undefined) 
+                    document.getElementById('warmupConcurrency').value = data.settings.worker_warmup_concurrency;
+                if (data.settings.worker_yandex_maps_concurrency !== undefined) 
+                    document.getElementById('mapsConcurrency').value = data.settings.worker_yandex_maps_concurrency;
+                if (data.settings.worker_yandex_search_concurrency !== undefined) 
+                    document.getElementById('searchConcurrency').value = data.settings.worker_yandex_search_concurrency;
+                if (data.settings.worker_warmup_enabled !== undefined) 
+                    document.getElementById('warmupEnabled').checked = data.settings.worker_warmup_enabled;
+                if (data.settings.worker_yandex_maps_enabled !== undefined) 
+                    document.getElementById('mapsEnabled').checked = data.settings.worker_yandex_maps_enabled;
+                if (data.settings.worker_yandex_search_enabled !== undefined) 
+                    document.getElementById('searchEnabled').checked = data.settings.worker_yandex_search_enabled;
+                if (data.settings.worker_warmup_memory_limit !== undefined) 
+                    document.getElementById('warmupMemory').value = data.settings.worker_warmup_memory_limit;
+                if (data.settings.worker_yandex_maps_memory_limit !== undefined) 
+                    document.getElementById('mapsMemory').value = data.settings.worker_yandex_maps_memory_limit;
+                if (data.settings.worker_yandex_search_memory_limit !== undefined) 
+                    document.getElementById('searchMemory').value = data.settings.worker_yandex_search_memory_limit;
+            }
+            
+            // Update workers info table
+            let workersHtml = '';
+            
+            if (data.worker_stats && Object.keys(data.worker_stats).length > 0) {
+                workersHtml = '<table class="table table-sm table-hover mb-0"><thead><tr><th>Воркер</th><th>Потоки</th><th>Активных задач</th><th>Всего выполнено</th></tr></thead><tbody>';
+                
+                for (const [name, stats] of Object.entries(data.worker_stats)) {
+                    const activeCnt = data.active_tasks[name] || 0;
+                    const totalTasks = stats.total_tasks || {};
+                    const totalSum = Object.values(totalTasks).reduce((a, b) => a + b, 0);
+                    
+                    // Determine worker type by name
+                    let workerType = 'secondary';
+                    let workerIcon = 'bi-gear';
+                    if (name.includes('warmup') || (!name.includes('yandex') && !name.includes('search'))) {
+                        workerType = 'primary';
+                        workerIcon = 'bi-fire';
+                    } else if (name.includes('yandex_maps') || name.includes('maps')) {
+                        workerType = 'success';
+                        workerIcon = 'bi-geo-alt-fill';
+                    } else if (name.includes('yandex_search') || name.includes('search')) {
+                        workerType = 'warning';
+                        workerIcon = 'bi-search';
+                    }
+                    
+                    workersHtml += `<tr>
+                        <td><i class="bi ${workerIcon} text-${workerType}"></i> ${name}</td>
+                        <td><span class="badge bg-${workerType}">${stats.concurrency}</span></td>
+                        <td>${activeCnt}</td>
+                        <td>${totalSum}</td>
+                    </tr>`;
+                    
+                    // Update architecture table and stats  
+                    if (name.includes('warmup') || (!name.includes('yandex') && !name.includes('search') && !name.includes('maps'))) {
+                        document.getElementById('archWarmupConc').textContent = stats.concurrency;
+                        document.getElementById('archWarmupStatus').innerHTML = `<span class="badge bg-success">Работает</span>`;
+                        document.getElementById('warmupActiveTasks').textContent = activeCnt;
+                        document.getElementById('warmupTotalTasks').textContent = totalSum;
+                    }
+                    if (name.includes('yandex_maps') || name.includes('maps')) {
+                        document.getElementById('archMapsConc').textContent = stats.concurrency;
+                        document.getElementById('archMapsStatus').innerHTML = `<span class="badge bg-success">Работает</span>`;
+                        document.getElementById('mapsActiveTasks').textContent = activeCnt;
+                        document.getElementById('mapsTotalTasks').textContent = totalSum;
+                    }
+                    if (name.includes('yandex_search') || name.includes('search')) {
+                        document.getElementById('archSearchConc').textContent = stats.concurrency;
+                        document.getElementById('archSearchStatus').innerHTML = `<span class="badge bg-success">Работает</span>`;
+                        document.getElementById('searchActiveTasks').textContent = activeCnt;
+                        document.getElementById('searchTotalTasks').textContent = totalSum;
+                    }
+                }
+                
+                workersHtml += '</tbody></table>';
+            } else {
+                workersHtml = `<div class="alert alert-warning mb-0">
+                    <i class="bi bi-exclamation-triangle"></i> 
+                    Нет активных воркеров или не удалось получить информацию
+                </div>`;
+            }
+            
+            document.getElementById('workersInfo').innerHTML = workersHtml;
+            
+        } catch (err) {
+            console.error('Error loading worker status:', err);
+            document.getElementById('workersInfo').innerHTML = `
+                <div class="alert alert-danger mb-0">
+                    <i class="bi bi-x-circle"></i> Ошибка загрузки: ${err.message}
+                </div>`;
+        }
+    }
+
+    // Adjust numeric input value
+    function adjustValue(elementId, delta) {
+        const el = document.getElementById(elementId);
+        const newVal = Math.max(1, parseInt(el.value || 1) + delta);
+        el.value = newVal;
+    }
+
+    // Save settings to DB
+    async function saveWorkerSettings() {
+        const btn = document.getElementById('btnSave');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Сохраняю...';
+        
+        const data = {
+            worker_warmup_concurrency: parseInt(document.getElementById('warmupConcurrency').value),
+            worker_yandex_maps_concurrency: parseInt(document.getElementById('mapsConcurrency').value),
+            worker_yandex_search_concurrency: parseInt(document.getElementById('searchConcurrency').value),
+            worker_warmup_enabled: document.getElementById('warmupEnabled').checked,
+            worker_yandex_maps_enabled: document.getElementById('mapsEnabled').checked,
+            worker_yandex_search_enabled: document.getElementById('searchEnabled').checked,
+            worker_warmup_memory_limit: parseInt(document.getElementById('warmupMemory').value),
+            worker_yandex_maps_memory_limit: parseInt(document.getElementById('mapsMemory').value),
+            worker_yandex_search_memory_limit: parseInt(document.getElementById('searchMemory').value),
+        };
+        
+        try {
+            const resp = await fetch('/api/workers/apply', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            });
+            const result = await resp.json();
+            
+            if (resp.ok) {
+                showToast('✅ Настройки сохранены! Нажмите "Перезапустить воркеры" для применения.', 'success');
+            } else {
+                showToast('❌ Ошибка сохранения: ' + (result.detail || 'Unknown error'), 'danger');
+            }
+        } catch (err) {
+            showToast('❌ Ошибка: ' + err.message, 'danger');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-save"></i> Сохранить настройки';
+        }
+    }
+
+    // Restart workers
+    async function restartWorkers() {
+        if (!confirm('Перезапустить все воркеры с новыми настройками? Текущие задачи будут завершены принудительно.')) {
+            return;
+        }
+        
+        const btn = document.getElementById('btnRestart');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Перезапуск...';
+        
+        try {
+            const resp = await fetch('/api/workers/restart', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: '{}'
+            });
+            const result = await resp.json();
+            
+            // Show restart log
+            document.getElementById('restartLogSection').style.display = 'block';
+            document.getElementById('restartLog').textContent = result.output || result.message || 'Перезапуск запущен';
+            
+            if (resp.ok) {
+                showToast('🔄 Воркеры перезапускаются...', 'info');
+                // Reload status after a delay
+                setTimeout(loadWorkerStatus, 10000);
+            } else {
+                showToast('❌ Ошибка перезапуска: ' + (result.detail || 'Unknown error'), 'danger');
+            }
+        } catch (err) {
+            showToast('❌ Ошибка: ' + err.message, 'danger');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-arrow-repeat"></i> Перезапустить воркеры';
+        }
+    }
+
+    // Auto-refresh
+    let refreshInterval;
+    
+    document.addEventListener('DOMContentLoaded', function() {
+        loadWorkerStatus();
+        refreshInterval = setInterval(loadWorkerStatus, 15000); // every 15 sec
+    });
+</script>
+{% endblock %}

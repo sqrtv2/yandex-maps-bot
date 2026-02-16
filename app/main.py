@@ -130,7 +130,7 @@ def _start_celery_worker():
             "worker",
             "--loglevel=info",
             "--concurrency=3",
-            "--queues=default,warmup,yandex,proxy,maintenance",
+            "--queues=default,warmup,yandex_maps,yandex_search,proxy,maintenance",
             f"--logfile={os.path.join(log_dir, 'celery.log')}",
             f"--pidfile={os.path.join(log_dir, 'celery.pid')}",
         ],

@@ -39,9 +39,9 @@ services:
       - yandex_maps_network
 
   # Celery worker for warmup/default tasks
-  celery_worker:
+  celery_warmup:
     build: .
-    container_name: yandex_maps_worker
+    container_name: yandex_maps_warmup_worker
     init: true
     command: celery -A tasks.celery_app worker --loglevel=info --concurrency=25 -Q default,warmup,proxy,maintenance -n warmup@%h
     shm_size: '8gb'
@@ -77,12 +77,12 @@ services:
     networks:
       - yandex_maps_network
 
-  # Celery worker for yandex visits only
-  celery_yandex:
+  # Celery worker for Yandex Maps clicks
+  celery_yandex_maps:
     build: .
-    container_name: yandex_maps_yandex_worker
+    container_name: yandex_maps_maps_worker
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5 -Q yandex -n yandex@%h
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5 -Q yandex_maps -n yandex_maps@%h
     shm_size: '4gb'
     environment:
       - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
@@ -112,7 +112,47 @@ services:
     deploy:
       resources:
         limits:
-          memory: 32G
+          memory: 16G
+          cpus: '4'
+    networks:
+      - yandex_maps_network
+
+  # Celery worker for Yandex Search clicks
+  celery_yandex_search:
+    build: .
+    container_name: yandex_maps_search_worker
+    init: true
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5 -Q yandex_search -n yandex_search@%h
+    shm_size: '4gb'
+    environment:
+      - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
+      - YANDEX_BOT_REDIS_HOST=redis
+      - YANDEX_BOT_REDIS_PORT=6379
+      - YANDEX_BOT_DEBUG=false
+      - YANDEX_BOT_BROWSER_HEADLESS=true
+      - YANDEX_BOT_SAVE_SCREENSHOTS=false
+      - YANDEX_BOT_FAST_MODE=true
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./browser_profiles:/app/browser_profiles
+      - ./tasks:/app/tasks
+      - ./core:/app/core
+      - ./app:/app/app
+      - ./web:/app/web
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 16G
           cpus: '4'
     networks:
       - yandex_maps_network

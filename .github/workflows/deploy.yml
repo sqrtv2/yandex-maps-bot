@@ -49,7 +49,7 @@ jobs:
             docker compose build
             
             echo "🔄 Restarting services..."
-            docker compose up -d postgres redis app celery_worker celery_beat
+            docker compose up -d postgres redis app celery_warmup celery_yandex_maps celery_yandex_search celery_beat
             
             echo "⏳ Waiting for startup..."
             sleep 15

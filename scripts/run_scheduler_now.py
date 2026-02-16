@@ -29,7 +29,7 @@ if result['status'] == 'success':
     print()
     
     if result.get('scheduled', 0) > 0:
-        print("📝 Задачи отправлены в Celery очередь 'yandex'")
+        print("📝 Задачи отправлены в Celery очередь 'yandex_maps'")
         print()
         print("🔍 Мониторинг:")
         print("   • Логи Celery: tail -f logs/celery.log")

@@ -38,11 +38,11 @@ services:
     networks:
       - yandex_maps_network
 
-  # Celery worker for background tasks (scale with: docker compose up --scale celery_worker=3)
-  celery_worker:
+  # Celery worker for warmup/default tasks
+  celery_warmup:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5 -Q default,warmup,yandex,proxy,maintenance
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5 -Q default,warmup,proxy,maintenance -n warmup@%h
     shm_size: '2gb'
     environment:
       - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
@@ -73,6 +73,84 @@ services:
         limits:
           memory: 12G
           cpus: '8'
+    networks:
+      - yandex_maps_network
+
+  # Celery worker for Yandex Maps clicks
+  celery_yandex_maps:
+    build: .
+    init: true
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=3 -Q yandex_maps -n yandex_maps@%h
+    shm_size: '2gb'
+    environment:
+      - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
+      - YANDEX_BOT_REDIS_HOST=redis
+      - YANDEX_BOT_REDIS_PORT=6379
+      - YANDEX_BOT_DEBUG=false
+      - YANDEX_BOT_BROWSER_HEADLESS=true
+      - YANDEX_BOT_SAVE_SCREENSHOTS=false
+      - YANDEX_BOT_FAST_MODE=true
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./browser_profiles:/app/browser_profiles
+      - ./tasks:/app/tasks
+      - ./core:/app/core
+      - ./app:/app/app
+      - ./web:/app/web
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: '4'
+    networks:
+      - yandex_maps_network
+
+  # Celery worker for Yandex Search clicks
+  celery_yandex_search:
+    build: .
+    init: true
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=3 -Q yandex_search -n yandex_search@%h
+    shm_size: '2gb'
+    environment:
+      - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
+      - YANDEX_BOT_REDIS_HOST=redis
+      - YANDEX_BOT_REDIS_PORT=6379
+      - YANDEX_BOT_DEBUG=false
+      - YANDEX_BOT_BROWSER_HEADLESS=true
+      - YANDEX_BOT_SAVE_SCREENSHOTS=false
+      - YANDEX_BOT_FAST_MODE=true
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./browser_profiles:/app/browser_profiles
+      - ./tasks:/app/tasks
+      - ./core:/app/core
+      - ./app:/app/app
+      - ./web:/app/web
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: '4'
     networks:
       - yandex_maps_network
 

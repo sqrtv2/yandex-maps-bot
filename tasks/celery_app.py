@@ -27,11 +27,11 @@ celery_app.conf.update(
     timezone='UTC',
     enable_utc=True,
 
-    # Task routing
+    # Task routing — each task type gets its own dedicated queue
     task_routes={
         'tasks.warmup.*': {'queue': 'warmup'},
-        'tasks.yandex_maps.*': {'queue': 'yandex'},
-        'tasks.yandex_search.*': {'queue': 'yandex'},
+        'tasks.yandex_maps.*': {'queue': 'yandex_maps'},
+        'tasks.yandex_search.*': {'queue': 'yandex_search'},
         'tasks.proxy.*': {'queue': 'proxy'},
         'tasks.maintenance.*': {'queue': 'maintenance'},
     },
@@ -61,44 +61,43 @@ celery_app.conf.update(
     task_send_sent_event=True,
 
     # Beat schedule for periodic tasks
-    # === ALL PERIODIC TASKS DISABLED FOR TESTING YANDEX SEARCH ===
     beat_schedule={
-        # 'proxy-health-check': {
-        #     'task': 'tasks.maintenance.check_all_proxies',
-        #     'schedule': crontab(minute='*/15'),
-        # },
-        # 'cleanup-old-tasks': {
-        #     'task': 'tasks.maintenance.cleanup_old_tasks',
-        #     'schedule': crontab(minute=0, hour=2),
-        # },
-        # 'update-proxy-stats': {
-        #     'task': 'tasks.maintenance.update_proxy_statistics',
-        #     'schedule': crontab(minute='*/30'),
-        # },
-        # 'profile-maintenance': {
-        #     'task': 'tasks.maintenance.profile_maintenance',
-        #     'schedule': crontab(minute=0, hour=1),
-        # },
-        # 'yandex-maps-scheduler': {
-        #     'task': 'tasks.yandex_maps.schedule_visits',
-        #     'schedule': crontab(minute='*/5'),
-        # },
-        # 'yandex-daily-stats-reset': {
-        #     'task': 'tasks.yandex_maps.daily_stats_reset',
-        #     'schedule': crontab(minute=0, hour=0),
-        # },
-        # 'yandex-cleanup-used-profiles': {
-        #     'task': 'tasks.yandex_maps.cleanup_used_profiles',
-        #     'schedule': crontab(minute='*/30'),
-        # },
-        # 'process-health-check': {
-        #     'task': 'tasks.warmup.auto_fix_stuck_processes',
-        #     'schedule': crontab(minute='*/10'),
-        # },
-        # 'periodic-rewarmup': {
-        #     'task': 'tasks.warmup.periodic_rewarmup',
-        #     'schedule': crontab(minute=0, hour='*'),
-        # },
+        'proxy-health-check': {
+            'task': 'tasks.maintenance.check_all_proxies',
+            'schedule': crontab(minute='*/15'),
+        },
+        'cleanup-old-tasks': {
+            'task': 'tasks.maintenance.cleanup_old_tasks',
+            'schedule': crontab(minute=0, hour=2),
+        },
+        'update-proxy-stats': {
+            'task': 'tasks.maintenance.update_proxy_statistics',
+            'schedule': crontab(minute='*/30'),
+        },
+        'profile-maintenance': {
+            'task': 'tasks.maintenance.profile_maintenance',
+            'schedule': crontab(minute=0, hour=1),
+        },
+        'yandex-maps-scheduler': {
+            'task': 'tasks.yandex_maps.schedule_visits',
+            'schedule': crontab(minute='*/5'),
+        },
+        'yandex-daily-stats-reset': {
+            'task': 'tasks.yandex_maps.daily_stats_reset',
+            'schedule': crontab(minute=0, hour=0),
+        },
+        'yandex-cleanup-used-profiles': {
+            'task': 'tasks.yandex_maps.cleanup_used_profiles',
+            'schedule': crontab(minute='*/30'),
+        },
+        'process-health-check': {
+            'task': 'tasks.warmup.auto_fix_stuck_processes',
+            'schedule': crontab(minute='*/10'),
+        },
+        'periodic-rewarmup': {
+            'task': 'tasks.warmup.periodic_rewarmup',
+            'schedule': crontab(minute=0, hour='*'),
+        },
     }
 )
 

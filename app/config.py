@@ -65,8 +65,10 @@ class Settings(BaseSettings):
             'enable_utc': self.celery_enable_utc,
             'task_routes': {
                 'tasks.warmup.*': {'queue': 'warmup'},
-                'tasks.yandex_maps.*': {'queue': 'yandex'},
+                'tasks.yandex_maps.*': {'queue': 'yandex_maps'},
+                'tasks.yandex_search.*': {'queue': 'yandex_search'},
                 'tasks.proxy.*': {'queue': 'proxy'},
+                'tasks.maintenance.*': {'queue': 'maintenance'},
             },
             'worker_prefetch_multiplier': 1,
             'task_acks_late': True,
