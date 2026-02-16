@@ -271,7 +271,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
 
 
 @shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=30,
-             soft_time_limit=600, time_limit=660)
+             soft_time_limit=1800, time_limit=2100)
 def yandex_search_click_task(self, profile_id: int, target_id: int,
                              keyword: str, task_id: int = None,
                              search_params: Dict = None):
