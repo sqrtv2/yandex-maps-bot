@@ -29,6 +29,7 @@ from core import BrowserManager, ProxyManager, CaptchaSolver
 from core.capsola_solver import create_capsola_solver
 from app.config import settings
 from .celery_app import BaseTask
+from celery.utils.log import get_task_logger
 
 logger = logging.getLogger(__name__)
 
@@ -934,3 +935,198 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 browser_manager.close_browser_session(browser_id)
             except Exception as close_err:
                 logger.warning(f"Error closing browser: {close_err}")
+
+
+# ======================== SCHEDULER ========================
+
+@shared_task(name='tasks.yandex_search.schedule_search_visits')
+def schedule_search_visits():
+    """
+    Automatic scheduler for Yandex Search click-through visits.
+    Runs every 5 minutes via celery beat. Checks all active YandexSearchTarget
+    entries and schedules visits according to visits_per_day / intervals.
+    """
+    scheduler_logger = logging.getLogger(__name__ + '.scheduler')
+    scheduler_logger.info("🔄 Starting Yandex Search visit scheduler")
+
+    # Distributed lock
+    try:
+        import redis as _redis
+        from app.config import settings as _s
+        r = _redis.Redis(host=_s.redis_host, port=_s.redis_port)
+        lock_key = 'scheduler:schedule_search_visits:lock'
+        if not r.set(lock_key, '1', nx=True, ex=240):
+            scheduler_logger.info("⏭️ Another search scheduler already running, skipping")
+            return {'status': 'skipped', 'reason': 'duplicate', 'scheduled': 0}
+    except Exception as le:
+        scheduler_logger.warning(f"Could not acquire scheduler lock: {le}")
+
+    # Don't flood the queue
+    try:
+        queue_len = r.llen('yandex_search') or 0
+        if queue_len > 10:
+            scheduler_logger.warning(f"⏭️ yandex_search queue already has {queue_len} tasks, skipping")
+            return {'status': 'skipped', 'reason': f'queue_full ({queue_len})', 'scheduled': 0}
+    except Exception as qe:
+        scheduler_logger.warning(f"Could not check queue length: {qe}")
+
+    try:
+        with get_db_session() as db:
+            targets = db.query(YandexSearchTarget).filter(
+                YandexSearchTarget.is_active == True
+            ).order_by(YandexSearchTarget.priority.desc()).all()
+
+            if not targets:
+                scheduler_logger.info("ℹ️  No active search targets found")
+                return {'status': 'success', 'message': 'No active search targets', 'scheduled': 0}
+
+            scheduler_logger.info(f"📊 Found {len(targets)} active search targets")
+
+            # Get available warmed profiles
+            all_profiles = db.query(BrowserProfile).filter(
+                BrowserProfile.warmup_completed == True,
+                BrowserProfile.is_active == True,
+                BrowserProfile.status == 'warmed',
+            ).all()
+
+            if not all_profiles:
+                scheduler_logger.warning("⚠️  No warmed profiles available")
+                return {'status': 'error', 'message': 'No warmed profiles available', 'scheduled': 0}
+
+            scheduler_logger.info(f"✅ Found {len(all_profiles)} warmed profiles")
+
+            scheduled_count = 0
+            current_time = datetime.utcnow()
+
+            for target in targets:
+                try:
+                    should_visit, reason = target.should_visit_now(current_time)
+                    if not should_visit:
+                        scheduler_logger.info(f"⏭️  Skipping {target.domain}: {reason}")
+                        continue
+
+                    # Check daily limit
+                    today_visits = target.today_visits or 0
+                    if today_visits >= target.visits_per_day:
+                        scheduler_logger.info(f"⏭️  {target.domain}: daily limit reached ({today_visits}/{target.visits_per_day})")
+                        continue
+
+                    visits_to_schedule = target.get_visits_needed_now(current_time)
+                    remaining_today = target.visits_per_day - today_visits
+                    visits_to_schedule = min(visits_to_schedule, remaining_today)
+
+                    if visits_to_schedule <= 0:
+                        scheduler_logger.info(f"⏭️  No visits needed for {target.domain}")
+                        continue
+
+                    scheduler_logger.info(f"📅 Scheduling {visits_to_schedule} search visits for: {target.domain}")
+
+                    keywords = target.get_keywords_list()
+                    if not keywords:
+                        scheduler_logger.warning(f"⚠️ No keywords for {target.domain}, skipping")
+                        continue
+
+                    search_params = {
+                        'max_search_pages': target.max_search_pages,
+                        'min_time_on_site': target.min_time_on_site,
+                        'max_time_on_site': target.max_time_on_site,
+                    }
+
+                    concurrent_visits = min(
+                        visits_to_schedule,
+                        target.concurrent_visits,
+                        len(all_profiles)
+                    )
+
+                    random.shuffle(all_profiles)
+
+                    for i in range(concurrent_visits):
+                        profile = all_profiles[i % len(all_profiles)]
+                        keyword = random.choice(keywords)
+
+                        # Spread visits across the 5-minute window
+                        delay_seconds = random.randint(0, 280)
+
+                        # Create Task record for UI visibility
+                        task_record = Task(
+                            name=f"Поиск '{keyword}' → {target.domain}",
+                            task_type="yandex_search",
+                            status="pending",
+                            target_url=f"https://yandex.ru/search/?text={keyword}",
+                            profile_id=profile.id,
+                            parameters={
+                                'keyword': keyword,
+                                'domain': target.domain,
+                                'target_id': target.id,
+                                **search_params
+                            },
+                            priority="normal",
+                        )
+                        db.add(task_record)
+                        db.flush()
+
+                        yandex_search_click_task.apply_async(
+                            args=[profile.id, target.id, keyword, task_record.id, search_params],
+                            countdown=delay_seconds,
+                            queue='yandex_search'
+                        )
+
+                        scheduled_count += 1
+                        scheduler_logger.info(
+                            f"✅ Scheduled search visit #{i+1}/{concurrent_visits} "
+                            f"for {target.domain} keyword='{keyword}' profile={profile.id} "
+                            f"(delay: {delay_seconds}s)"
+                        )
+
+                    target.last_visit_at = current_time
+                    db.commit()
+
+                except Exception as e:
+                    scheduler_logger.error(f"❌ Error scheduling search visits for {target.domain}: {e}", exc_info=True)
+                    continue
+
+            scheduler_logger.info(f"✅ Search scheduler completed. Scheduled {scheduled_count} visits")
+
+            return {
+                'status': 'success',
+                'targets_processed': len(targets),
+                'scheduled': scheduled_count,
+                'timestamp': current_time.isoformat()
+            }
+
+    except Exception as e:
+        scheduler_logger.error(f"❌ Search scheduler error: {e}", exc_info=True)
+        return {'status': 'error', 'error': str(e)}
+
+
+@shared_task(name='tasks.yandex_search.daily_search_stats_reset')
+def daily_search_stats_reset():
+    """
+    Reset daily visit statistics for all search targets.
+    Runs at midnight UTC via celery beat.
+    """
+    scheduler_logger = logging.getLogger(__name__ + '.scheduler')
+    scheduler_logger.info("🔄 Starting daily stats reset for Yandex Search targets")
+
+    try:
+        with get_db_session() as db:
+            targets = db.query(YandexSearchTarget).all()
+            current_time = datetime.utcnow()
+
+            for target in targets:
+                target.today_visits = 0
+                target.today_successful = 0
+                target.today_failed = 0
+                target.stats_reset_date = current_time
+
+            db.commit()
+
+            scheduler_logger.info(f"✅ Daily search reset done: {len(targets)} targets zeroed")
+            return {
+                'status': 'success',
+                'targets_reset': len(targets),
+                'timestamp': current_time.isoformat()
+            }
+    except Exception as e:
+        scheduler_logger.error(f"❌ Daily search stats reset error: {e}", exc_info=True)
+        return {'status': 'error', 'error': str(e)}

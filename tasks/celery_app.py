@@ -98,6 +98,14 @@ celery_app.conf.update(
             'task': 'tasks.warmup.periodic_rewarmup',
             'schedule': crontab(minute=0, hour='*'),
         },
+        'yandex-search-scheduler': {
+            'task': 'tasks.yandex_search.schedule_search_visits',
+            'schedule': crontab(minute='*/5'),
+        },
+        'yandex-search-daily-stats-reset': {
+            'task': 'tasks.yandex_search.daily_search_stats_reset',
+            'schedule': crontab(minute=0, hour=0),
+        },
     }
 )
 
