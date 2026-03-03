@@ -2194,6 +2194,47 @@ async def remove_keywords_from_target(target_id: int, body: Dict[str, Any], db: 
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/api/yandex-search-targets/{target_id}/enable-keywords")
+async def enable_disabled_keywords(target_id: int, body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Re-enable previously auto-disabled keywords. Body: {keywords: ['kw1', 'kw2']} or {all: true}"""
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+
+        if body.get("all"):
+            count = len(target.get_disabled_keywords_set())
+            target.disabled_keywords = None
+            db.commit()
+            return {"message": f"Все {count} ключевых слов включены", "enabled": count}
+
+        keywords_to_enable = set(k.strip().lower() for k in body.get("keywords", []) if k.strip())
+        if not keywords_to_enable:
+            raise HTTPException(status_code=400, detail="Не указаны ключевые слова")
+
+        disabled = target.get_disabled_keywords_set()
+        remaining = disabled - keywords_to_enable
+        enabled_count = len(disabled) - len(remaining)
+
+        if remaining:
+            # Reconstruct disabled_keywords from remaining set, preserving original casing
+            original_disabled = [k.strip() for k in (target.disabled_keywords or '').split('\n') if k.strip()]
+            target.disabled_keywords = '\n'.join(
+                k for k in original_disabled if k.strip().lower() in remaining
+            )
+        else:
+            target.disabled_keywords = None
+
+        db.commit()
+        return {"message": f"Включено {enabled_count} ключевых слов", "enabled": enabled_count, "still_disabled": len(remaining)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error enabling keywords: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/yandex-search-logs")
 async def get_yandex_search_logs(db: Session = Depends(get_db), limit: int = 50):
     """Get recent search click-through task logs."""

@@ -56,7 +56,7 @@ def _update_search_task_log(task_id: int, message: str, status: str = None,
                     task_obj.result = result_data
                 if exec_time:
                     task_obj.execution_time_seconds = exec_time
-                if status in ('completed', 'failed'):
+                if status in ('completed', 'failed', 'not_found'):
                     task_obj.completed_at = datetime.utcnow()
                 db.commit()
     except Exception as e:
@@ -421,6 +421,43 @@ def _save_position_history(search_target_id: int, keyword: str, domain: str,
                         f"{'p' + str(page) + '#' + str(position) if found else 'NOT_FOUND'}")
     except Exception as e:
         logger.error(f"Failed to save position history: {e}")
+
+
+def _check_and_disable_keyword(target_id: int, keyword: str, domain: str, consecutive_threshold: int = 3):
+    """
+    Check if the last N searches for this keyword+target all resulted in not_found.
+    If so, auto-disable the keyword in the target.
+    """
+    with get_db_session() as db:
+        # Get last N position history records for this keyword+target, newest first
+        recent = db.query(SearchPositionHistory).filter(
+            SearchPositionHistory.search_target_id == target_id,
+            SearchPositionHistory.keyword == keyword,
+        ).order_by(SearchPositionHistory.checked_at.desc()).limit(consecutive_threshold).all()
+
+        if len(recent) < consecutive_threshold:
+            return  # Not enough data yet
+
+        # Check if all recent records are not_found
+        all_not_found = all(not r.found for r in recent)
+        if not all_not_found:
+            return  # At least one was found, don't disable
+
+        # Auto-disable keyword
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            return
+
+        disabled = target.get_disabled_keywords_set()
+        if keyword.strip().lower() in disabled:
+            return  # Already disabled
+
+        target.disable_keyword(keyword)
+        db.commit()
+        logger.warning(
+            f"🚫 Auto-disabled keyword '{keyword}' for {domain} "
+            f"(not found {consecutive_threshold} consecutive times)"
+        )
 
 
 def _calculate_keyword_clicks(db, target_id: int, keyword: str, target_success_rate: float = 100.0) -> dict:
@@ -1723,7 +1760,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             msg = f"❌ Сайт {domain} не найден в выдаче (проверено {max_pages} стр.)"
             logger.warning(msg)
             if task_id:
-                _update_search_task_log(task_id, msg, status='failed', error='Site not found in search results')
+                _update_search_task_log(task_id, msg, status='not_found', error='Site not found in search results')
             
             # Update target stats
             with get_db_session() as db:
@@ -1743,6 +1780,12 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 found=False, page=max_pages, position=0,
                 profile_id=profile_id, task_id=task_id, clicked=False
             )
+            
+            # Auto-disable keyword after 3 consecutive not_found
+            try:
+                _check_and_disable_keyword(target_id, keyword, domain, consecutive_threshold=3)
+            except Exception as disable_err:
+                logger.warning(f"Error checking auto-disable for keyword '{keyword}': {disable_err}")
             
             return {
                 'status': 'not_found',
@@ -2063,9 +2106,15 @@ def schedule_search_visits():
                         scheduler_logger.info(f"⏭️  Skipping {target.domain}: {reason}")
                         continue
 
-                    keywords = target.get_keywords_list()
+                    keywords = target.get_active_keywords_list()
+                    disabled_kws = target.get_disabled_keywords_set()
+                    if disabled_kws:
+                        scheduler_logger.info(
+                            f"🚫 {target.domain}: {len(disabled_kws)} keyword(s) auto-disabled, "
+                            f"{len(keywords)} active"
+                        )
                     if not keywords:
-                        scheduler_logger.warning(f"⚠️ No keywords for {target.domain}, skipping")
+                        scheduler_logger.warning(f"⚠️ No active keywords for {target.domain}, skipping")
                         continue
 
                     # Calculate click budget for each keyword based on position history

@@ -60,6 +60,9 @@ class YandexSearchTarget(Base):
     
     # Notes
     notes = Column(Text, nullable=True)
+    
+    # Disabled keywords (auto-disabled after consecutive not_found)
+    disabled_keywords = Column(Text, nullable=True)  # newline-separated disabled keywords
 
     def __repr__(self):
         return f"<YandexSearchTarget(id={self.id}, domain={self.domain}, visits_per_day={self.visits_per_day})>"
@@ -93,7 +96,9 @@ class YandexSearchTarget(Base):
             "priority": self.priority,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-            "notes": self.notes
+            "notes": self.notes,
+            "disabled_keywords": self.disabled_keywords,
+            "disabled_keywords_list": list(self.get_disabled_keywords_set()),
         }
 
     def get_keywords_list(self):
@@ -101,6 +106,24 @@ class YandexSearchTarget(Base):
         if not self.keywords:
             return []
         return [k.strip() for k in self.keywords.strip().split('\n') if k.strip()]
+
+    def get_disabled_keywords_set(self):
+        """Get disabled keywords as a set."""
+        if not self.disabled_keywords:
+            return set()
+        return {k.strip().lower() for k in self.disabled_keywords.strip().split('\n') if k.strip()}
+
+    def get_active_keywords_list(self):
+        """Get only active (non-disabled) keywords."""
+        disabled = self.get_disabled_keywords_set()
+        return [k for k in self.get_keywords_list() if k.strip().lower() not in disabled]
+
+    def disable_keyword(self, keyword: str):
+        """Add a keyword to the disabled list."""
+        disabled = self.get_disabled_keywords_set()
+        if keyword.strip().lower() not in disabled:
+            existing = self.disabled_keywords.strip() if self.disabled_keywords else ''
+            self.disabled_keywords = (existing + '\n' + keyword.strip()).strip()
 
     @property
     def success_rate(self) -> float:

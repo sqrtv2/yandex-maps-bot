@@ -389,6 +389,7 @@ function renderTargets() {
             <td>
                 <small class="text-muted" title="${keywords.join('\n')}">${kwPreview}</small>
                 <span class="badge bg-light text-dark ms-1">${t.keywords_count} шт.</span>
+                ${(t.disabled_keywords_list && t.disabled_keywords_list.length > 0) ? `<span class="badge bg-warning text-dark ms-1" title="Отключены: ${t.disabled_keywords_list.join(', ')}">🚫 ${t.disabled_keywords_list.length}</span>` : ''}
             </td>
             <td>
                 <span class="badge bg-info">${t.today_visits || 0}/${t.visits_per_day}</span>
@@ -582,6 +583,7 @@ function renderLogs(logs) {
             'pending': '<span class="badge bg-secondary">Ожидает</span>',
             'in_progress': '<span class="badge bg-primary"><span class="spinner-border spinner-border-sm me-1"></span>Выполняется</span>',
             'completed': '<span class="badge bg-success">Успех</span>',
+            'not_found': '<span class="badge bg-warning text-dark">Не найден</span>',
             'failed': '<span class="badge bg-danger">Ошибка</span>',
         };
         const statusBadge = statusMap[t.status] || `<span class="badge bg-secondary">${t.status}</span>`;
@@ -593,7 +595,8 @@ function renderLogs(logs) {
             if (t.result.browse_time) details += `${Math.round(t.result.browse_time)}с на сайте`;
         }
         if (t.error_message) {
-            details = `<span class="text-danger">${t.error_message.substring(0, 60)}</span>`;
+            const errClass = t.status === 'not_found' ? 'text-warning' : 'text-danger';
+            details = `<span class="${errClass}">${t.error_message.substring(0, 60)}</span>`;
         }
 
         return `<tr>
@@ -703,6 +706,23 @@ function renderManageKeywords() {
         html += '</div>';
     }
 
+    // Show disabled keywords section
+    const targetData = targets.find(t => t.id === mkTargetId);
+    const disabledKws = targetData && targetData.disabled_keywords_list ? targetData.disabled_keywords_list : [];
+    if (disabledKws.length > 0) {
+        html += `<div class="mt-3 alert alert-secondary py-2">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+                <strong><i class="bi bi-slash-circle"></i> Автоотключённые (${disabledKws.length}):</strong>
+                <button class="btn btn-sm btn-outline-success" onclick="enableAllKeywords()">
+                    <i class="bi bi-arrow-counterclockwise"></i> Включить все
+                </button>
+            </div>
+            <div class="d-flex flex-wrap gap-1">
+                ${disabledKws.map(kw => `<span class="badge bg-warning text-dark">${kw.replace(/</g, '&lt;')}</span>`).join('')}
+            </div>
+        </div>`;
+    }
+
     content.innerHTML = html;
 }
 
@@ -732,6 +752,19 @@ async function doRemoveKeywords() {
         loadTargets();
     } catch (err) {
         alert('Ошибка удаления: ' + (err.message || err));
+    }
+}
+
+async function enableAllKeywords() {
+    if (!mkTargetId) return;
+    if (!confirm('Включить все автоотключённые ключевые слова?')) return;
+    try {
+        const result = await apiCall(`/yandex-search-targets/${mkTargetId}/enable-keywords`, 'POST', { all: true });
+        alert(`Включено: ${result.enabled} ключевых слов`);
+        loadTargets();
+        loadManageKeywords();
+    } catch (err) {
+        alert('Ошибка: ' + (err.message || err));
     }
 }
 </script>
