@@ -824,14 +824,13 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
         # Save pre-click URL to detect redirect
         pre_click_url = driver.current_url
         
-        # Wait up to 60 seconds for URL change.
-        # SmartCaptcha PoW can take 10-40 seconds depending on CPU.
-        # DO NOT call form.submit() manually — it sends an incomplete PoW token
-        # and breaks the captcha flow, causing Yandex to reject and navigation to hang!
+        # Wait up to 25 seconds for URL change (reduced from 60).
+        # SmartCaptcha checkbox PoW has ~2% success rate — if it works, it works within 15-20s.
+        # Don't waste 60s waiting — better to refresh and try kaleidoscope (100% solvable).
         redirected = False
         driver_alive = True
         image_grid_appeared = False
-        for i in range(60):
+        for i in range(25):
             time.sleep(1)
             try:
                 new_url = driver.current_url
@@ -846,16 +845,24 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
                     elif 'checkcaptcha' in new_url_path:
                         logger.info(f"⏳ Form auto-submitted ({i}s), waiting for final redirect...")
                         continue
-                # Check if image grid appeared (AdvancedCaptcha) — means PoW was accepted
+                # Check if image grid or kaleidoscope appeared — means PoW was accepted
                 # but additional challenge is required
                 if i > 0 and i % 5 == 0:
                     try:
-                        has_grid = driver.execute_script("""
-                            return !!(document.querySelector("[class*='AdvancedCaptcha']") ||
-                                      document.querySelector("[class*='Task-Grid']") ||
-                                      document.querySelector("canvas[class*='captcha']"));
+                        captcha_type_check = driver.execute_script("""
+                            var src = document.documentElement.innerHTML.toLowerCase();
+                            return {
+                                grid: !!(document.querySelector("[class*='AdvancedCaptcha']") ||
+                                         document.querySelector("[class*='Task-Grid']") ||
+                                         document.querySelector("canvas[class*='captcha']")),
+                                kaleidoscope: (src.indexOf('kaleidoscope') !== -1 ||
+                                              src.indexOf('captchaslider') !== -1)
+                            };
                         """)
-                        if has_grid:
+                        if captcha_type_check and captcha_type_check.get('kaleidoscope'):
+                            logger.info(f"🧩 Kaleidoscope appeared at {i}s after checkbox — switching to PazlCaptcha solver!")
+                            return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path, max_attempts=max_kaleidoscope_attempts)
+                        if captcha_type_check and captcha_type_check.get('grid'):
                             logger.info(f"🔍 Image grid appeared at {i}s — moving to ШАГ 3")
                             image_grid_appeared = True
                             break
@@ -957,59 +964,117 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
                 logger.info("🎉 Captcha resolved while waiting!")
                 return True
             
-            # No image grid — this is a checkbox-only captcha that didn't pass.
-            # The checkbox verification failed (likely detected as bot).
-            # Try refreshing and clicking again with more human-like behavior.
-            logger.info("⚠️ No image grid found after checkbox click. Trying refresh + re-click...")
+            # No image grid — checkbox-only captcha didn't pass (SmartCaptcha has ~2% success rate).
+            # Strategy: Refresh page up to 3 times hoping Yandex switches to Kaleidoscope
+            # (which we solve at 100% rate via PazlCaptchaV2).
+            logger.info("⚠️ Checkbox captcha failed. Refreshing to try getting Kaleidoscope...")
             
-            driver.refresh()
-            time.sleep(random.uniform(5, 8))
-            
-            # Try clicking checkbox again with longer pause
-            for selector in [".CheckboxCaptcha-Button", "[class*='CheckboxCaptcha'] button"]:
+            for refresh_attempt in range(1, 4):
+                logger.info(f"🔄 Refresh attempt {refresh_attempt}/3 — looking for kaleidoscope...")
                 try:
-                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                    for el in elements:
-                        if el.is_displayed():
-                            # More human-like: move slowly, pause, click
-                            ActionChains(driver).move_to_element(el).pause(random.uniform(0.5, 1.5)).click().perform()
-                            logger.info(f"✅ Re-clicked checkbox: {selector}")
-                            break
-                except:
-                    continue
-            
-            # Wait for redirect again
-            pre_url = driver.current_url
-            for i in range(20):
-                time.sleep(1)
+                    driver.refresh()
+                except Exception as ref_err:
+                    if 'Timed out' in str(ref_err) or 'timeout' in str(ref_err).lower():
+                        logger.warning("⚠️ Timeout during refresh, waiting...")
+                        time.sleep(10)
+                    else:
+                        logger.warning(f"⚠️ Refresh error: {ref_err}")
+                
+                time.sleep(random.uniform(3, 6))
+                
+                # Check what type of captcha appeared after refresh
                 try:
-                    new_url = driver.current_url
-                    if new_url != pre_url and 'captcha' not in new_url.lower():
-                        logger.info(f"🎉 Redirected after re-click! {new_url[:100]}")
-                        time.sleep(2)
-                        if not detect_captcha_or_block(driver):
-                            return True
-                        break
-                except:
-                    pass
-                    
-                # Check for AdvancedCaptcha appearance
-                for sel in grid_selectors:
+                    page_src_refresh = driver.page_source.lower()
+                except Exception:
+                    page_src_refresh = ""
+                
+                # Check for kaleidoscope first (our best solver)
+                is_kaleidoscope_now = any(kw in page_src_refresh for kw in [
+                    'kaleidoscope', 'captchaslider', 'kaleidoscopecanvas'
+                ])
+                if is_kaleidoscope_now:
+                    logger.info(f"🧩 Kaleidoscope appeared after refresh {refresh_attempt}! Solving via PazlCaptcha...")
+                    return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path, max_attempts=max_kaleidoscope_attempts)
+                
+                # Check for silhouette
+                is_silhouette_now = any(kw in page_src_refresh for kw in [
+                    'advancedcaptcha_silhouette', 'silhouette-container'
+                ])
+                if is_silhouette_now:
+                    logger.info(f"🧩 Silhouette appeared after refresh {refresh_attempt}! Solving...")
+                    return _solve_yandex_silhouette_captcha(driver, screenshot_path)
+                
+                # Check if no captcha at all (lucky!)
+                if not detect_captcha_or_block(driver):
+                    logger.info(f"🎉 Captcha disappeared after refresh {refresh_attempt}!")
+                    return True
+                
+                # Still checkbox — try clicking one more time with human-like behavior
+                checkbox_retry_clicked = False
+                for selector in [".CheckboxCaptcha-Button", "[class*='CheckboxCaptcha'] button"]:
                     try:
-                        elems = driver.find_elements(By.CSS_SELECTOR, sel)
-                        if elems and any(e.is_displayed() for e in elems):
-                            grid_found = True
-                            logger.info(f"✅ Image grid appeared after re-click: {sel}")
-                            break
+                        elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                        for el in elements:
+                            if el.is_displayed():
+                                # Human-like: random offset, pause, click
+                                ActionChains(driver)\
+                                    .move_to_element_with_offset(el, random.randint(-3, 3), random.randint(-2, 2))\
+                                    .pause(random.uniform(0.5, 1.5))\
+                                    .click()\
+                                    .perform()
+                                checkbox_retry_clicked = True
+                                logger.info(f"✅ Re-clicked checkbox on refresh {refresh_attempt}: {selector}")
+                                break
                     except:
                         continue
+                    if checkbox_retry_clicked:
+                        break
+                
+                if checkbox_retry_clicked:
+                    # Short wait for checkbox — if it works, it's fast
+                    pre_url = driver.current_url
+                    for wait_i in range(15):
+                        time.sleep(1)
+                        try:
+                            new_url = driver.current_url
+                            new_path = new_url.lower().split('?')[0]
+                            if new_url != pre_url and 'showcaptcha' not in new_path and 'checkcaptcha' not in new_path:
+                                logger.info(f"🎉 Redirected after re-click on refresh {refresh_attempt}! {new_url[:100]}")
+                                time.sleep(2)
+                                if not detect_captcha_or_block(driver):
+                                    return True
+                                break
+                        except:
+                            pass
+                        # Check if kaleidoscope appeared after checkbox click
+                        if wait_i > 0 and wait_i % 5 == 0:
+                            try:
+                                src_check = driver.page_source[:3000].lower()
+                                if 'kaleidoscope' in src_check or 'captchaslider' in src_check:
+                                    logger.info(f"🧩 Kaleidoscope appeared after checkbox click! Solving...")
+                                    return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path, max_attempts=max_kaleidoscope_attempts)
+                            except:
+                                pass
+                        # Check for image grid
+                        for sel in grid_selectors:
+                            try:
+                                elems = driver.find_elements(By.CSS_SELECTOR, sel)
+                                if elems and any(e.is_displayed() for e in elems):
+                                    grid_found = True
+                                    logger.info(f"✅ Image grid appeared after re-click: {sel}")
+                                    break
+                            except:
+                                continue
+                        if grid_found:
+                            break
+                
                 if grid_found:
                     break
             
             if not grid_found:
                 if not detect_captcha_or_block(driver):
                     return True
-                logger.warning("❌ Checkbox captcha failed — no redirect, no image grid")
+                logger.warning("❌ Checkbox captcha failed after 3 refresh attempts — no kaleidoscope appeared")
                 return False
         
         # ШАГ 4: Detect captcha subtype (Kaleidoscope / Silhouette / Image grid)
