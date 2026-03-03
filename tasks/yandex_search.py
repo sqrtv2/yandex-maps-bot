@@ -626,9 +626,137 @@ def _calculate_keyword_clicks(db, target_id: int, keyword: str, target_success_r
         }
 
 
+def _extract_organic_results_js(driver) -> list:
+    """Extract organic search results using JavaScript for reliability.
+    
+    Returns list of dicts with: index, title, href, domain, displayed, greenUrl
+    Each dict represents one organic search result (not ads, not widgets).
+    """
+    try:
+        results = driver.execute_script("""
+            var results = [];
+            
+            // Strategy 1: Find all serp-item containers with [data-cid] (most reliable)
+            var serpItems = document.querySelectorAll('[data-cid]');
+            
+            for (var i = 0; i < serpItems.length; i++) {
+                var item = serpItems[i];
+                var rect = item.getBoundingClientRect();
+                if (rect.height < 20) continue;  // Skip invisible items
+                
+                // Skip ads (sponsored results)  
+                var isAd = item.querySelector('.label_theme_direct, .DirectBanner, [class*="Direct"], [class*="Ad_type"]');
+                if (isAd) continue;
+                
+                // Find the main title link in this result
+                var titleLink = item.querySelector(
+                    'a.OrganicTitle-Link, ' +
+                    'a.organic__url, ' +
+                    '.OrganicTitle a[href], ' +
+                    'h2 a[href], ' +
+                    '.organic__title-wrapper a[href], ' +
+                    'a[class*="Title"][href]'
+                );
+                
+                if (!titleLink) {
+                    // Try broader search within the item
+                    var allLinks = item.querySelectorAll('a[href]');
+                    for (var k = 0; k < allLinks.length; k++) {
+                        var lnk = allLinks[k];
+                        var href = lnk.getAttribute('href') || '';
+                        var lRect = lnk.getBoundingClientRect();
+                        if (lRect.height > 10 && lRect.width > 50 && 
+                            (href.indexOf('http') === 0 || href.indexOf('/clck') === 0 || href.indexOf('//') === 0)) {
+                            titleLink = lnk;
+                            break;
+                        }
+                    }
+                }
+                
+                if (!titleLink) continue;
+                
+                var href = titleLink.href || titleLink.getAttribute('href') || '';
+                if (!href || href === '#') continue;
+                
+                // Extract visible domain from green URL or compute from href
+                var greenUrl = '';
+                var greenEl = item.querySelector(
+                    '.OrganicTitle-Path, .Path, .organic__path, .typo_greenurl, ' +
+                    'a[class*="greenurl"], .Organic-Path, [class*="Path"] a, ' +
+                    '.OrganicUrl, [data-log-node="path"]'
+                );
+                if (greenEl) greenUrl = greenEl.textContent.trim();
+                
+                // Extract domain from href
+                var domain = '';
+                try {
+                    if (href.indexOf('yandex.ru/clck') !== -1 || href.indexOf('ya.ru/clck') !== -1) {
+                        // Yandex redirect URL — try to extract real domain from green URL
+                        domain = greenUrl.replace(/^https?:\\/\\//, '').replace(/^www\\./, '').split('/')[0].split(' ')[0];
+                    } else {
+                        var u = new URL(href);
+                        domain = u.hostname.replace(/^www\\./, '');
+                    }
+                } catch(e) {
+                    domain = href.replace(/^https?:\\/\\//, '').replace(/^www\\./, '').split('/')[0];
+                }
+                
+                var title = titleLink.textContent.trim() || item.querySelector('h2, [class*="Title"]')?.textContent?.trim() || '';
+                
+                results.push({
+                    index: results.length,
+                    title: title.substring(0, 100),
+                    href: href,
+                    domain: domain.toLowerCase(),
+                    greenUrl: greenUrl.substring(0, 100),
+                    displayed: rect.height > 0 && rect.width > 0
+                });
+            }
+            
+            // Strategy 2 fallback: If [data-cid] didn't find enough, try .serp-item
+            if (results.length < 3) {
+                var serpItems2 = document.querySelectorAll('li.serp-item, .serp-item');
+                for (var j = 0; j < serpItems2.length; j++) {
+                    var item2 = serpItems2[j];
+                    if (item2.getAttribute('data-cid')) continue;  // Already processed
+                    var rect2 = item2.getBoundingClientRect();
+                    if (rect2.height < 20) continue;
+                    
+                    var link2 = item2.querySelector('a[href*="http"], a[href*="/clck"]');
+                    if (!link2) continue;
+                    
+                    var href2 = link2.href || '';
+                    var domain2 = '';
+                    try {
+                        var u2 = new URL(href2);
+                        domain2 = u2.hostname.replace(/^www\\./, '');
+                    } catch(e) {
+                        domain2 = href2.replace(/^https?:\\/\\//, '').replace(/^www\\./, '').split('/')[0];
+                    }
+                    
+                    results.push({
+                        index: results.length,
+                        title: link2.textContent.trim().substring(0, 100),
+                        href: href2,
+                        domain: domain2.toLowerCase(),
+                        greenUrl: '',
+                        displayed: true
+                    });
+                }
+            }
+            
+            return results;
+        """)
+        return results or []
+    except Exception as e:
+        logger.warning(f"JS result extraction failed: {e}")
+        return []
+
+
 def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
     """
     Search through Yandex search results to find and click target domain.
+    Uses JS-based extraction for reliable result parsing.
     
     Returns:
         dict with keys: found (bool), page (int), position (int), clicked (bool)
@@ -639,208 +767,266 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
         logger.info(f"🔍 Scanning search results page {page_num} for domain: {domain_clean}")
         time.sleep(random.uniform(2, 4))
         
-        # Collect all search result links
-        result_selectors = [
-            # Desktop Yandex SERP
-            "a.OrganicTitle-Link",
-            "li.serp-item a.link",
-            "a.organic__url",
-            "div.organic a[href]",
-            "a[data-cid]",
-            "h2 a[href]",
-            ".serp-item a[href*='http']",
-            # Mobile Yandex SERP (touch version)
-            ".OrganicTitle a",
-            ".Organic a.link",
-            ".serp-item .OrganicTitle a",
-            ".OrganicTitleContentSpan a",
-            ".Organic .Path a",
-            "a.link.organic__greenurl",
-            ".serp-item .organic__title-wrapper a",
-        ]
+        # Save current URL to verify pagination later
+        url_before_scan = driver.current_url
         
-        all_links = []
-        for selector in result_selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                for elem in elements:
-                    try:
-                        href = elem.get_attribute('href') or ''
-                        text = elem.text.strip()
-                        if href and ('yandex.ru/clck' in href or domain_clean in href.lower() or
-                                     any(x in href for x in ['http://', 'https://'])):
-                            all_links.append({
-                                'element': elem,
-                                'href': href,
-                                'text': text,
-                                'displayed': elem.is_displayed()
-                            })
-                    except StaleElementReferenceException:
-                        continue
-            except Exception:
-                continue
+        # === Extract organic results via JavaScript ===
+        organic_results = _extract_organic_results_js(driver)
         
-        # Deduplicate by href
-        seen_hrefs = set()
-        unique_links = []
-        for link in all_links:
-            if link['href'] not in seen_hrefs and link['displayed']:
-                seen_hrefs.add(link['href'])
-                unique_links.append(link)
+        logger.info(f"  Found {len(organic_results)} organic results on page {page_num}")
         
-        logger.info(f"  Found {len(unique_links)} unique links on page {page_num}")
+        # Log first 10 results for debugging
+        for res in organic_results[:10]:
+            logger.info(f"    #{res['index']+1}: {res['title'][:50]} → {res['domain']} ({res['href'][:80]})")
         
-        # Log first 10 links for debugging
-        for i, link in enumerate(unique_links[:10], 1):
-            logger.info(f"    #{i}: {link['text'][:50]} → {link['href'][:100]}")
+        # === Human-like behavior: scroll through results before clicking ===
+        # Simulate reading the SERP - scroll through a few results naturally
+        if organic_results:
+            num_to_browse = random.randint(1, min(3, len(organic_results)))
+            for _ in range(num_to_browse):
+                driver.execute_script(f"window.scrollBy(0, {random.randint(150, 400)})")
+                time.sleep(random.uniform(0.8, 2.0))
         
-        # Search for target domain in results
-        for position, link in enumerate(unique_links, 1):
-            href = link['href'].lower()
+        # === Search for target domain in results ===
+        target_result = None
+        target_position = 0
+        
+        for res in organic_results:
+            position = res['index'] + 1  # 1-indexed
             
-            # Check if this link points to our target domain
-            # Handle both direct URLs and Yandex redirect URLs
-            if domain_clean in href:
-                # Determine REAL SERP position using DOM serp-item containers
-                real_serp_pos = _get_real_serp_position(driver, link['element'])
-                if real_serp_pos:
-                    logger.info(f"✅ Found target at page {page_num}, SERP position {real_serp_pos} (link index {position}): {link['href'][:100]}")
-                else:
-                    logger.info(f"✅ Found target at page {page_num}, link index {position} (SERP pos unknown): {link['href'][:100]}")
-                    real_serp_pos = min(position, 10)  # Fallback: cap at 10 per page
-                logger.info(f"   Link text: '{link['text']}'")
-                
-                # Remember windows before click
-                windows_before = driver.window_handles
-                url_before = driver.current_url
-                
-                # Simulate natural behavior: scroll to element first
-                try:
-                    # Scroll a few results before clicking (realistic behavior)
-                    if position > 2:
-                        pre_scroll = random.randint(1, min(position - 1, 3))
-                        for _ in range(pre_scroll):
-                            driver.execute_script(f"window.scrollBy(0, {random.randint(150, 350)})")
-                            time.sleep(random.uniform(0.5, 1.5))
-                    
+            # Check if this result matches our target domain
+            res_domain = res['domain']
+            # Also check green URL for redirect links
+            green_domain = res.get('greenUrl', '').lower().replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0].split(' ')[0]
+            
+            if domain_clean in res_domain or domain_clean in green_domain or \
+               res_domain.endswith('.' + domain_clean) or domain_clean in res.get('href', '').lower():
+                target_result = res
+                target_position = position
+                logger.info(f"✅ Found target '{domain_clean}' at page {page_num}, position {position}")
+                logger.info(f"   Title: '{res['title']}'")
+                logger.info(f"   Href: {res['href'][:150]}")
+                logger.info(f"   Domain: {res_domain}, Green: {green_domain}")
+                break
+        
+        if target_result:
+            # === Scroll to the target naturally (as a human would) ===
+            # Scroll past a few results before the target
+            if target_position > 2:
+                scroll_steps = random.randint(1, min(target_position - 1, 4))
+                for _ in range(scroll_steps):
+                    driver.execute_script(f"window.scrollBy(0, {random.randint(200, 450)})")
                     time.sleep(random.uniform(0.5, 1.5))
+            
+            time.sleep(random.uniform(0.5, 1.5))
+            
+            # === Find the actual clickable element ===
+            click_element = None
+            try:
+                # Find the element by its href using JS
+                click_element = driver.execute_script("""
+                    var href = arguments[0];
+                    // First try exact href match
+                    var el = document.querySelector('a[href="' + CSS.escape(href).replace(/"/g, '\\\\"') + '"]');
+                    if (el) return el;
                     
-                    logger.info(f"   Clicking element...")
-                    
-                    # === ANTI-METRIKA: Block analytics BEFORE click ===
-                    _block_analytics_on_target(driver)
-                    
-                    _safe_click(driver, link['element'])
-                    
-                    # === ANTI-METRIKA: Abort page load quickly ===
-                    # Wait just enough for URL redirect to register, then stop loading
-                    # This prevents Yandex Metrika JS from executing on target site
-                    _abort_page_load_fast(driver, wait_before_abort=random.uniform(0.8, 2.5))
-                    
-                except Exception as click_err:
-                    logger.warning(f"   Click failed: {click_err}")
-                
-                # Check if new tab was opened
-                windows_after = driver.window_handles
-                if len(windows_after) > len(windows_before):
-                    new_window = [w for w in windows_after if w not in windows_before][0]
-                    logger.info(f"   New tab opened, switching to it")
-                    driver.switch_to.window(new_window)
-                    # Abort load in new tab too
-                    _abort_page_load_fast(driver, wait_before_abort=random.uniform(0.5, 1.5))
-                
-                # Re-block analytics after any navigation
-                _block_analytics_on_target(driver)
-                
-                # Check current URL
-                current_url = driver.current_url.lower()
-                logger.info(f"   Current URL after click: {driver.current_url[:150]}")
-                
-                # If still on Yandex (ya.ru or yandex.ru), try direct navigation
-                still_on_yandex = (
-                    domain_clean not in current_url and
-                    ('yandex.ru' in current_url or 'ya.ru' in current_url)
-                )
-                if still_on_yandex:
-                    logger.warning(f"   Still on Yandex after click, trying direct navigation to target")
-                    # Extract actual target URL from href if it's a yandex redirect
-                    target_url = link['href']
-                    if 'yandex.ru/clck' in target_url:
-                        # Direct URL approach
-                        target_url = f"https://{domain_clean}/"
-                    logger.info(f"   Navigating to: {target_url}")
-                    
-                    # Block analytics before navigating
-                    _block_analytics_on_target(driver)
-                    driver.get(target_url)
-                    # Abort quickly - don't let Metrika load
-                    _abort_page_load_fast(driver, wait_before_abort=random.uniform(0.8, 2.0))
-                    
-                    current_url = driver.current_url.lower()
-                    logger.info(f"   URL after direct nav: {driver.current_url[:150]}")
-
-                # Robust click success check:
-                # 1) Must not remain on Ya/Yandex domain
-                # 2) Current hostname must contain target domain
-                final_url = driver.current_url.lower()
-                final_host = urlparse(final_url).netloc.lower().replace('www.', '')
-                on_yandex_host = ('ya.ru' in final_host or 'yandex.ru' in final_host)
-                clicked = (not on_yandex_host) and (domain_clean in final_host)
-                logger.info(f"   Final result: on_target={clicked}, host={final_host}, url={driver.current_url[:100]}")
-                
+                    // Search through all [data-cid] items
+                    var items = document.querySelectorAll('[data-cid]');
+                    for (var i = 0; i < items.length; i++) {
+                        var links = items[i].querySelectorAll('a[href]');
+                        for (var j = 0; j < links.length; j++) {
+                            if (links[j].href === href) return links[j];
+                        }
+                    }
+                    return null;
+                """, target_result['href'])
+            except Exception as find_err:
+                logger.warning(f"   Could not find element by href: {find_err}")
+            
+            # Fallback: find by position
+            if not click_element:
+                try:
+                    click_element = driver.execute_script("""
+                        var targetIdx = arguments[0];
+                        var items = document.querySelectorAll('[data-cid]');
+                        var orgIdx = 0;
+                        for (var i = 0; i < items.length; i++) {
+                            var item = items[i];
+                            if (item.getBoundingClientRect().height < 20) continue;
+                            var isAd = item.querySelector('.label_theme_direct, .DirectBanner, [class*="Direct"]');
+                            if (isAd) continue;
+                            if (orgIdx === targetIdx) {
+                                var link = item.querySelector(
+                                    'a.OrganicTitle-Link, a.organic__url, .OrganicTitle a[href], h2 a[href], a[class*="Title"][href]'
+                                );
+                                return link || item.querySelector('a[href*="http"]');
+                            }
+                            orgIdx++;
+                        }
+                        return null;
+                    """, target_result['index'])
+                except Exception as pos_err:
+                    logger.warning(f"   Could not find element by position: {pos_err}")
+            
+            if not click_element:
+                logger.warning(f"   ⚠️ Found target in DOM data but cannot get clickable element")
                 return {
                     'found': True,
                     'page': page_num,
-                    'position': real_serp_pos,  # Real SERP position (not link index)
-                    'clicked': clicked,
-                    'href': link['href'],
-                    'serp_position': real_serp_pos  # Explicit real position
+                    'position': target_position,
+                    'clicked': False,
+                    'href': target_result['href'],
+                    'serp_position': target_position
                 }
+            
+            # === Click the target result ===
+            logger.info(f"   Clicking target element...")
+            
+            # Remember windows before click
+            windows_before = driver.window_handles
+            
+            # DO NOT block analytics before click — we need Yandex's click tracking
+            # (yandex.ru/clck redirect) to register the click properly
+            try:
+                _safe_click(driver, click_element)
+            except Exception as click_err:
+                logger.warning(f"   Click failed: {click_err}")
+            
+            # === Wait for Yandex click redirect to complete ===
+            # The click goes through yandex.ru/clck → target site
+            # We need to wait for this redirect to happen (click registered)
+            # but abort BEFORE the target site fully loads (prevent Metrika)
+            time.sleep(random.uniform(1.5, 3.0))
+            
+            # Check if new tab was opened
+            windows_after = driver.window_handles
+            if len(windows_after) > len(windows_before):
+                new_window = [w for w in windows_after if w not in windows_before][0]
+                logger.info(f"   New tab opened, switching to it")
+                driver.switch_to.window(new_window)
+                time.sleep(random.uniform(0.5, 1.5))
+            
+            # Check if we've left Yandex (redirect completed)
+            try:
+                current_url = driver.current_url.lower()
+            except Exception:
+                current_url = ''
+            logger.info(f"   Current URL after click: {driver.current_url[:150] if current_url else 'unknown'}")
+            
+            # Wait a bit more if still on Yandex redirect
+            if 'yandex.ru/clck' in current_url or 'ya.ru/clck' in current_url:
+                logger.info(f"   Still on Yandex redirect, waiting...")
+                time.sleep(random.uniform(2.0, 4.0))
+                try:
+                    current_url = driver.current_url.lower()
+                except Exception:
+                    pass
+            
+            # NOW block analytics and abort page load on target site
+            _block_analytics_on_target(driver)
+            _abort_page_load_fast(driver, wait_before_abort=random.uniform(0.3, 1.0))
+            
+            # Verify click success
+            try:
+                final_url = driver.current_url.lower()
+                final_host = urlparse(final_url).netloc.lower().replace('www.', '')
+            except Exception:
+                final_url = ''
+                final_host = ''
+            
+            on_yandex = ('ya.ru' in final_host or 'yandex.ru' in final_host)
+            clicked = (not on_yandex) and (domain_clean in final_host or domain_clean in final_url)
+            
+            # If still on Yandex, the redirect might not have worked
+            if on_yandex and not clicked:
+                logger.warning(f"   Still on Yandex after click: {final_url[:100]}")
+                # Don't do direct navigation — that defeats the purpose of organic click
+                # Just report as click_failed
+            
+            logger.info(f"   Final result: clicked={clicked}, host={final_host}")
+            
+            return {
+                'found': True,
+                'page': page_num,
+                'position': target_position,
+                'clicked': clicked,
+                'href': target_result['href'],
+                'serp_position': target_position
+            }
         
-        # Target not found on this page — scroll through results naturally
+        # Target not found on this page — scroll through remaining results naturally
         _human_scroll(driver, 2, 4)
         time.sleep(random.uniform(1, 3))
         
-        # Go to next page if not last
+        # === Go to next page ===
         if page_num < max_pages:
+            next_page_success = False
+            
+            # Method 1: Direct URL manipulation (most reliable)
             try:
-                # Find "next page" button
-                next_selectors = [
-                    "a.pager__item_kind_next",
-                    "a[aria-label='Следующая страница']",
-                    "a.Pager-Item_type_next",
-                    ".pager__item_kind_next",
-                    "a[data-p]:last-child",
-                    # Mobile Yandex SERP next page
-                    ".pager-load-more a",
-                    "a.pager-more__button",
-                    ".more-results a",
-                    "button.more",
-                    ".pager a[aria-label*='След']",
-                ]
-                
-                next_btn = None
-                for sel in next_selectors:
-                    try:
-                        elems = driver.find_elements(By.CSS_SELECTOR, sel)
-                        for e in elems:
-                            if e.is_displayed():
-                                next_btn = e
-                                break
-                        if next_btn:
-                            break
-                    except:
-                        continue
-                
-                if next_btn:
-                    _safe_click(driver, next_btn, 0.3, 0.7)
+                current_search_url = driver.current_url
+                if 'text=' in current_search_url:
+                    # Build URL for next page
+                    from urllib.parse import urlparse as _up, parse_qs, urlencode
+                    parsed = _up(current_search_url)
+                    params = parse_qs(parsed.query)
+                    params['p'] = [str(page_num)]  # p=0 is page 1, p=1 is page 2, etc.
+                    new_query = urlencode({k: v[0] for k, v in params.items()})
+                    next_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+                    logger.info(f"  ➡️ Navigating to page {page_num + 1} via URL: {next_url[:120]}")
+                    driver.get(next_url)
                     time.sleep(random.uniform(3, 6))
-                    logger.info(f"  ➡️ Navigated to page {page_num + 1}")
-                else:
-                    logger.info(f"  No next page button found, stopping at page {page_num}")
-                    break
-            except Exception as nav_err:
-                logger.warning(f"Failed to navigate to next page: {nav_err}")
+                    
+                    # Verify URL changed
+                    new_url = driver.current_url
+                    if new_url != url_before_scan:
+                        next_page_success = True
+                        logger.info(f"  ✅ On page {page_num + 1}")
+                    else:
+                        logger.warning(f"  ⚠️ URL didn't change after pagination")
+            except Exception as url_nav_err:
+                logger.warning(f"  URL pagination failed: {url_nav_err}")
+            
+            # Method 2: Click next button (fallback)
+            if not next_page_success:
+                try:
+                    next_selectors = [
+                        "a.pager__item_kind_next",
+                        "a[aria-label='Следующая страница']",
+                        "a.Pager-Item_type_next",
+                        ".pager__item_kind_next",
+                        ".pager-load-more a",
+                        "a.pager-more__button",
+                        ".pager a[aria-label*='След']",
+                    ]
+                    
+                    next_btn = None
+                    for sel in next_selectors:
+                        try:
+                            elems = driver.find_elements(By.CSS_SELECTOR, sel)
+                            for e in elems:
+                                if e.is_displayed():
+                                    next_btn = e
+                                    break
+                            if next_btn:
+                                break
+                        except:
+                            continue
+                    
+                    if next_btn:
+                        _safe_click(driver, next_btn, 0.3, 0.7)
+                        time.sleep(random.uniform(3, 6))
+                        # Verify we moved
+                        if driver.current_url != url_before_scan:
+                            next_page_success = True
+                            logger.info(f"  ✅ Navigated to page {page_num + 1} via button")
+                        else:
+                            logger.warning(f"  ⚠️ Button click didn't change page")
+                except Exception as nav_err:
+                    logger.warning(f"  Button pagination failed: {nav_err}")
+            
+            if not next_page_success:
+                logger.info(f"  ❌ Could not navigate to page {page_num + 1}, stopping")
                 break
     
     return {'found': False, 'page': max_pages, 'position': 0, 'clicked': False}
