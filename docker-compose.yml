@@ -130,8 +130,8 @@ services:
   celery_yandex_search:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=6 -Q yandex_search -n yandex_search@%h --max-memory-per-child=4000000
-    shm_size: '4gb'
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=12 -Q yandex_search -n yandex_search@%h --max-memory-per-child=4000000
+    shm_size: '8gb'
     healthcheck:
       test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d yandex_search@$$HOSTNAME --timeout=10 || exit 1"]
       interval: 30s
@@ -165,8 +165,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 16G
-          cpus: '4'
+          memory: 32G
+          cpus: '6'
     networks:
       - yandex_maps_network
 

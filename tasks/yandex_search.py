@@ -1102,7 +1102,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             import subprocess as _sp
             chrome_count = int(_sp.run(['sh', '-c', 'pgrep -c chrome || echo 0'],
                                        capture_output=True, text=True, timeout=5).stdout.strip())
-            if chrome_count > 50:
+            if chrome_count > 150:
                 logger.warning(f"⚠️ Too many Chrome processes ({chrome_count}), cleaning up")
                 from core.browser_manager import cleanup_orphaned_chrome
                 cleanup_orphaned_chrome()
@@ -1932,14 +1932,14 @@ def schedule_search_visits():
     # Don't flood the queue — check both Redis queue AND active DB tasks
     try:
         queue_len = r.llen('yandex_search') or 0
-        if queue_len > 50:
+        if queue_len > 100:
             scheduler_logger.warning(f"⏭️ yandex_search queue already has {queue_len} tasks, skipping")
             return {'status': 'skipped', 'reason': f'queue_full ({queue_len})', 'scheduled': 0}
     except Exception as qe:
         scheduler_logger.warning(f"Could not check queue length: {qe}")
 
     # ── Limit total concurrent tasks to avoid overloading proxies ──
-    MAX_CONCURRENT_SEARCH_TASKS = 20
+    MAX_CONCURRENT_SEARCH_TASKS = 40
     try:
         with get_db_session() as db:
             active_count = db.query(Task).filter(
