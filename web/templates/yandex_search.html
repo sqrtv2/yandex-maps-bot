@@ -124,6 +124,41 @@
     </div>
 </div>
 
+<!-- Manage Keywords Modal (Not Found) -->
+<div class="modal fade" id="manageKeywordsModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-danger text-white">
+                <h5 class="modal-title"><i class="bi bi-key"></i> Управление ключевыми словами — <span id="mkDomain"></span></h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <label class="form-label fw-bold mb-0">Период проверки</label>
+                        <select class="form-select form-select-sm" style="width:160px;" id="mkDays" onchange="loadManageKeywords()">
+                            <option value="1" selected>За вчера</option>
+                            <option value="3">За 3 дня</option>
+                            <option value="7">За 7 дней</option>
+                            <option value="14">За 14 дней</option>
+                            <option value="30">За 30 дней</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="mkContent">
+                    <div class="text-center text-muted py-4"><div class="spinner-border text-danger"></div></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Закрыть</button>
+                <button type="button" class="btn btn-danger" id="mkRemoveBtn" onclick="doRemoveKeywords()" disabled>
+                    <i class="bi bi-trash"></i> Удалить выбранные
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Add Target Modal -->
 <div class="modal fade" id="addTargetModal" tabindex="-1">
     <div class="modal-dialog modal-lg">
@@ -372,8 +407,14 @@ function renderTargets() {
             <td>${statusBadge}</td>
             <td>
                 <div class="btn-group btn-group-sm">
+                    <a class="btn btn-outline-dark" href="/search-analytics#${t.id}" title="Аналитика">
+                        <i class="bi bi-graph-up-arrow"></i>
+                    </a>
                     <button class="btn btn-success" onclick="showLaunchModal(${t.id}, '${t.domain}', ${t.visits_per_day})" title="Запустить">
                         <i class="bi bi-rocket"></i>
+                    </button>
+                    <button class="btn btn-outline-danger" onclick="showManageKeywords(${t.id}, '${t.domain}')" title="Управление ключами (не найдены)">
+                        <i class="bi bi-key"></i>
                     </button>
                     <button class="btn btn-outline-primary" onclick="editTarget(${t.id})" title="Редактировать">
                         <i class="bi bi-pencil"></i>
@@ -563,6 +604,135 @@ function renderLogs(logs) {
             <td><small>${details}</small></td>
         </tr>`;
     }).join('');
+}
+
+// ===== Manage Keywords (Not Found) =====
+
+let mkTargetId = null;
+let mkNotFoundData = null;
+
+function showManageKeywords(id, domain) {
+    mkTargetId = id;
+    document.getElementById('mkDomain').textContent = domain;
+    document.getElementById('mkContent').innerHTML = '<div class="text-center text-muted py-4"><div class="spinner-border text-danger"></div></div>';
+    document.getElementById('mkRemoveBtn').disabled = true;
+    new bootstrap.Modal(document.getElementById('manageKeywordsModal')).show();
+    loadManageKeywords();
+}
+
+async function loadManageKeywords() {
+    if (!mkTargetId) return;
+    const days = document.getElementById('mkDays').value || 1;
+    const content = document.getElementById('mkContent');
+    content.innerHTML = '<div class="text-center py-3"><div class="spinner-border spinner-border-sm text-danger"></div> Загрузка...</div>';
+
+    try {
+        mkNotFoundData = await apiCall(`/yandex-search-targets/${mkTargetId}/not-found-keywords?days=${days}`);
+        renderManageKeywords();
+    } catch (err) {
+        content.innerHTML = '<div class="text-center text-danger py-3">Ошибка загрузки</div>';
+    }
+}
+
+function renderManageKeywords() {
+    const content = document.getElementById('mkContent');
+    const removeBtn = document.getElementById('mkRemoveBtn');
+
+    if (!mkNotFoundData) {
+        content.innerHTML = '<div class="text-center text-muted py-3">Нет данных</div>';
+        removeBtn.disabled = true;
+        return;
+    }
+
+    const nfKws = mkNotFoundData.not_found_keywords || [];
+    const neverChecked = mkNotFoundData.never_checked_keywords || [];
+
+    if (nfKws.length === 0 && neverChecked.length === 0) {
+        content.innerHTML = '<div class="text-center text-success py-4"><i class="bi bi-check-circle fs-3"></i><br>Все ключевые слова находятся в выдаче!</div>';
+        removeBtn.disabled = true;
+        return;
+    }
+
+    let html = '';
+
+    html += `<div class="alert alert-warning py-2 mb-3">
+        <strong>${nfKws.length}</strong> ключ(ей) не найдено в выдаче.
+        Всего ключей в цели: <strong>${mkNotFoundData.total_keywords}</strong>
+    </div>`;
+
+    if (nfKws.length > 0) {
+        html += `<div class="mb-2">
+            <button class="btn btn-sm btn-outline-secondary me-1" onclick="toggleAllMk(true)"><i class="bi bi-check-all"></i> Выбрать все</button>
+            <button class="btn btn-sm btn-outline-secondary" onclick="toggleAllMk(false)"><i class="bi bi-x-lg"></i> Снять все</button>
+        </div>`;
+
+        html += '<div class="table-responsive" style="max-height:350px; overflow-y:auto;">';
+        html += '<table class="table table-sm table-hover mb-0">';
+        html += '<thead class="table-light sticky-top"><tr>';
+        html += '<th style="width:30px;"><input type="checkbox" id="mkSelectAll" onchange="toggleAllMk(this.checked)" checked></th>';
+        html += '<th>Ключевое слово</th>';
+        html += '<th class="text-center">Проверок</th>';
+        html += '<th class="text-center">Последняя проверка</th>';
+        html += '</tr></thead><tbody>';
+
+        nfKws.forEach(kw => {
+            const lastChecked = kw.last_checked ? new Date(kw.last_checked).toLocaleString('ru-RU', {
+                day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'
+            }) : '—';
+            const safeKw = kw.keyword.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+            html += `<tr>
+                <td><input type="checkbox" class="mk-checkbox" value="${safeKw}" checked></td>
+                <td><strong>${kw.keyword.replace(/</g, '&lt;')}</strong></td>
+                <td class="text-center"><span class="badge bg-secondary">${kw.checks}</span></td>
+                <td class="text-center"><small class="text-muted">${lastChecked}</small></td>
+            </tr>`;
+        });
+
+        html += '</tbody></table></div>';
+        removeBtn.disabled = false;
+    } else {
+        removeBtn.disabled = true;
+    }
+
+    if (neverChecked.length > 0) {
+        html += `<div class="mt-3"><strong class="text-muted"><i class="bi bi-question-circle"></i> Ещё не проверялись (${neverChecked.length}):</strong></div>`;
+        html += '<div class="d-flex flex-wrap gap-1 mt-1">';
+        neverChecked.forEach(kw => {
+            html += `<span class="badge bg-light text-dark border">${kw.replace(/</g, '&lt;')}</span>`;
+        });
+        html += '</div>';
+    }
+
+    content.innerHTML = html;
+}
+
+function toggleAllMk(checked) {
+    document.querySelectorAll('.mk-checkbox').forEach(cb => cb.checked = checked);
+    const selectAll = document.getElementById('mkSelectAll');
+    if (selectAll) selectAll.checked = checked;
+}
+
+async function doRemoveKeywords() {
+    const checkboxes = document.querySelectorAll('.mk-checkbox:checked');
+    const keywords = Array.from(checkboxes).map(cb => cb.value);
+
+    if (keywords.length === 0) {
+        alert('Не выбрано ни одного ключевого слова');
+        return;
+    }
+
+    if (!confirm(`Удалить ${keywords.length} ключевых слов из цели?\n\n${keywords.join('\n')}\n\nЭто действие необратимо!`)) {
+        return;
+    }
+
+    try {
+        const result = await apiCall(`/yandex-search-targets/${mkTargetId}/remove-keywords`, 'POST', { keywords });
+        alert(`Удалено: ${result.removed} ключевых слов. Осталось: ${result.remaining}`);
+        loadManageKeywords();
+        loadTargets();
+    } catch (err) {
+        alert('Ошибка удаления: ' + (err.message || err));
+    }
 }
 </script>
 {% endblock %}

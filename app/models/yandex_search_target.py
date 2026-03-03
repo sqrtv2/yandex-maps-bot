@@ -30,7 +30,7 @@ class YandexSearchTarget(Base):
     max_interval_minutes = Column(Integer, default=120)
     
     # Search behavior
-    max_search_pages = Column(Integer, default=3)  # How deep to search (pages 1-N)
+    max_search_pages = Column(Integer, default=4)  # How deep to search (pages 1-N)
     min_time_on_site = Column(Integer, default=30)  # Min seconds on target site
     max_time_on_site = Column(Integer, default=120)  # Max seconds on target site
     

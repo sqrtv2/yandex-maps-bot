@@ -95,6 +95,15 @@ async def yandex_search_page(request: Request):
     return templates.TemplateResponse("yandex_search.html", {"request": request})
 
 
+@router.get("/search-analytics", response_class=HTMLResponse)
+async def search_analytics_page(request: Request):
+    """Search position analytics page."""
+    if not templates:
+        return HTMLResponse("<h1>Templates not found</h1>")
+
+    return templates.TemplateResponse("search_analytics.html", {"request": request})
+
+
 @router.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
     """Worker and system settings page."""
@@ -775,6 +784,145 @@ async def get_system_info():
 
 # Yandex Maps Targets API Routes
 
+@router.get("/api/profiles/summary")
+async def get_profiles_summary(db: Session = Depends(get_db)):
+    """Profile status overview for the yandex-targets page."""
+    from sqlalchemy import func, case
+    try:
+        # Count by status
+        status_counts = dict(
+            db.query(BrowserProfile.status, func.count(BrowserProfile.id))
+            .group_by(BrowserProfile.status)
+            .all()
+        )
+        total = sum(status_counts.values())
+        warmed = status_counts.get("warmed", 0)
+        warming_up = status_counts.get("warming_up", 0)
+        created = status_counts.get("created", 0)
+        error = status_counts.get("error", 0)
+
+        # Warmed & active (ready for target visits)
+        ready = db.query(func.count(BrowserProfile.id)).filter(
+            BrowserProfile.is_active == True,
+            BrowserProfile.warmup_completed == True,
+            BrowserProfile.status == "warmed"
+        ).scalar()
+
+        return {
+            "total": total,
+            "warmed": warmed,
+            "warming_up": warming_up,
+            "created": created,
+            "error": error,
+            "ready_for_visits": ready,
+        }
+    except Exception as e:
+        logger.error(f"Error getting profiles summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/yandex-targets/task-status")
+async def get_targets_task_status(db: Session = Depends(get_db)):
+    """Get real-time task execution status per target."""
+    try:
+        from sqlalchemy import func, case
+        
+        # Get all targets
+        all_targets = db.query(YandexMapTarget).all()
+        
+        # Get active tasks (in_progress + pending) grouped by target_url
+        active_tasks = db.query(
+            Task.target_url,
+            func.sum(case(
+                (Task.status == 'in_progress', 1),
+                else_=0
+            )).label('running'),
+            func.sum(case(
+                (Task.status == 'pending', 1),
+                else_=0
+            )).label('pending'),
+        ).filter(
+            Task.task_type == 'yandex_visit',
+            Task.status.in_(['in_progress', 'pending']),
+        ).group_by(Task.target_url).all()
+        
+        # Get last completed/failed task per target (within last hour)
+        one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+        recent_tasks = db.query(
+            Task.target_url,
+            func.max(case(
+                (Task.status == 'completed', Task.completed_at),
+                else_=None
+            )).label('last_completed'),
+            func.max(case(
+                (Task.status == 'failed', Task.completed_at),
+                else_=None
+            )).label('last_failed'),
+            func.count(case(
+                (Task.status == 'completed', 1),
+                else_=None
+            )).label('completed_1h'),
+            func.count(case(
+                (Task.status == 'failed', 1),
+                else_=None
+            )).label('failed_1h'),
+        ).filter(
+            Task.task_type == 'yandex_visit',
+            Task.created_at >= one_hour_ago,
+        ).group_by(Task.target_url).all()
+        
+        # Build lookup maps
+        active_map = {}
+        for row in active_tasks:
+            active_map[row.target_url] = {
+                'running': int(row.running or 0),
+                'pending': int(row.pending or 0),
+            }
+        
+        recent_map = {}
+        for row in recent_tasks:
+            recent_map[row.target_url] = {
+                'last_completed': row.last_completed.isoformat() if row.last_completed else None,
+                'last_failed': row.last_failed.isoformat() if row.last_failed else None,
+                'completed_1h': int(row.completed_1h or 0),
+                'failed_1h': int(row.failed_1h or 0),
+            }
+        
+        # Build result per target
+        result = {}
+        for target in all_targets:
+            active = active_map.get(target.url, {'running': 0, 'pending': 0})
+            recent = recent_map.get(target.url, {
+                'last_completed': None, 'last_failed': None,
+                'completed_1h': 0, 'failed_1h': 0
+            })
+            
+            # Determine overall status
+            if active['running'] > 0:
+                status = 'running'
+            elif active['pending'] > 0:
+                status = 'pending'
+            elif not target.is_active:
+                status = 'disabled'
+            else:
+                status = 'idle'
+            
+            result[str(target.id)] = {
+                'status': status,
+                'running': active['running'],
+                'pending': active['pending'],
+                'last_completed': recent.get('last_completed'),
+                'last_failed': recent.get('last_failed'),
+                'completed_1h': recent.get('completed_1h', 0),
+                'failed_1h': recent.get('failed_1h', 0),
+            }
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error getting targets task status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/yandex-targets")
 async def get_yandex_targets(
     skip: int = 0,
@@ -1311,7 +1459,20 @@ async def get_process_monitor(db: Session = Depends(get_db)):
     Comprehensive process health monitor.
     Detects stuck warmup profiles, orphaned Chrome processes,
     Celery worker/beat issues, and stalled tasks.
+    Results are cached in Redis for 30 seconds to avoid slow Celery inspect calls.
     """
+    # ── Cache check — return cached result if fresh ──
+    try:
+        import redis as _redis_cache
+        import json as _json_cache
+        from app.config import settings as _s_cache
+        _r_cache = _redis_cache.Redis(host=_s_cache.redis_host, port=_s_cache.redis_port, decode_responses=True)
+        cached = _r_cache.get('process_monitor_cache')
+        if cached:
+            return _json_cache.loads(cached)
+    except Exception:
+        _r_cache = None
+
     alerts = []  # list of {level: 'danger'|'warning'|'info', title: str, message: str, action: str|None}
     now = datetime.utcnow()
 
@@ -1388,7 +1549,7 @@ async def get_process_monitor(db: Session = Depends(get_db)):
         active_celery_tasks = 0
         try:
             from tasks.celery_app import celery_app
-            inspector = celery_app.control.inspect(timeout=2)
+            inspector = celery_app.control.inspect(timeout=1)
             active = inspector.active()
             if active:
                 for w, tasks in active.items():
@@ -1423,7 +1584,7 @@ async def get_process_monitor(db: Session = Depends(get_db)):
     celery_active_tasks = 0
     try:
         from tasks.celery_app import celery_app
-        inspector = celery_app.control.inspect(timeout=3)
+        inspector = celery_app.control.inspect(timeout=1)
         ping = inspector.ping()
         if ping:
             celery_worker_online = True
@@ -1451,23 +1612,43 @@ async def get_process_monitor(db: Session = Depends(get_db)):
         })
 
     # ── 5. Celery Beat health ──
+    # Beat runs in a separate container, so psutil/pgrep won't find it.
+    # Instead, check if scheduled tasks were dispatched recently via Redis
+    # or if beat schedule keys exist.
     celery_beat_running = False
     try:
-        import psutil
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        import redis as _redis_beat
+        from app.config import settings as _s_beat
+        _r_beat = _redis_beat.Redis(host=_s_beat.redis_host, port=_s_beat.redis_port, decode_responses=True)
+        # Check if celery beat schedule key exists (celery stores it in Redis)
+        # Also check if any of the periodic queues received tasks recently
+        # by looking at queue activity — if schedule_visits tasks are being
+        # sent every 5 min, there should be recent activity
+        beat_keys = _r_beat.keys('celery-beat*') or []
+        if beat_keys:
+            celery_beat_running = True
+        else:
+            # Fallback: check recent task activity from scheduled tasks
+            # If yandex_maps or yandex_search queues have had activity,
+            # beat is likely running
             try:
-                cmdline = ' '.join(proc.info.get('cmdline') or [])
-                if 'celery' in cmdline and 'beat' in cmdline:
+                from tasks.celery_app import celery_app as _celery_beat
+                inspect_beat = _celery_beat.control.inspect(timeout=1)
+                scheduled = inspect_beat.scheduled() or {}
+                reserved = inspect_beat.reserved() or {}
+                # If workers have scheduled/reserved tasks, beat is dispatching
+                if scheduled or reserved:
                     celery_beat_running = True
-                    break
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-    except ImportError:
-        try:
-            result = subprocess.run(['pgrep', '-f', 'celery.*beat'], capture_output=True, text=True, timeout=3)
-            celery_beat_running = bool(result.stdout.strip())
-        except:
-            pass
+                else:
+                    # Final fallback: check if any worker received tasks recently
+                    active = inspect_beat.active() or {}
+                    if active:
+                        celery_beat_running = True
+            except Exception:
+                pass
+    except Exception:
+        # If Redis check fails, assume beat is running to avoid false alerts
+        celery_beat_running = True
 
     if not celery_beat_running:
         alerts.append({
@@ -1536,10 +1717,20 @@ async def get_process_monitor(db: Session = Depends(get_db)):
         "checked_at": now.isoformat()
     }
 
-    return {
+    result = {
         "summary": summary,
         "alerts": alerts
     }
+
+    # ── Cache the result for 30 seconds ──
+    try:
+        if _r_cache:
+            import json as _json_store
+            _r_cache.setex('process_monitor_cache', 30, _json_store.dumps(result, default=str))
+    except Exception:
+        pass
+
+    return result
 
 
 @router.post("/api/process-monitor/fix-stuck-profiles")
@@ -1900,6 +2091,109 @@ async def reset_search_target_stats(target_id: int, db: Session = Depends(get_db
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/api/yandex-search-targets/{target_id}/not-found-keywords")
+async def get_not_found_keywords(target_id: int, db: Session = Depends(get_db), days: int = 1):
+    """Get keywords that were checked but never found in search results for the given period."""
+    from app.models.search_position_history import SearchPositionHistory
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+
+        since = datetime.utcnow() - timedelta(days=days)
+
+        # Get all position history records for this period
+        records = db.query(SearchPositionHistory).filter(
+            SearchPositionHistory.search_target_id == target_id,
+            SearchPositionHistory.checked_at >= since
+        ).all()
+
+        # Group by keyword
+        keyword_stats = {}
+        for r in records:
+            kw = r.keyword
+            if kw not in keyword_stats:
+                keyword_stats[kw] = {"total": 0, "found": 0, "not_found": 0, "last_checked": None}
+            keyword_stats[kw]["total"] += 1
+            if r.found:
+                keyword_stats[kw]["found"] += 1
+            else:
+                keyword_stats[kw]["not_found"] += 1
+            if not keyword_stats[kw]["last_checked"] or (r.checked_at and r.checked_at > keyword_stats[kw]["last_checked"]):
+                keyword_stats[kw]["last_checked"] = r.checked_at
+
+        # Keywords that were checked but never found
+        not_found_keywords = []
+        for kw, stats in keyword_stats.items():
+            if stats["found"] == 0 and stats["total"] > 0:
+                not_found_keywords.append({
+                    "keyword": kw,
+                    "checks": stats["total"],
+                    "last_checked": stats["last_checked"].isoformat() if stats["last_checked"] else None
+                })
+
+        # Also include keywords from target that were never even checked
+        all_keywords = target.get_keywords_list()
+        checked_keywords = set(keyword_stats.keys())
+        never_checked = [kw for kw in all_keywords if kw not in checked_keywords]
+
+        return {
+            "target_id": target_id,
+            "domain": target.domain,
+            "days": days,
+            "not_found_keywords": not_found_keywords,
+            "never_checked_keywords": never_checked,
+            "total_keywords": len(all_keywords),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting not-found keywords: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/yandex-search-targets/{target_id}/remove-keywords")
+async def remove_keywords_from_target(target_id: int, body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Remove specific keywords from a search target. Body: {keywords: ['kw1', 'kw2']}"""
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+
+        keywords_to_remove = set(k.strip().lower() for k in body.get("keywords", []) if k.strip())
+        if not keywords_to_remove:
+            raise HTTPException(status_code=400, detail="Не указаны ключевые слова для удаления")
+
+        current_keywords = target.get_keywords_list()
+        original_count = len(current_keywords)
+
+        # Filter out keywords to remove (case-insensitive match)
+        remaining = [kw for kw in current_keywords if kw.strip().lower() not in keywords_to_remove]
+        removed_count = original_count - len(remaining)
+
+        if removed_count == 0:
+            return {"message": "Ни одно ключевое слово не найдено для удаления", "removed": 0, "remaining": original_count}
+
+        if len(remaining) == 0:
+            raise HTTPException(status_code=400, detail="Нельзя удалить все ключевые слова. Должно остаться хотя бы одно.")
+
+        target.keywords = "\n".join(remaining)
+        db.commit()
+
+        return {
+            "message": f"Удалено {removed_count} ключевых слов",
+            "removed": removed_count,
+            "remaining": len(remaining),
+            "removed_keywords": list(keywords_to_remove & set(kw.strip().lower() for kw in current_keywords)),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error removing keywords: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/yandex-search-logs")
 async def get_yandex_search_logs(db: Session = Depends(get_db), limit: int = 50):
     """Get recent search click-through task logs."""
@@ -1911,4 +2205,407 @@ async def get_yandex_search_logs(db: Session = Depends(get_db), limit: int = 50)
         return [t.to_dict() for t in tasks]
     except Exception as e:
         logger.error(f"Error getting search logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===== Search Position Analytics =====
+
+@router.get("/api/yandex-search-targets/{target_id}/positions-pivot")
+async def get_positions_pivot(target_id: int, db: Session = Depends(get_db), days: int = 30):
+    """Get keyword × date pivot table with positions. Dates sorted latest first."""
+    from app.models.search_position_history import SearchPositionHistory
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+
+        since = datetime.utcnow() - timedelta(days=days)
+        records = db.query(SearchPositionHistory).filter(
+            SearchPositionHistory.search_target_id == target_id,
+            SearchPositionHistory.checked_at >= since
+        ).order_by(SearchPositionHistory.checked_at.asc()).all()
+
+        if not records:
+            return {"target_id": target_id, "domain": target.domain, "dates": [], "keywords": [], "pivot": {}}
+
+        # Collect all dates and keywords, build pivot
+        all_dates = set()
+        keyword_date_positions = {}  # keyword -> date -> [positions]
+
+        for r in records:
+            day_key = r.checked_at.strftime("%Y-%m-%d") if r.checked_at else None
+            if not day_key:
+                continue
+            all_dates.add(day_key)
+            kw = r.keyword
+            if kw not in keyword_date_positions:
+                keyword_date_positions[kw] = {}
+            if day_key not in keyword_date_positions[kw]:
+                keyword_date_positions[kw][day_key] = {"positions": [], "found": 0, "not_found": 0, "clicked": 0}
+            if r.found and r.absolute_position:
+                keyword_date_positions[kw][day_key]["positions"].append(r.absolute_position)
+                keyword_date_positions[kw][day_key]["found"] += 1
+            else:
+                keyword_date_positions[kw][day_key]["not_found"] += 1
+            if r.clicked:
+                keyword_date_positions[kw][day_key]["clicked"] += 1
+
+        # Sort dates latest first
+        dates_sorted = sorted(all_dates, reverse=True)
+
+        # Build pivot: keyword -> {date: {avg_pos, checks, found, clicked}}
+        pivot = {}
+        for kw, date_data in keyword_date_positions.items():
+            pivot[kw] = {}
+            for d in dates_sorted:
+                if d in date_data:
+                    dd = date_data[d]
+                    avg_pos = round(sum(dd["positions"]) / len(dd["positions"]), 1) if dd["positions"] else None
+                    pivot[kw][d] = {
+                        "avg_position": avg_pos,
+                        "checks": dd["found"] + dd["not_found"],
+                        "found": dd["found"],
+                        "not_found": dd["not_found"],
+                        "clicked": dd["clicked"]
+                    }
+                else:
+                    pivot[kw][d] = None
+
+        # Sort keywords by their latest average position (best first)
+        def kw_sort_key(kw_name):
+            for d in dates_sorted:
+                cell = pivot[kw_name].get(d)
+                if cell and cell["avg_position"] is not None:
+                    return cell["avg_position"]
+            return 999
+
+        keywords_sorted = sorted(pivot.keys(), key=kw_sort_key)
+
+        return {
+            "target_id": target_id,
+            "domain": target.domain,
+            "dates": dates_sorted,
+            "keywords": keywords_sorted,
+            "pivot": pivot
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting positions pivot: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/yandex-search-targets/{target_id}/position-history")
+async def get_position_history(target_id: int, db: Session = Depends(get_db),
+                               keyword: str = None, days: int = 30, limit: int = 500):
+    """Get position history for a search target, optionally filtered by keyword."""
+    from app.models.search_position_history import SearchPositionHistory
+    try:
+        since = datetime.utcnow() - timedelta(days=days)
+        query = db.query(SearchPositionHistory).filter(
+            SearchPositionHistory.search_target_id == target_id,
+            SearchPositionHistory.checked_at >= since
+        )
+        if keyword:
+            query = query.filter(SearchPositionHistory.keyword == keyword)
+        
+        records = query.order_by(SearchPositionHistory.checked_at.desc()).limit(limit).all()
+        return [r.to_dict() for r in records]
+    except Exception as e:
+        logger.error(f"Error getting position history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/yandex-search-targets/{target_id}/analytics")
+async def get_search_analytics(target_id: int, db: Session = Depends(get_db), days: int = 30):
+    """Get aggregated analytics for a search target: per-keyword trends, growth/decline."""
+    from app.models.search_position_history import SearchPositionHistory
+    from sqlalchemy import func, case
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+        
+        since = datetime.utcnow() - timedelta(days=days)
+        
+        # Get all records for the period
+        records = db.query(SearchPositionHistory).filter(
+            SearchPositionHistory.search_target_id == target_id,
+            SearchPositionHistory.checked_at >= since
+        ).order_by(SearchPositionHistory.checked_at.asc()).all()
+        
+        if not records:
+            return {
+                "target_id": target_id,
+                "domain": target.domain,
+                "period_days": days,
+                "total_checks": 0,
+                "keywords": [],
+                "summary": {"avg_position": None, "found_rate": 0, "trend": "no_data"}
+            }
+        
+        # Group by keyword
+        keyword_data = {}
+        for r in records:
+            kw = r.keyword
+            if kw not in keyword_data:
+                keyword_data[kw] = []
+            keyword_data[kw].append(r)
+        
+        # Analyze each keyword
+        keyword_analytics = []
+        total_found = 0
+        total_checks = len(records)
+        all_positions = []
+        
+        for kw, kw_records in keyword_data.items():
+            found_records = [r for r in kw_records if r.found]
+            not_found = len(kw_records) - len(found_records)
+            
+            total_found += len(found_records)
+            
+            positions = [r.absolute_position for r in found_records if r.absolute_position]
+            all_positions.extend(positions)
+            
+            avg_pos = round(sum(positions) / len(positions), 1) if positions else None
+            
+            # Trend: compare first half vs second half
+            trend = "stable"
+            trend_value = 0
+            if len(positions) >= 4:
+                mid = len(positions) // 2
+                first_half_avg = sum(positions[:mid]) / mid
+                second_half_avg = sum(positions[mid:]) / (len(positions) - mid)
+                trend_value = round(first_half_avg - second_half_avg, 1)  # positive = improving (lower position = better)
+                if trend_value > 2:
+                    trend = "improving"
+                elif trend_value < -2:
+                    trend = "declining"
+            
+            # Best and worst positions
+            best_pos = min(positions) if positions else None
+            worst_pos = max(positions) if positions else None
+            
+            # Last 5 checks
+            last_5 = kw_records[-5:]
+            last_5_positions = [r.absolute_position for r in last_5 if r.found and r.absolute_position]
+            current_avg = round(sum(last_5_positions) / len(last_5_positions), 1) if last_5_positions else None
+            
+            # Position history for chart (aggregate by date)
+            daily_positions = {}
+            for r in kw_records:
+                day_key = r.checked_at.strftime("%Y-%m-%d") if r.checked_at else None
+                if day_key:
+                    if day_key not in daily_positions:
+                        daily_positions[day_key] = {"positions": [], "found": 0, "not_found": 0}
+                    if r.found and r.absolute_position:
+                        daily_positions[day_key]["positions"].append(r.absolute_position)
+                        daily_positions[day_key]["found"] += 1
+                    else:
+                        daily_positions[day_key]["not_found"] += 1
+            
+            chart_data = []
+            for day, data in sorted(daily_positions.items()):
+                avg_day_pos = round(sum(data["positions"]) / len(data["positions"]), 1) if data["positions"] else None
+                chart_data.append({
+                    "date": day,
+                    "avg_position": avg_day_pos,
+                    "checks": data["found"] + data["not_found"],
+                    "found": data["found"],
+                    "not_found": data["not_found"]
+                })
+            
+            keyword_analytics.append({
+                "keyword": kw,
+                "total_checks": len(kw_records),
+                "found_count": len(found_records),
+                "not_found_count": not_found,
+                "found_rate": round(len(found_records) / len(kw_records) * 100, 1) if kw_records else 0,
+                "avg_position": avg_pos,
+                "current_avg": current_avg,
+                "best_position": best_pos,
+                "worst_position": worst_pos,
+                "trend": trend,
+                "trend_value": trend_value,
+                "chart_data": chart_data
+            })
+        
+        # Sort by avg position (best first), keywords not found go last
+        keyword_analytics.sort(key=lambda x: (x["avg_position"] is None, x["avg_position"] or 999))
+        
+        # Overall summary
+        overall_avg = round(sum(all_positions) / len(all_positions), 1) if all_positions else None
+        overall_found_rate = round(total_found / total_checks * 100, 1) if total_checks else 0
+        
+        # Overall trend
+        overall_trend = "no_data"
+        if len(all_positions) >= 4:
+            mid = len(all_positions) // 2
+            first_avg = sum(all_positions[:mid]) / mid
+            second_avg = sum(all_positions[mid:]) / (len(all_positions) - mid)
+            diff = first_avg - second_avg
+            if diff > 2:
+                overall_trend = "improving"
+            elif diff < -2:
+                overall_trend = "declining"
+            else:
+                overall_trend = "stable"
+        
+        # === TOP distribution by day ===
+        # For each day, count how many UNIQUE keywords had their best position in TOP-3/5/10/20/50
+        daily_keyword_best = {}  # {date: {keyword: best_position}}
+        for r in records:
+            if r.found and r.absolute_position and r.checked_at:
+                day_key = r.checked_at.strftime("%Y-%m-%d")
+                kw = r.keyword
+                if day_key not in daily_keyword_best:
+                    daily_keyword_best[day_key] = {}
+                if kw not in daily_keyword_best[day_key] or r.absolute_position < daily_keyword_best[day_key][kw]:
+                    daily_keyword_best[day_key][kw] = r.absolute_position
+        
+        top_distribution = []
+        for day in sorted(daily_keyword_best.keys()):
+            kw_positions = daily_keyword_best[day]
+            total_kw_day = len(kw_positions)
+            top3 = sum(1 for p in kw_positions.values() if p <= 3)
+            top5 = sum(1 for p in kw_positions.values() if p <= 5)
+            top10 = sum(1 for p in kw_positions.values() if p <= 10)
+            top20 = sum(1 for p in kw_positions.values() if p <= 20)
+            top50 = sum(1 for p in kw_positions.values() if p <= 50)
+            top_distribution.append({
+                "date": day,
+                "top3": top3,
+                "top5": top5,
+                "top10": top10,
+                "top20": top20,
+                "top50": top50,
+                "total_keywords": total_kw_day
+            })
+        
+        return {
+            "target_id": target_id,
+            "domain": target.domain,
+            "period_days": days,
+            "total_checks": total_checks,
+            "keywords": keyword_analytics,
+            "top_distribution": top_distribution,
+            "summary": {
+                "avg_position": overall_avg,
+                "found_rate": overall_found_rate,
+                "trend": overall_trend,
+                "total_found": total_found,
+                "total_not_found": total_checks - total_found,
+                "keywords_count": len(keyword_analytics)
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting search analytics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/yandex-search-targets/{target_id}/strategy")
+async def get_search_strategy(target_id: int, db: Session = Depends(get_db)):
+    """Generate strategy recommendations using the position-adaptive click algorithm."""
+    from app.models.search_position_history import SearchPositionHistory
+    from tasks.yandex_search import _calculate_keyword_clicks
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+        
+        keywords_list = target.get_keywords_list()
+        
+        # Use success rate for correction (if enough data)
+        sr = target.success_rate if target.total_visits >= 10 else 100.0
+        
+        recommendations = []
+        total_budget = 0
+        total_done = 0
+        
+        for kw in keywords_list:
+            calc = _calculate_keyword_clicks(db, target.id, kw, target_success_rate=sr)
+            remaining = max(0, calc["clicks_per_day"] - calc["today_done"])
+            total_budget += calc["clicks_per_day"]
+            total_done += calc["today_done"]
+            
+            # Map phase to priority
+            phase = calc["phase"]
+            if phase in ("peak", "recovery"):
+                priority = "high"
+            elif phase in ("ramp_up",):
+                priority = "medium"
+            elif phase in ("start", "ramp_down", "maintain"):
+                priority = "low"
+            else:
+                priority = "low"
+            
+            # Map phase to action
+            action_map = {
+                "start": "start_tracking",
+                "ramp_up": "boost",
+                "peak": "boost",
+                "ramp_down": "maintain",
+                "maintain": "maintain",
+                "recovery": "boost",
+                "not_found": "increase_pages",
+                "error": "review"
+            }
+            
+            recommendations.append({
+                "keyword": kw,
+                "action": action_map.get(phase, "review"),
+                "priority": priority,
+                "message": calc["reason"],
+                "current_position": calc.get("current_position"),
+                "prev_position": calc.get("prev_position"),
+                "trend": calc["trend"],
+                "phase": phase,
+                "suggested_clicks": calc["clicks_per_day"],
+                "today_done": calc["today_done"],
+                "remaining": remaining,
+            })
+        
+        # Sort: high priority first, then by remaining budget desc
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        recommendations.sort(key=lambda x: (priority_order.get(x["priority"], 3), -x["remaining"]))
+        
+        # General advice
+        general_advice = []
+        top5_count = sum(1 for r in recommendations if r.get("current_position") and r["current_position"] <= 5)
+        top10_count = sum(1 for r in recommendations if r.get("current_position") and r["current_position"] <= 10)
+        not_found_count = sum(1 for r in recommendations if r.get("phase") == "not_found")
+        recovery_count = sum(1 for r in recommendations if r.get("phase") == "recovery")
+        peak_count = sum(1 for r in recommendations if r.get("phase") == "peak")
+        
+        if top5_count > 0:
+            general_advice.append(f"✅ {top5_count} ключ(ей) в TOP-5 — режим поддержки")
+        if top10_count > top5_count:
+            general_advice.append(f"🎯 {top10_count - top5_count} ключ(ей) в TOP-10 — активное продвижение")
+        if peak_count > 0:
+            general_advice.append(f"🚀 {peak_count} ключ(ей) на пике — максимальные клики")
+        if recovery_count > 0:
+            general_advice.append(f"⚠️ {recovery_count} ключ(ей) восстанавливаются — позиции падали")
+        if not_found_count > 0:
+            general_advice.append(f"❌ {not_found_count} ключ(ей) не найдены — проверьте релевантность")
+        
+        general_advice.append(f"📊 Общий бюджет: {total_budget} кликов/день, выполнено сегодня: {total_done}")
+        
+        if not general_advice:
+            general_advice.append("📊 Данных пока мало. Продолжайте визиты для накопления статистики.")
+        
+        return {
+            "target_id": target_id,
+            "domain": target.domain,
+            "visits_per_day": target.visits_per_day,
+            "algorithm_budget": total_budget,
+            "today_done": total_done,
+            "recommendations": recommendations,
+            "general_advice": general_advice
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating strategy: {e}")
         raise HTTPException(status_code=500, detail=str(e))

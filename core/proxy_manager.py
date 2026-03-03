@@ -112,10 +112,12 @@ class ProxyManager:
                 if not available_proxies:
                     return None
 
-            # Sort by last used time (least recently used first)
-            available_proxies.sort(key=lambda x: self.last_used.get(x[0], 0))
+            # Shuffle for true round-robin across forked workers
+            # (each worker has its own ProxyManager with empty last_used,
+            # so LRU alone always picks the same proxy)
+            random.shuffle(available_proxies)
 
-            # Get the least recently used proxy
+            # Get a random proxy from available ones
             proxy_id, proxy_data = available_proxies[0]
             self.last_used[proxy_id] = current_time
 

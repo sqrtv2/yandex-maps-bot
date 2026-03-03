@@ -11,6 +11,7 @@ from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 
 from celery import shared_task
+from celery.exceptions import SoftTimeLimitExceeded
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
@@ -94,6 +95,7 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
     """
     browser_manager = None
     browser_id = None
+    _profile_dir_for_cleanup = None  # Track profile dir for cleanup even if browser_id is None
 
     try:
         # Validate parameters
@@ -194,7 +196,12 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
         # Create profile data
         from core.profile_generator import ProfileGenerator
         profile_generator = ProfileGenerator()
-        profile_data = profile_generator.generate_profile(profile_data_from_db['name'])
+        
+        # Detect if this is a mobile profile based on user agent
+        ua_str = profile_data_from_db['user_agent']
+        is_mobile = 'Mobile' in ua_str and 'Android' in ua_str
+        
+        profile_data = profile_generator.generate_profile(profile_data_from_db['name'], is_mobile=is_mobile)
 
         # Update with database values
         # Force ru-RU language for Yandex visits — prevents redirect to yandex.com
@@ -207,6 +214,13 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
             'timezone': profile_data_from_db['timezone'],
             'language': 'ru-RU'
         })
+        
+        if is_mobile:
+            logger.info(f"📱 Mobile profile detected: {profile_data_from_db['name']}")
+        
+        # Track profile dir for cleanup even if Chrome fails to start
+        from app.config import settings as _settings
+        _profile_dir_for_cleanup = os.path.join(_settings.browser_user_data_dir, profile_data['name'])
 
         # Create browser session
         browser_id = browser_manager.create_browser_session(profile_data, proxy_data)
@@ -337,6 +351,11 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
         
         return result
 
+    except SoftTimeLimitExceeded:
+        logger.error(f"⏰ Soft time limit exceeded for profile {profile_id}, cleaning up Chrome...")
+        _update_task_log(profile_id, target_url, "⏰ Превышено время выполнения задачи", status='failed', error='SoftTimeLimitExceeded', task_id=task_id)
+        raise
+
     except Exception as e:
         logger.error(f"Error visiting Yandex Maps profile {profile_id}: {e}")
         _update_task_log(profile_id, target_url, f"❌ Ошибка: {str(e)[:200]}", status='failed', error=str(e)[:500], task_id=task_id)
@@ -391,7 +410,18 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
 
         # Retry task if possible (but not for Chrome resource issues)
         error_str = str(e).lower()
-        is_resource_error = any(x in error_str for x in ['connection refused', 'session not created', 'chrome not reachable', 'oom', 'out of memory'])
+        is_resource_error = any(x in error_str for x in ['oom', 'out of memory'])
+        is_proxy_error_retry = any(x in error_str for x in ['err_tunnel', 'err_proxy', 'err_connection'])
+        # Transient Chrome errors (session not created, chrome not reachable) — retry once
+        is_transient_chrome = any(x in error_str for x in ['session not created', 'chrome not reachable', 'connection refused'])
+        if is_transient_chrome and self.request.retries < self.max_retries:
+            logger.warning(f"🔄 Transient Chrome error, retrying in 15s (attempt {self.request.retries + 1}/{self.max_retries})")
+            raise self.retry(exc=e, countdown=15)
+        if is_proxy_error_retry and self.request.retries < self.max_retries:
+            # Exponential backoff for proxy errors: 60s, 120s
+            backoff = 60 * (2 ** self.request.retries)
+            logger.warning(f"🔄 Proxy error, retrying in {backoff}s (attempt {self.request.retries + 1}/{self.max_retries})")
+            raise self.retry(exc=e, countdown=backoff)
         if not is_resource_error and self.request.retries < self.max_retries:
             # Use different proxy on retry
             raise self.retry(exc=e)
@@ -405,17 +435,61 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
                 browser_manager.close_browser_session(browser_id)
             except Exception as e:
                 logger.error(f"Error closing browser session: {e}")
+        elif _profile_dir_for_cleanup:
+            # browser_id is None — Chrome failed to start but may have left orphans.
+            # Clean up any Chrome processes for this profile directory.
+            try:
+                browser_manager_cleanup = browser_manager or BrowserManager.__new__(BrowserManager)
+                if hasattr(browser_manager_cleanup, '_kill_chrome_by_profile_dir'):
+                    browser_manager_cleanup._kill_chrome_by_profile_dir(_profile_dir_for_cleanup)
+                else:
+                    import subprocess as _sp
+                    _sp.run(['pkill', '-9', '-f', _profile_dir_for_cleanup], capture_output=True, timeout=5)
+            except Exception as cleanup_err:
+                logger.warning(f"Cleanup by profile dir failed: {cleanup_err}")
         # Note: Do NOT call cleanup_orphaned_chrome() here — it kills ALL Chrome
         # processes including those used by other concurrent tasks, causing -9 errors.
         # close_browser_session() already kills Chrome by PID for this specific session.
 
 
+def _url_path_has_captcha(url: str) -> bool:
+    """Check if the URL path (ignoring query params like utm_referrer) contains captcha indicators.
+    
+    IMPORTANT: We MUST check only the path, not query parameters.
+    After captcha is solved, Yandex redirects to search results with
+    utm_referrer=https://ya.ru/showcaptcha... — the word 'showcaptcha'
+    appears in the query string but the page itself is NOT a captcha page.
+    Checking the full URL causes false positives that break captcha solving.
+    """
+    try:
+        url_lower = url.lower()
+        # Extract just the base URL (path) before query parameters
+        url_path = url_lower.split('?')[0]
+        return any(indicator in url_path for indicator in ['showcaptcha', 'checkcaptcha', '/captcha', 'blocked', 'verify'])
+    except Exception:
+        return False
+
+
 def detect_captcha_or_block(driver) -> bool:
     """Detect if we've been blocked or shown a captcha."""
     try:
-        # First check URL — most reliable indicator
-        current_url = driver.current_url.lower()
-        if any(block in current_url for block in ['showcaptcha', '/captcha', 'blocked', 'verify']):
+        # First check URL path — most reliable indicator
+        # IMPORTANT: Only check path, NOT query params (utm_referrer contains 'showcaptcha' on normal pages)
+        try:
+            current_url = driver.current_url.lower()
+        except Exception as _url_err:
+            _url_str = str(_url_err)
+            if 'Timed out' in _url_str or 'timeout' in _url_str.lower():
+                logger.warning(f"⚠️ Renderer timeout in detect_captcha_or_block (current_url) — waiting...")
+                time.sleep(10)
+                try:
+                    current_url = driver.current_url.lower()
+                except Exception:
+                    logger.warning("⚠️ Renderer still dead in detect_captcha_or_block — assuming no captcha")
+                    return False
+            else:
+                raise
+        if _url_path_has_captcha(current_url):
             logger.info(f"🔍 URL indicates captcha: {current_url[:100]}")
             return True
 
@@ -474,7 +548,7 @@ def detect_captcha_or_block(driver) -> bool:
         return False
 
 
-def handle_yandex_protection(driver, captcha_solver: CaptchaSolver) -> bool:
+def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidoscope_attempts: int = 7) -> bool:
     """Handle Yandex captcha or protection mechanisms (SmartCaptcha через Capsola)."""
     try:
         logger.info("🔧 Attempting to handle Yandex protection")
@@ -499,8 +573,22 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver) -> bool:
             return _try_simple_refresh(driver)
 
         # === ШАГ 1: Определяем тип капчи ===
-        current_url = driver.current_url.lower()
-        page_source = driver.page_source
+        try:
+            current_url = driver.current_url.lower()
+            page_source = driver.page_source
+        except Exception as _init_err:
+            _init_str = str(_init_err)
+            if 'Timed out' in _init_str or 'timeout' in _init_str.lower():
+                logger.warning(f"⚠️ Renderer timeout in handle_yandex_protection initialization — waiting for recovery...")
+                time.sleep(10)
+                try:
+                    current_url = driver.current_url.lower()
+                    page_source = driver.page_source
+                except Exception:
+                    logger.error("❌ Renderer still dead — cannot solve captcha")
+                    return False
+            else:
+                raise
         page_source_lower = page_source.lower()
         logger.info(f"🔍 URL: {current_url[:120]}")
         
@@ -516,7 +604,17 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver) -> bool:
         
         if is_kaleidoscope:
             logger.info("🧩 Kaleidoscope (slider puzzle) detected! Solving via Capsola PazlCaptcha API...")
-            return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path)
+            result = _solve_yandex_kaleidoscope_captcha(
+                driver,
+                screenshot_path,
+                max_attempts=max_kaleidoscope_attempts,
+            )
+            try:
+                driver.set_page_load_timeout(60)
+                driver.set_script_timeout(30)
+            except Exception:
+                pass
+            return result
         
         # ============================================
         # YANDEX SILHOUETTE / PAZL CAPTCHA (priority — detected before SmartCaptcha)
@@ -531,12 +629,20 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver) -> bool:
         
         if is_silhouette:
             logger.info("🧩 Silhouette/PazlCaptcha detected! Solving via Capsola PazlCaptcha API...")
-            return _solve_yandex_silhouette_captcha(driver, screenshot_path)
+            result = _solve_yandex_silhouette_captcha(driver, screenshot_path)
+            try:
+                driver.set_page_load_timeout(60)
+                driver.set_script_timeout(30)
+            except Exception:
+                pass
+            return result
         
         # ============================================
         # YANDEX SMARTCAPTCHA (showcaptcha page OR embedded)
         # ============================================
-        is_captcha_page = 'showcaptcha' in current_url or 'captcha' in current_url
+        # Check only URL path for captcha indicators (not query params like utm_referrer)
+        url_path_for_check = current_url.split('?')[0]
+        is_captcha_page = 'showcaptcha' in url_path_for_check or '/captcha' in url_path_for_check
         is_smartcaptcha_in_source = any(kw in page_source_lower for kw in [
             'smartcaptcha', 'checkboxcaptcha', 'checkbox-captcha', 
             'captcha-api.yandex', 'i\'m not a robot', 'я не робот',
@@ -547,7 +653,14 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver) -> bool:
         
         if is_captcha_page or is_smartcaptcha_in_source:
             logger.info(f"🎯 SmartCaptcha detected (url={is_captcha_page}, source={is_smartcaptcha_in_source})")
-            return _solve_yandex_showcaptcha(driver, screenshot_path)
+            result = _solve_yandex_showcaptcha(driver, screenshot_path, max_kaleidoscope_attempts=max_kaleidoscope_attempts)
+            # Restore normal timeout after captcha solving (captcha sets 120s)
+            try:
+                driver.set_page_load_timeout(60)
+                driver.set_script_timeout(30)
+            except Exception:
+                pass
+            return result
         
         # ============================================
         # SMARTCAPTCHA (embedded on page via iframe)
@@ -563,7 +676,13 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver) -> bool:
                 elements = driver.find_elements(By.CSS_SELECTOR, selector)
                 if elements:
                     logger.info(f"🎯 Embedded SmartCaptcha found: {selector}")
-                    return _solve_yandex_showcaptcha(driver, screenshot_path)
+                    result = _solve_yandex_showcaptcha(driver, screenshot_path, max_kaleidoscope_attempts=max_kaleidoscope_attempts)
+                    try:
+                        driver.set_page_load_timeout(60)
+                        driver.set_script_timeout(30)
+                    except Exception:
+                        pass
+                    return result
             except:
                 continue
         
@@ -602,7 +721,7 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver) -> bool:
         return False
 
 
-def _solve_yandex_showcaptcha(driver, screenshot_path: str) -> bool:
+def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_attempts: int = 7) -> bool:
     """Solve Yandex SmartCaptcha using Capsola API.
     
     Flow:
@@ -687,41 +806,76 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str) -> bool:
             except Exception as e:
                 logger.warning(f"JS form click failed: {e}")
         
-        # ШАГ 2: Wait for reaction — either captcha resolves or image grid appears
-        logger.info("⏳ Waiting for SmartCaptcha reaction...")
+        # ШАГ 2: Wait for reaction — PoW completes and form auto-submits
+        logger.info("⏳ Waiting for SmartCaptcha PoW + redirect...")
+        
+        # Set moderate timeouts for captcha solving. Don't go too high (300s) because
+        # it blocks the worker if Chrome dies. 120s is enough for PoW + proxy latency.
+        # IMPORTANT: caller (handle_yandex_protection) MUST restore timeout to 60 after return.
+        try:
+            driver.set_page_load_timeout(120)
+        except Exception as e:
+            logger.warning(f"Could not set page_load_timeout: {e}")
+        try:
+            driver.set_script_timeout(120)
+        except Exception as e:
+            logger.warning(f"Could not set script_timeout: {e}")
         
         # Save pre-click URL to detect redirect
         pre_click_url = driver.current_url
         
-        # Wait up to 20 seconds for URL change (showcaptcha form submits to /checkcaptcha which redirects)
+        # Wait up to 60 seconds for URL change.
+        # SmartCaptcha PoW can take 10-40 seconds depending on CPU.
+        # DO NOT call form.submit() manually — it sends an incomplete PoW token
+        # and breaks the captcha flow, causing Yandex to reject and navigation to hang!
         redirected = False
-        for i in range(20):
+        driver_alive = True
+        image_grid_appeared = False
+        for i in range(60):
             time.sleep(1)
             try:
                 new_url = driver.current_url
                 if new_url != pre_click_url:
-                    if 'showcaptcha' not in new_url.lower() and 'checkcaptcha' not in new_url.lower():
-                        logger.info(f"🎉 Page redirected! New URL: {new_url[:100]}")
+                    # IMPORTANT: Check only URL path, not query params!
+                    # After captcha solve, search URL may contain showcaptcha in utm_referrer
+                    new_url_path = new_url.lower().split('?')[0]
+                    if 'showcaptcha' not in new_url_path and 'checkcaptcha' not in new_url_path:
+                        logger.info(f"🎉 Page redirected after {i}s! New URL: {new_url[:100]}")
                         redirected = True
                         break
-                    elif 'checkcaptcha' in new_url.lower():
-                        logger.info("⏳ Form submitted, waiting for redirect...")
+                    elif 'checkcaptcha' in new_url_path:
+                        logger.info(f"⏳ Form auto-submitted ({i}s), waiting for final redirect...")
                         continue
-            except:
-                pass
-            
-            # At second 8 and 15, try submitting the form manually if no redirect
-            if i in (8, 15):
-                try:
-                    form_exists = driver.execute_script("""
-                        var form = document.getElementById('checkbox-captcha-form');
-                        if (form) { form.submit(); return true; }
-                        return false;
-                    """)
-                    if form_exists:
-                        logger.info(f"🔄 Manually submitted captcha form (attempt at {i}s)")
-                except:
-                    pass
+                # Check if image grid appeared (AdvancedCaptcha) — means PoW was accepted
+                # but additional challenge is required
+                if i > 0 and i % 5 == 0:
+                    try:
+                        has_grid = driver.execute_script("""
+                            return !!(document.querySelector("[class*='AdvancedCaptcha']") ||
+                                      document.querySelector("[class*='Task-Grid']") ||
+                                      document.querySelector("canvas[class*='captcha']"));
+                        """)
+                        if has_grid:
+                            logger.info(f"🔍 Image grid appeared at {i}s — moving to ШАГ 3")
+                            image_grid_appeared = True
+                            break
+                    except Exception:
+                        pass
+                # Log progress every 10 seconds
+                if i > 0 and i % 10 == 0:
+                    logger.info(f"⏳ Still waiting for PoW... ({i}s elapsed, URL unchanged)")
+            except Exception as e:
+                err_str = str(e)
+                if 'Connection refused' in err_str or 'RemoteDisconnected' in err_str or 'ConnectionResetError' in err_str:
+                    logger.error(f"💀 Chrome/chromedriver DIED at {i}s after checkbox click: {err_str[:200]}")
+                    driver_alive = False
+                    break
+                else:
+                    logger.warning(f"⚠️ current_url error at {i}s: {type(e).__name__}: {err_str[:200]}")
+        
+        if not driver_alive:
+            logger.error("💀 Browser died during SmartCaptcha PoW wait — cannot continue")
+            return False
         
         if redirected:
             time.sleep(2)
@@ -737,11 +891,14 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str) -> bool:
             after_ss = f"screenshots/captcha_after_click_{int(time.time())}.png"
             driver.save_screenshot(after_ss)
             logger.info(f"📄 After-click state saved: {after_html}")
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"⚠️ Could not save after-click debug: {type(e).__name__}: {str(e)[:200]}")
         
         # ШАГ 3: Check if image grid challenge appeared
-        logger.info("🔍 Checking for image grid challenge...")
+        if image_grid_appeared:
+            logger.info("🔍 Image grid already detected in ШАГ 2, proceeding...")
+        else:
+            logger.info("🔍 Checking for image grid challenge...")
         
         # Try to find the AdvancedCaptcha (image task)
         grid_selectors = [
@@ -784,6 +941,18 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str) -> bool:
         
         if not grid_found:
             # Check if maybe captcha passed while we waited
+            current_check_url = driver.current_url.lower()
+            current_check_path = current_check_url.split('?')[0]
+            if 'checkcaptcha' in current_check_path:
+                # Still on intermediate checkcaptcha page — wait for final redirect
+                logger.info("⏳ Still on checkcaptcha, waiting for final redirect...")
+                for redir_wait in range(15):
+                    time.sleep(1)
+                    current_check_url = driver.current_url.lower()
+                    current_check_path = current_check_url.split('?')[0]
+                    if 'checkcaptcha' not in current_check_path and 'showcaptcha' not in current_check_path:
+                        logger.info(f"🎉 Final redirect completed: {driver.current_url[:100]}")
+                        break
             if not detect_captcha_or_block(driver):
                 logger.info("🎉 Captcha resolved while waiting!")
                 return True
@@ -846,25 +1015,37 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str) -> bool:
         # ШАГ 4: Detect captcha subtype (Kaleidoscope / Silhouette / Image grid)
         try:
             page_src_check = driver.page_source.lower()
-            
-            # 4a: Kaleidoscope (slider puzzle) → PazlCaptcha V1
-            if ('kaleidoscope' in page_src_check or
-                'captchaslider' in page_src_check or
-                'kaleidoscopecanvas' in page_src_check or
-                'captcha-slider' in page_src_check or
-                '/ru/kaleidoscope' in page_src_check):
-                logger.info("🧩 Kaleidoscope (slider puzzle) detected — using PazlCaptcha V1")
-                return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path)
-            
-            # 4b: Silhouette → SmartCaptcha
-            if ('advancedcaptcha_silhouette' in page_src_check or
-                'advancedcaptcha-silhouettetask' in page_src_check or
-                'silhouette-container' in page_src_check or
-                '/silhouette' in page_src_check):
-                logger.info("🧩 Silhouette captcha detected after checkbox — switching to SmartCaptcha solver")
-                return _solve_yandex_silhouette_captcha(driver, screenshot_path)
-        except:
-            pass
+        except Exception as e:
+            err_str = str(e)
+            if 'Timed out' in err_str or 'timeout' in err_str.lower():
+                logger.warning(f"⚠️ Renderer timeout reading page source for subtype detection — waiting for recovery...")
+                time.sleep(10)
+                try:
+                    page_src_check = driver.page_source.lower()
+                    logger.info("✅ Renderer recovered, got page source")
+                except Exception:
+                    logger.warning("⚠️ Renderer still unresponsive, using empty source (will default to SmartCaptcha)")
+                    page_src_check = ""
+            else:
+                logger.warning(f"⚠️ Could not read page source for subtype detection: {e}")
+                page_src_check = ""
+        
+        # 4a: Kaleidoscope (slider puzzle) → PazlCaptcha V1
+        if ('kaleidoscope' in page_src_check or
+            'captchaslider' in page_src_check or
+            'kaleidoscopecanvas' in page_src_check or
+            'captcha-slider' in page_src_check or
+            '/ru/kaleidoscope' in page_src_check):
+            logger.info("🧩 Kaleidoscope (slider puzzle) detected — using PazlCaptcha V1")
+            return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path, max_attempts=max_kaleidoscope_attempts)
+        
+        # 4b: Silhouette → SmartCaptcha
+        if ('advancedcaptcha_silhouette' in page_src_check or
+            'advancedcaptcha-silhouettetask' in page_src_check or
+            'silhouette-container' in page_src_check or
+            '/silhouette' in page_src_check):
+            logger.info("🧩 Silhouette captcha detected after checkbox — switching to SmartCaptcha solver")
+            return _solve_yandex_silhouette_captcha(driver, screenshot_path)
         
         # ШАГ 5: Image grid is visible — extract images for Capsola SmartCaptcha
         logger.info("📸 Extracting SmartCaptcha images for Capsola...")
@@ -950,7 +1131,7 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str) -> bool:
         return False
 
 
-def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str) -> bool:
+def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str, max_attempts: int = 7) -> bool:
     """Solve Yandex Kaleidoscope (slider puzzle) captcha using Capsola PazlCaptcha API.
     
     This captcha shows a scrambled 5x5 image grid with a slider (0 to ~42 steps).
@@ -965,12 +1146,22 @@ def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str) -> bool:
     from app.config import settings
     from core.capsola_solver import create_capsola_solver
     
-    MAX_ATTEMPTS = 5
-    # Step adjustments to try: exact, +1, -1, exact, +1
-    STEP_ADJUSTMENTS = [0, 1, -1, 0, 1]
+    MAX_ATTEMPTS = max(1, int(max_attempts))
+    # No adjustments — each attempt gets a DIFFERENT captcha image,
+    # so adjusting based on a previous captcha's answer is meaningless.
+    # Always submit the raw Capsola answer for each new captcha.
+    STEP_ADJUSTMENTS = [0, 0, 0, 0, 0, 0, 0]
     
     try:
         capsola = create_capsola_solver(settings.capsola_api_key)
+        
+        # Set moderate timeouts for captcha solving (120s, not 300).
+        # IMPORTANT: caller (handle_yandex_protection) MUST restore timeout to 60 after return.
+        try:
+            driver.set_page_load_timeout(120)
+            driver.set_script_timeout(120)
+        except Exception as e:
+            logger.warning(f"Could not set timeouts: {e}")
         
         for attempt in range(1, MAX_ATTEMPTS + 1):
             logger.info(f"🧩 Kaleidoscope attempt {attempt}/{MAX_ATTEMPTS}")
@@ -982,8 +1173,29 @@ def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str) -> bool:
             except:
                 pass
             
-            # Dump SSR_DATA for diagnostics
-            ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+            # Dump SSR_DATA for diagnostics (with timeout recovery)
+            try:
+                ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+            except Exception as _ssr_err:
+                _ssr_err_str = str(_ssr_err)
+                if 'Timed out' in _ssr_err_str or 'timeout' in _ssr_err_str.lower():
+                    logger.warning(f"⚠️ Renderer timeout reading SSR_DATA on attempt {attempt}: {_ssr_err_str[:150]}")
+                    # Wait for renderer to recover
+                    time.sleep(10)
+                    try:
+                        ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+                    except Exception:
+                        logger.error(f"❌ Renderer still dead after retry — skipping attempt {attempt}")
+                        if attempt < MAX_ATTEMPTS:
+                            try:
+                                driver.refresh()
+                            except Exception:
+                                pass
+                            time.sleep(random.uniform(3, 6))
+                            continue
+                        return False
+                else:
+                    raise
             if ssr_data:
                 task_str = ssr_data.get('task', '')
                 image_src = ssr_data.get('imageSrc', '')
@@ -994,26 +1206,16 @@ def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str) -> bool:
             step = None
             
             # === Get step from Capsola ===
-            # Try V1 (HTML) first — simpler and faster
-            page_html = driver.page_source
-            logger.info(f"📤 [V1] Sending HTML to Capsola PazlCaptcha ({len(page_html)} chars)...")
-            result = capsola.solve_pazl_captcha_v1(page_html, max_wait=120)
+            # Try V2 (image + permutations) first — more accurate than V1
+            v2_step = _get_kaleidoscope_v2_step(driver, capsola)
+            if v2_step is not None:
+                step = v2_step
+                logger.info(f"✅ Got step from V2: {step}")
             
-            if result and result.get('status') == 1:
-                answer = result.get('response', '')
-                logger.info(f"✅ [V1] Capsola PazlCaptcha answer: {answer}")
-                try:
-                    step = int(str(answer).strip())
-                except (ValueError, TypeError):
-                    logger.error(f"❌ [V1] Cannot parse step: {answer}")
-            else:
-                logger.warning(f"⚠️ [V1] PazlCaptcha V1 failed: {result}")
-            
-            # Try V2 if V1 didn't produce a step
+            # V1 (HTML) fallback disabled — Capsola returns CAPCHA_NOT_AVAILABLE for V1.
+            # All PazlCaptcha solving goes through V2 (image + permutations).
             if step is None:
-                v2_step = _get_kaleidoscope_v2_step(driver, capsola)
-                if v2_step is not None:
-                    step = v2_step
+                logger.warning(f"⚠️ V2 did not return a step — skipping V1 (not supported by Capsola)")
             
             if step is None:
                 logger.error(f"❌ No valid step from Capsola on attempt {attempt}")
@@ -1041,15 +1243,33 @@ def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str) -> bool:
                 # After failed submission, Yandex redirects to new captcha page
                 time.sleep(random.uniform(1, 2))
                 
-                if not detect_captcha_or_block(driver):
-                    logger.info("🎉 Captcha disappeared after submit — solved!")
-                    return True
-                
-                page_src = driver.page_source.lower()
-                if 'kaleidoscope' not in page_src and 'captcha' not in page_src:
-                    logger.info("🔄 Different page after failed attempt — checking...")
+                try:
                     if not detect_captcha_or_block(driver):
+                        logger.info("🎉 Captcha disappeared after submit — solved!")
                         return True
+                except Exception as e:
+                    err_str = str(e)
+                    if 'Timed out' in err_str or 'timeout' in err_str.lower():
+                        logger.warning(f"⚠️ Renderer timeout after kaleidoscope submit: {err_str[:200]}")
+                        time.sleep(10)
+                        try:
+                            if not detect_captcha_or_block(driver):
+                                logger.info("🎉 Captcha solved (after timeout recovery)!")
+                                return True
+                        except Exception:
+                            pass
+                    else:
+                        logger.warning(f"⚠️ Error checking captcha: {err_str[:200]}")
+                
+                try:
+                    page_src = driver.page_source.lower()
+                    if 'kaleidoscope' not in page_src and 'captcha' not in page_src:
+                        logger.info("🔄 Different page after failed attempt — checking...")
+                        if not detect_captcha_or_block(driver):
+                            return True
+                        return False
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not check page source: {e}")
                     return False
                 
                 # Stay on current page — new captcha is already loaded (status=failed redirects to new captcha)
@@ -1060,16 +1280,51 @@ def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str) -> bool:
         return False
         
     except Exception as e:
-        logger.error(f"❌ Error solving Kaleidoscope: {e}")
-        import traceback
-        traceback.print_exc()
+        err_str = str(e)
+        if 'Timed out' in err_str or 'timeout' in err_str.lower():
+            logger.warning(f"⚠️ Renderer timeout in Kaleidoscope solver: {err_str[:200]}")
+            # Try to recover the browser for the caller
+            try:
+                time.sleep(5)
+                _ = driver.current_url  # Test if browser is responsive
+                logger.info("✅ Browser recovered after Kaleidoscope timeout")
+            except Exception:
+                logger.error("💀 Browser unresponsive after Kaleidoscope timeout")
+        else:
+            logger.error(f"❌ Error solving Kaleidoscope: {e}")
+            import traceback
+            traceback.print_exc()
         return False
 
 
 def _get_kaleidoscope_v2_step(driver, capsola) -> int:
-    """Get kaleidoscope step via Capsola PazlCaptcha V2 (image + permutations)."""
+    """Get kaleidoscope step via Capsola PazlCaptcha V2 (image + permutations).
+    
+    IMPORTANT: Downloads the captcha image THROUGH THE BROWSER (via fetch + proxy)
+    to ensure we get the exact same image Yandex tied to this session/IP.
+    Using requests.get directly would bypass the proxy and potentially get a different image.
+    """
     try:
-        ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+        # Set async script timeout for fetch operations
+        try:
+            driver.set_script_timeout(30)
+        except Exception:
+            pass
+        
+        try:
+            ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+        except Exception as _ssr_err:
+            _ssr_str = str(_ssr_err)
+            if 'Timed out' in _ssr_str or 'timeout' in _ssr_str.lower():
+                logger.warning(f"⚠️ [V2] Renderer timeout reading SSR_DATA: {_ssr_str[:150]}")
+                time.sleep(5)
+                try:
+                    ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+                except Exception:
+                    logger.error("❌ [V2] Renderer still dead after retry")
+                    return None
+            else:
+                raise
         if not ssr_data:
             logger.error("❌ [V2] No __SSR_DATA__ found")
             return None
@@ -1081,6 +1336,8 @@ def _get_kaleidoscope_v2_step(driver, capsola) -> int:
             logger.error(f"❌ [V2] Missing imageSrc or task in SSR_DATA")
             return None
         
+        logger.info(f"📋 [V2] imageSrc URL: {image_src[:120]}")
+        
         import json as json_mod
         try:
             permutations = json_mod.loads(task_str) if isinstance(task_str, str) else task_str
@@ -1088,18 +1345,59 @@ def _get_kaleidoscope_v2_step(driver, capsola) -> int:
             logger.error(f"❌ [V2] Cannot parse task array: {task_str[:100]}")
             return None
         
-        import requests as req
-        cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-        resp = req.get(image_src, cookies=cookies, timeout=15, headers={
-            'User-Agent': driver.execute_script("return navigator.userAgent"),
-            'Referer': driver.current_url
-        })
+        # Download image THROUGH THE BROWSER via fetch() to use the same proxy/IP/session
+        # This is critical — requests.get bypasses the proxy and may get a different/invalid image
+        try:
+            # Set generous script timeout for image download via slow proxy
+            try:
+                driver.set_script_timeout(60)
+            except Exception:
+                pass
+            image_b64 = driver.execute_async_script("""
+                var callback = arguments[arguments.length - 1];
+                var url = arguments[0];
+                fetch(url, {credentials: 'include'})
+                    .then(function(resp) {
+                        if (!resp.ok) { callback({error: 'HTTP ' + resp.status}); return; }
+                        return resp.blob();
+                    })
+                    .then(function(blob) {
+                        var reader = new FileReader();
+                        reader.onloadend = function() {
+                            callback({data: reader.result.split(',')[1], size: blob.size});
+                        };
+                        reader.readAsDataURL(blob);
+                    })
+                    .catch(function(e) {
+                        callback({error: e.message});
+                    });
+            """, image_src)
+        except Exception as fetch_err:
+            fetch_err_str = str(fetch_err)
+            if 'Timed out' in fetch_err_str or 'timeout' in fetch_err_str.lower():
+                logger.warning(f"⚠️ [V2] Renderer timeout during image fetch — falling back to requests: {fetch_err_str[:150]}")
+            else:
+                logger.warning(f"⚠️ [V2] execute_async_script failed: {fetch_err}")
+            image_b64 = None
         
-        if resp.status_code != 200 or len(resp.content) < 100:
-            logger.error(f"❌ [V2] Failed to download image: {resp.status_code}")
-            return None
+        if not image_b64 or image_b64.get('error'):
+            logger.warning(f"⚠️ [V2] Browser fetch failed: {image_b64}, falling back to requests.get")
+            # Fallback to requests.get (without proxy — may not work but worth trying)
+            import requests as req
+            cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+            resp = req.get(image_src, cookies=cookies, timeout=15, headers={
+                'User-Agent': driver.execute_script("return navigator.userAgent"),
+                'Referer': driver.current_url
+            })
+            if resp.status_code != 200 or len(resp.content) < 100:
+                logger.error(f"❌ [V2] Fallback download also failed: {resp.status_code}")
+                return None
+            image_data = resp.content
+        else:
+            import base64
+            image_data = base64.b64decode(image_b64['data'])
+            logger.info(f"✅ [V2] Image downloaded via browser fetch: {len(image_data)} bytes")
         
-        image_data = resp.content
         logger.info(f"📤 [V2] Sending image={len(image_data)}b, permutations={len(permutations)} items")
         
         result = capsola.solve_pazl_captcha_v2(image_data, permutations, max_wait=120)
@@ -1119,6 +1417,8 @@ def _get_kaleidoscope_v2_step(driver, capsola) -> int:
         
     except Exception as e:
         logger.error(f"❌ [V2] Error: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -1133,8 +1433,21 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
     4. Wait for redirect to determine success/failure
     """
     try:
-        # Get slider max value from __SSR_DATA__ task array
-        ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+        # Get slider max value from __SSR_DATA__ task array (with timeout recovery)
+        try:
+            ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+        except Exception as _ssr_err:
+            _ssr_str = str(_ssr_err)
+            if 'Timed out' in _ssr_str or 'timeout' in _ssr_str.lower():
+                logger.warning(f"⚠️ Renderer timeout reading SSR_DATA in slider: {_ssr_str[:150]}")
+                time.sleep(10)
+                try:
+                    ssr_data = driver.execute_script("return window.__SSR_DATA__ || null;")
+                except Exception:
+                    logger.error("❌ Renderer still dead in slider — cannot submit")
+                    return False
+            else:
+                raise
         max_step = 42  # default
         if ssr_data:
             task_str = ssr_data.get('task', '')
@@ -1151,58 +1464,126 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
         step = max(0, min(step, max_step))
         logger.info(f"🎯 Setting rep={step} (max={max_step})")
         
-        # Wait for PoW (pdata) to be computed by page JavaScript
-        pdata_ready = False
-        for wait_i in range(15):
-            pdata = driver.execute_script(
-                "return document.querySelector('input[name=\"pdata\"]')?.value || '';"
-            )
-            if pdata and len(pdata) > 20:
-                logger.info(f"✅ PoW ready (pdata: {len(pdata)} chars)")
-                pdata_ready = True
+        # Wait for PoW (pdata) AND fingerprint fields to be computed by page JavaScript
+        fields_ready = False
+        for wait_i in range(30):
+            try:
+                field_status = driver.execute_script("""
+                    var pdata = document.querySelector('input[name="pdata"]');
+                    var rdata = document.querySelector('input[name="rdata"]');
+                    var picasso = document.querySelector('input[name="picasso"]');
+                    return {
+                        pdata: (pdata && pdata.value) ? pdata.value.length : 0,
+                        rdata: (rdata && rdata.value) ? rdata.value.length : 0,
+                        picasso: (picasso && picasso.value) ? picasso.value.length : 0
+                    };
+                """)
+            except Exception as _fs_err:
+                _fs_str = str(_fs_err)
+                if 'Timed out' in _fs_str or 'timeout' in _fs_str.lower():
+                    logger.warning(f"⚠️ Renderer timeout checking form fields at {wait_i}s — waiting for recovery...")
+                    time.sleep(10)
+                    continue
+                raise
+            pdata_len = field_status.get('pdata', 0) if field_status else 0
+            rdata_len = field_status.get('rdata', 0) if field_status else 0
+            picasso_len = field_status.get('picasso', 0) if field_status else 0
+            
+            # Require PoW plus at least one fingerprint field (rdata or picasso)
+            if pdata_len > 100 and (rdata_len > 100 or picasso_len > 100):
+                logger.info(f"✅ Form fields ready (pdata: {pdata_len}, rdata: {rdata_len}, picasso: {picasso_len})")
+                fields_ready = True
                 break
+            elif pdata_len > 200 and (rdata_len > 0 or picasso_len > 0):
+                # Partial but likely usable state
+                if wait_i > 20:
+                    logger.info(f"✅ PoW partially ready (pdata: {pdata_len}, rdata: {rdata_len}, picasso: {picasso_len}), proceeding")
+                    fields_ready = True
+                    break
             time.sleep(1)
-            if wait_i % 3 == 2:
-                logger.info(f"⏳ Waiting for PoW computation... ({wait_i + 1}s)")
+            if wait_i % 5 == 4:
+                logger.info(f"⏳ Waiting for form fields... ({wait_i + 1}s, pdata={pdata_len}, rdata={rdata_len}, picasso={picasso_len})")
         
-        if not pdata_ready:
-            logger.warning("⚠️ PoW (pdata) not computed after 15s, proceeding anyway")
+        if not fields_ready:
+            logger.warning("⚠️ Form fields not fully computed after 30s, proceeding anyway")
         
-        # Also check that rdata and picasso are present
-        form_status = driver.execute_script("""
-            var form = document.getElementById('advanced-captcha-form');
-            if (!form) {
-                var forms = document.querySelectorAll('form');
-                for (var i = 0; i < forms.length; i++) {
-                    if (forms[i].querySelector('input[name="rep"]')) {
-                        form = forms[i];
-                        break;
+        # Also check that rdata and picasso are present (with timeout recovery)
+        try:
+            form_status = driver.execute_script("""
+                var form = document.getElementById('advanced-captcha-form');
+                if (!form) {
+                    var forms = document.querySelectorAll('form');
+                    for (var i = 0; i < forms.length; i++) {
+                        if (forms[i].querySelector('input[name="rep"]')) {
+                            form = forms[i];
+                            break;
+                        }
                     }
                 }
-            }
-            if (!form) return {found: false};
-            return {
-                found: true,
-                repExists: !!form.querySelector('input[name="rep"]'),
-                rdataLen: (form.querySelector('input[name="rdata"]')?.value || '').length,
-                pdataLen: (form.querySelector('input[name="pdata"]')?.value || '').length,
-                picassoLen: (form.querySelector('input[name="picasso"]')?.value || '').length,
-                tdataLen: (form.querySelector('input[name="tdata"]')?.value || '').length,
-                formAction: (form.action || '').substring(0, 80)
-            };
-        """)
+                if (!form) return {found: false};
+                return {
+                    found: true,
+                    repExists: !!form.querySelector('input[name="rep"]'),
+                    rdataLen: (form.querySelector('input[name="rdata"]')?.value || '').length,
+                    pdataLen: (form.querySelector('input[name="pdata"]')?.value || '').length,
+                    picassoLen: (form.querySelector('input[name="picasso"]')?.value || '').length,
+                    tdataLen: (form.querySelector('input[name="tdata"]')?.value || '').length,
+                    formAction: (form.action || '').substring(0, 80)
+                };
+            """)
+        except Exception as _form_err:
+            _form_str = str(_form_err)
+            if 'Timed out' in _form_str or 'timeout' in _form_str.lower():
+                logger.warning(f"⚠️ Renderer timeout reading form status — waiting for recovery...")
+                time.sleep(10)
+                try:
+                    form_status = driver.execute_script("""
+                        var form = document.getElementById('advanced-captcha-form') || 
+                                   document.querySelector('form');
+                        if (!form) return {found: false};
+                        return {found: true, repExists: !!form.querySelector('input[name="rep"]'),
+                                rdataLen: 999, pdataLen: 999, picassoLen: 0, tdataLen: 0,
+                                formAction: (form.action || '').substring(0, 80)};
+                    """)
+                except Exception:
+                    logger.error("❌ Renderer still dead — cannot submit form")
+                    return False
+            else:
+                raise
         logger.info(f"📋 Form status: {form_status}")
         
         if not form_status or not form_status.get('found'):
             logger.error("❌ Captcha form not found!")
+            return False
+
+        if form_status.get('pdataLen', 0) < 100 or (
+            form_status.get('rdataLen', 0) == 0 and form_status.get('picassoLen', 0) == 0
+        ):
+            logger.warning(
+                f"⚠️ Captcha fields not ready for submit (pdata={form_status.get('pdataLen', 0)}, "
+                f"rdata={form_status.get('rdataLen', 0)}, picasso={form_status.get('picassoLen', 0)})"
+            )
             return False
         
         # Small random delay to simulate "thinking" before submission
         time.sleep(random.uniform(1.0, 3.0))
         
         # Set rep value and submit the form in one atomic JS call
-        pre_url = driver.current_url
-        submit_result = driver.execute_script(f"""
+        try:
+            pre_url = driver.current_url
+        except Exception as _pu_err:
+            if 'Timed out' in str(_pu_err) or 'timeout' in str(_pu_err).lower():
+                logger.warning("⚠️ Renderer timeout getting pre_url — waiting...")
+                time.sleep(10)
+                try:
+                    pre_url = driver.current_url
+                except Exception:
+                    logger.error("❌ Renderer dead — cannot submit")
+                    return False
+            else:
+                raise
+        try:
+            submit_result = driver.execute_script(f"""
             try {{
                 var form = document.getElementById('advanced-captcha-form');
                 if (!form) {{
@@ -1244,6 +1625,23 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
                 return {{success: false, error: e.message}};
             }}
         """)
+        except Exception as _submit_err:
+            _submit_str = str(_submit_err)
+            if 'Timed out' in _submit_str or 'timeout' in _submit_str.lower():
+                logger.warning(f"⚠️ Renderer timeout during form.submit() — form may have been submitted anyway")
+                # Wait and check if page changed (form.submit() triggers navigation)
+                time.sleep(15)
+                try:
+                    new_url = driver.current_url
+                    if new_url != pre_url and 'status=failed' not in new_url.lower():
+                        if not detect_captcha_or_block(driver):
+                            logger.info("🎉 Form was submitted despite timeout — captcha solved!")
+                            return True
+                except Exception:
+                    pass
+                return False
+            else:
+                raise
         
         logger.info(f"📨 Submit result: {submit_result}")
         
@@ -1252,8 +1650,11 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
             return False
         
         # Wait for page navigation (form POST → redirect)
-        for wait_i in range(20):
-            time.sleep(1)
+        # Use generous timeout — proxy navigation can take 60+ seconds,
+        # which causes "Timed out receiving message from renderer" if we
+        # call driver.current_url while Chrome is still loading.
+        for wait_i in range(30):
+            time.sleep(2)
             try:
                 new_url = driver.current_url
                 if new_url != pre_url:
@@ -1262,7 +1663,7 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
                         logger.warning(f"❌ Yandex returned status=failed for step={step}")
                         return False
                     
-                    if 'showcaptcha' not in new_url.lower() and 'checkcaptcha' not in new_url.lower():
+                    if 'showcaptcha' not in new_url.lower().split('?')[0] and 'checkcaptcha' not in new_url.lower().split('?')[0]:
                         # Redirected away from captcha — success!
                         logger.info(f"🎉 Redirected to: {new_url[:100]}")
                         time.sleep(1)
@@ -1272,16 +1673,23 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
                         logger.warning("⚠️ New captcha at redirect destination")
                         return False
                     
-                    if 'checkcaptcha' in new_url.lower():
+                    if 'checkcaptcha' in new_url.lower().split('?')[0]:
                         # Still processing
-                        logger.info(f"⏳ Processing... ({wait_i}s)")
+                        logger.info(f"⏳ Processing... ({wait_i * 2}s)")
                         continue
                     
                     # Other showcaptcha URL without status=failed — new captcha
                     logger.info(f"⏳ Redirected to new captcha: {new_url[:100]}")
                     time.sleep(2)
                     return False
+            except TimeoutException:
+                logger.warning(f"⚠️ Renderer timeout at {wait_i * 2}s after submit — page still loading")
+                continue
             except Exception as e:
+                err_str = str(e)
+                if 'Timed out' in err_str or 'timeout' in err_str.lower():
+                    logger.warning(f"⚠️ Timeout at {wait_i * 2}s: {err_str[:200]}")
+                    continue
                 logger.debug(f"URL check error: {e}")
                 pass
         
@@ -1694,19 +2102,39 @@ def _apply_silhouette_answer(driver, answer) -> bool:
             except:
                 pass
         
-        # Wait for result
+        # Wait for result — use generous wait since proxy navigation can be slow.
+        # The form submit triggers a page load that may take 60+ seconds through proxy.
         time.sleep(random.uniform(5, 8))
         
-        # Check if captcha resolved
-        if not detect_captcha_or_block(driver):
-            logger.info("🎉 Silhouette/PazlCaptcha solved successfully!")
-            return True
+        # Check if captcha resolved — wrap in try/except for renderer timeout
+        try:
+            if not detect_captcha_or_block(driver):
+                logger.info("🎉 Silhouette/PazlCaptcha solved successfully!")
+                return True
+        except Exception as e:
+            err_str = str(e)
+            if 'Timed out' in err_str or 'timeout' in err_str.lower():
+                logger.warning(f"⚠️ Renderer timeout after silhouette submit: {err_str[:200]}")
+                # Wait more and retry
+                time.sleep(10)
+                try:
+                    if not detect_captcha_or_block(driver):
+                        logger.info("🎉 Silhouette solved (detected after timeout recovery)!")
+                        return True
+                except Exception:
+                    pass
+            else:
+                logger.warning(f"⚠️ Error checking captcha after submit: {err_str[:200]}")
         
         # Check if page redirected
-        current_url = driver.current_url.lower()
-        if 'showcaptcha' not in current_url and 'captcha' not in current_url:
-            logger.info(f"🎉 Redirected away from captcha: {current_url[:100]}")
-            return True
+        try:
+            current_url = driver.current_url.lower()
+            current_url_path = current_url.split('?')[0]
+            if 'showcaptcha' not in current_url_path and 'captcha' not in current_url_path:
+                logger.info(f"🎉 Redirected away from captcha: {current_url[:100]}")
+                return True
+        except Exception:
+            pass
         
         logger.warning("❌ Silhouette captcha still present after submitting answer")
         return False
@@ -1849,12 +2277,26 @@ def _send_to_capsola_and_click(driver, capsola, click_image_data: bytes, task_im
             except:
                 continue
         
-        # Wait for result
+        # Wait for result — proxy navigation can be very slow after form submit.
         time.sleep(random.uniform(5, 8))
         
-        if not detect_captcha_or_block(driver):
-            logger.info("🎉 SmartCaptcha solved via Capsola!")
-            return True
+        try:
+            if not detect_captcha_or_block(driver):
+                logger.info("🎉 SmartCaptcha solved via Capsola!")
+                return True
+        except Exception as e:
+            err_str = str(e)
+            if 'Timed out' in err_str or 'timeout' in err_str.lower():
+                logger.warning(f"⚠️ Renderer timeout after SmartCaptcha submit: {err_str[:200]}")
+                time.sleep(10)
+                try:
+                    if not detect_captcha_or_block(driver):
+                        logger.info("🎉 SmartCaptcha solved (detected after timeout recovery)!")
+                        return True
+                except Exception:
+                    pass
+            else:
+                logger.warning(f"⚠️ Error checking captcha: {err_str[:200]}")
         
         logger.warning("❌ SmartCaptcha still present after Capsola solution")
         return False
@@ -1912,20 +2354,21 @@ def perform_yandex_visit_actions(browser_manager: BrowserManager, browser_id: st
     try:
         # Build list of possible actions and RANDOMIZE order
         possible_actions = []
+        actions = params['actions']
 
-        if 'scroll' in params['actions'] and random.random() < params['scroll_probability']:
+        if ('scroll' in actions) and random.random() < params['scroll_probability']:
             possible_actions.append('page_scroll')
 
-        if 'view_photos' in params['actions'] and random.random() < params['photo_click_probability']:
+        if ('view_photos' in actions or 'photos' in actions) and random.random() < params['photo_click_probability']:
             possible_actions.append('view_photos')
 
-        if 'read_reviews' in params['actions'] and random.random() < params['review_read_probability']:
+        if ('read_reviews' in actions or 'reviews' in actions) and random.random() < params['review_read_probability']:
             possible_actions.append('read_reviews')
 
-        if 'click_contacts' in params['actions'] and random.random() < params['contact_click_probability']:
+        if ('click_contacts' in actions or 'contacts' in actions) and random.random() < params['contact_click_probability']:
             possible_actions.append('click_contacts')
 
-        if 'view_map' in params['actions'] and random.random() < params['map_interaction_probability']:
+        if ('view_map' in actions or 'map' in actions) and random.random() < params['map_interaction_probability']:
             possible_actions.append('view_map')
         # Always start with a scroll to look natural
         if 'page_scroll' in possible_actions:
@@ -2186,44 +2629,129 @@ def click_contact_info(driver) -> bool:
 
 
 def interact_with_map(driver) -> bool:
-    """Interact with the map element."""
+    """Interact with the map element on Yandex Maps page."""
     try:
+        # Updated selectors for current Yandex Maps layout (2024-2026)
         map_selectors = [
-            ".ymaps-map", ".map-container", "[data-bem*='map']",
-            ".business-map-view", ".ymaps-glass"
+            # Modern Yandex Maps selectors
+            "[class*='map-container']",
+            "[class*='card-map']",
+            "[class*='orgpage-map']",
+            ".orgpage-map-provider__map",
+            "[class*='MapComponent']",
+            # ymaps3 (new API)
+            "[class*='ymaps3']",
+            "ymaps[class*='map']",
+            # ymaps 2.1 legacy
+            ".ymaps-2-1-79-map",
+            "[class*='ymaps'][class*='map']",
+            ".ymaps-map",
+            ".ymaps-glass",
+            # Generic fallbacks
+            "[data-bem*='map']",
+            ".map-container",
+            ".business-map-view",
+            "canvas[class*='map']",
+            # iframe with map
         ]
 
+        map_element = None
         for selector in map_selectors:
             try:
-                map_element = driver.find_element(By.CSS_SELECTOR, selector)
-                if map_element.is_displayed():
-                    # Smooth scroll to map
-                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", map_element)
-                    time.sleep(random.uniform(1, 2))
-
-                    # Get map dimensions
-                    size = map_element.size
-                    if size['width'] > 100 and size['height'] > 100:
-                        # Perform random clicks on map with separate ActionChains
-                        for _ in range(random.randint(1, 3)):
-                            x_offset = random.randint(10, size['width'] - 10)
-                            y_offset = random.randint(10, size['height'] - 10)
-
-                            # Each interaction is a separate ActionChain (not chained)
-                            ActionChains(driver).move_to_element_with_offset(
-                                map_element, x_offset, y_offset
-                            ).pause(random.uniform(0.1, 0.3)).click().perform()
-
-                            time.sleep(random.uniform(1, 2))
-
-                        logger.info("Interacted with map")
-                        return True
-
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for el in elements:
+                    if el.is_displayed() and el.size['width'] > 80 and el.size['height'] > 80:
+                        map_element = el
+                        break
+                if map_element:
+                    break
             except Exception as e:
-                logger.debug(f"Error interacting with map using selector {selector}: {e}")
+                logger.debug(f"Selector {selector} failed: {e}")
                 continue
 
-        return False
+        # Fallback: try to find map via JavaScript (look for large canvas/div with map-like attributes)
+        if not map_element:
+            try:
+                map_element = driver.execute_script("""
+                    // Try ymaps global object
+                    var candidates = document.querySelectorAll(
+                        '[class*="ymaps"], [class*="map-container"], [class*="orgpage-map"], canvas'
+                    );
+                    for (var i = 0; i < candidates.length; i++) {
+                        var el = candidates[i];
+                        var rect = el.getBoundingClientRect();
+                        if (rect.width > 100 && rect.height > 100 && rect.top < window.innerHeight * 2) {
+                            return el;
+                        }
+                    }
+                    return null;
+                """)
+            except Exception as e:
+                logger.debug(f"JS map search failed: {e}")
+
+        if not map_element:
+            logger.info("Map element not found on page")
+            return False
+
+        # Smooth scroll to map
+        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", map_element)
+        time.sleep(random.uniform(1, 2))
+
+        # Get map dimensions
+        size = map_element.size
+        if size['width'] < 50 or size['height'] < 50:
+            logger.info(f"Map element too small: {size}")
+            return False
+
+        # Perform random interactions on map
+        num_clicks = random.randint(1, 3)
+        for i in range(num_clicks):
+            # Keep offsets within the element, offset from center
+            x_offset = random.randint(-size['width'] // 3, size['width'] // 3)
+            y_offset = random.randint(-size['height'] // 3, size['height'] // 3)
+
+            try:
+                ActionChains(driver).move_to_element_with_offset(
+                    map_element, x_offset, y_offset
+                ).pause(random.uniform(0.2, 0.5)).click().perform()
+            except Exception as click_err:
+                logger.debug(f"Map click {i+1} failed: {click_err}")
+                # Fallback: try JS click at position
+                try:
+                    driver.execute_script("""
+                        var rect = arguments[0].getBoundingClientRect();
+                        var cx = rect.left + rect.width/2 + arguments[1];
+                        var cy = rect.top + rect.height/2 + arguments[2];
+                        var evt = new MouseEvent('click', {
+                            bubbles: true, cancelable: true, view: window,
+                            clientX: cx, clientY: cy
+                        });
+                        document.elementFromPoint(cx, cy).dispatchEvent(evt);
+                    """, map_element, x_offset, y_offset)
+                except Exception:
+                    pass
+
+            time.sleep(random.uniform(0.8, 2.0))
+
+        # Optional: try drag (pan) on map
+        if random.random() < 0.4:
+            try:
+                start_x = random.randint(-size['width'] // 4, size['width'] // 4)
+                start_y = random.randint(-size['height'] // 4, size['height'] // 4)
+                end_x = start_x + random.randint(-100, 100)
+                end_y = start_y + random.randint(-100, 100)
+                ActionChains(driver).move_to_element_with_offset(map_element, start_x, start_y) \
+                    .click_and_hold() \
+                    .pause(random.uniform(0.1, 0.3)) \
+                    .move_by_offset(end_x - start_x, end_y - start_y) \
+                    .pause(random.uniform(0.1, 0.2)) \
+                    .release().perform()
+                time.sleep(random.uniform(0.5, 1.5))
+            except Exception as drag_err:
+                logger.debug(f"Map drag failed: {drag_err}")
+
+        logger.info(f"Interacted with map ({num_clicks} clicks)")
+        return True
 
     except Exception as e:
         logger.warning(f"Error interacting with map: {e}")

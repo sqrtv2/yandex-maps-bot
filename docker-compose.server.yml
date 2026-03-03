@@ -43,7 +43,7 @@ services:
     build: .
     container_name: yandex_maps_warmup_worker
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=25 -Q default,warmup,proxy,maintenance -n warmup@%h
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5 -Q default,warmup,proxy,maintenance -n warmup@%h
     shm_size: '8gb'
     environment:
       - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
@@ -73,7 +73,7 @@ services:
       resources:
         limits:
           memory: 48G
-          cpus: '8'
+          cpus: '3'
     networks:
       - yandex_maps_network
 
@@ -153,7 +153,7 @@ services:
       resources:
         limits:
           memory: 16G
-          cpus: '4'
+          cpus: '6'
     networks:
       - yandex_maps_network
 

@@ -33,6 +33,7 @@ class ProfileGenerator:
             "ru,en-US;q=0.9,en;q=0.8",
         ]
 
+        # Desktop screen resolutions
         self.screen_resolutions = [
             (1920, 1080), (1366, 768), (1440, 900), (1600, 900),
             (1280, 1024), (1024, 768), (1280, 800), (1680, 1050),
@@ -43,6 +44,26 @@ class ProfileGenerator:
             (1920, 929), (1366, 657), (1440, 789), (1600, 789),
             (1280, 913), (1024, 657), (1280, 689), (1680, 939),
             (2560, 1329), (3840, 2049), (2880, 1689), (1920, 1089)
+        ]
+
+        # Mobile screen resolutions (portrait, width x height)
+        self.mobile_screen_resolutions = [
+            (360, 800), (375, 812), (390, 844), (393, 873),
+            (412, 915), (414, 896), (360, 780), (384, 854),
+            (411, 731), (320, 568), (375, 667), (428, 926),
+        ]
+
+        # Mobile device models for UA metadata
+        self.mobile_devices = [
+            {"model": "Pixel 7", "android": "14", "build": "AP2A.240805.005"},
+            {"model": "Pixel 8", "android": "14", "build": "AD1A.240530.047"},
+            {"model": "SM-S928B", "android": "14", "build": "UP1A.231005.007"},  # Samsung Galaxy S24 Ultra
+            {"model": "SM-A546B", "android": "14", "build": "UP1A.231005.007"},  # Samsung Galaxy A54
+            {"model": "SM-G998B", "android": "13", "build": "TP1A.220624.014"},  # Samsung Galaxy S21 Ultra
+            {"model": "22101316G", "android": "14", "build": "UKQ1.231003.002"},  # Xiaomi 13
+            {"model": "2201117TG", "android": "13", "build": "TKQ1.220829.002"},  # Xiaomi 12
+            {"model": "CPH2451", "android": "13", "build": "TP1A.220905.001"},  # OPPO Reno 8
+            {"model": "RMX3630", "android": "14", "build": "UP1A.231005.007"},  # Realme 11 Pro
         ]
 
         # Common fonts found on different systems
@@ -83,26 +104,37 @@ class ProfileGenerator:
             ("WebKit", "Intel(R) Iris(TM) Plus Graphics 640"),
         ]
 
-    def generate_profile(self, profile_name: str = None) -> Dict:
-        """Generate a complete browser profile."""
+    def generate_profile(self, profile_name: str = None, is_mobile: bool = False) -> Dict:
+        """Generate a complete browser profile.
+        
+        Args:
+            profile_name: Name for the profile
+            is_mobile: If True, generate a mobile (Android) profile
+        """
         try:
+            # Pick mobile device if needed
+            device_info = None
+            if is_mobile:
+                device_info = random.choice(self.mobile_devices)
+
             profile = {
                 "name": profile_name or f"Profile_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                 "created_at": datetime.utcnow().isoformat(),
+                "is_mobile": is_mobile,
 
                 # Basic browser settings
-                "user_agent": self._generate_user_agent(),
-                "platform": self._generate_platform(),
+                "user_agent": self._generate_user_agent(is_mobile=is_mobile, device_info=device_info),
+                "platform": self._generate_platform(is_mobile=is_mobile),
                 "language": random.choice(self.languages),
                 "timezone": random.choice(self.timezones),
 
                 # Screen and viewport
-                "screen": self._generate_screen_settings(),
-                "viewport": self._generate_viewport_settings(),
+                "screen": self._generate_screen_settings(is_mobile=is_mobile),
+                "viewport": self._generate_viewport_settings(is_mobile=is_mobile),
 
                 # Fingerprinting data
                 "canvas_fingerprint": self._generate_canvas_fingerprint(),
-                "webgl_fingerprint": self._generate_webgl_fingerprint(),
+                "webgl_fingerprint": self._generate_webgl_fingerprint(is_mobile=is_mobile),
                 "audio_fingerprint": self._generate_audio_fingerprint(),
                 "fonts": self._generate_font_list(),
                 "plugins": self._generate_plugin_list(),
@@ -121,9 +153,9 @@ class ProfileGenerator:
                 "cookies_enabled": True,
 
                 # Advanced settings
-                "hardware_concurrency": random.choice([2, 4, 6, 8, 12, 16]),
-                "device_memory": random.choice([2, 4, 8, 16, 32]),
-                "max_touch_points": 0,  # Desktop profile
+                "hardware_concurrency": random.choice([4, 6, 8]) if is_mobile else random.choice([2, 4, 6, 8, 12, 16]),
+                "device_memory": random.choice([4, 6, 8]) if is_mobile else random.choice([2, 4, 8, 16, 32]),
+                "max_touch_points": random.choice([5, 10]) if is_mobile else 0,
 
                 # Chrome-specific settings
                 "chrome_extensions": [],
@@ -132,6 +164,10 @@ class ProfileGenerator:
                 # Proxy settings (to be filled later)
                 "proxy": None
             }
+
+            # Mobile-specific fields
+            if is_mobile and device_info:
+                profile["mobile_device"] = device_info
 
             # Generate profile hash for identification
             profile["profile_hash"] = self._generate_profile_hash(profile)
@@ -142,41 +178,70 @@ class ProfileGenerator:
             logger.error(f"Error generating profile: {e}")
             raise
 
-    def _generate_user_agent(self) -> str:
-        """Generate realistic user agent string."""
-        try:
-            # Get random user agent
-            ua_string = self.ua.random
+    # Modern Chrome UA templates matching actual Chrome 143-145 on server
+    MODERN_CHROME_UAS = [
+        # Windows 10 / 11
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+        # macOS
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+        # Linux
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+    ]
 
-            # Occasionally modify version numbers to make unique
-            if random.random() < 0.3:
-                # Slightly modify Chrome version
-                import re
-                chrome_match = re.search(r'Chrome/(\d+)\.(\d+)\.(\d+)\.(\d+)', ua_string)
-                if chrome_match:
-                    major, minor, build, patch = chrome_match.groups()
-                    new_build = str(int(build) + random.randint(-10, 10))
-                    new_patch = str(int(patch) + random.randint(-50, 50))
-                    ua_string = ua_string.replace(
-                        f"Chrome/{major}.{minor}.{build}.{patch}",
-                        f"Chrome/{major}.{minor}.{new_build}.{new_patch}"
-                    )
+    # Mobile Chrome UA template (Android)
+    # {device} is replaced with model info from mobile_devices list
+    MOBILE_CHROME_UAS = [
+        "Mozilla/5.0 (Linux; Android {android}; {model}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Mobile Safari/537.36",
+    ]
 
-            return ua_string
+    # Chrome version ranges matching what's actually installed (143-145)
+    CHROME_VERSIONS = [
+        "143.0.7544.{patch}",
+        "144.0.7612.{patch}",
+        "145.0.7632.{patch}",
+    ]
 
-        except Exception:
-            # Fallback user agent
-            return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    def _generate_user_agent(self, is_mobile: bool = False, device_info: dict = None) -> str:
+        """Generate realistic user agent matching actual installed Chrome version."""
+        version_template = random.choice(self.CHROME_VERSIONS)
+        patch = random.randint(40, 120)
+        version = version_template.format(patch=patch)
 
-    def _generate_platform(self) -> str:
+        if is_mobile and device_info:
+            template = random.choice(self.MOBILE_CHROME_UAS)
+            return template.format(
+                ver=version,
+                android=device_info['android'],
+                model=device_info['model']
+            )
+        else:
+            template = random.choice(self.MODERN_CHROME_UAS)
+            return template.format(ver=version)
+
+    def _generate_platform(self, is_mobile: bool = False) -> str:
         """Generate platform string."""
+        if is_mobile:
+            return "Linux armv81"
         platforms = [
             "Win32", "MacIntel", "Linux x86_64", "Linux i686"
         ]
         return random.choice(platforms)
 
-    def _generate_screen_settings(self) -> Dict:
+    def _generate_screen_settings(self, is_mobile: bool = False) -> Dict:
         """Generate screen resolution and color depth."""
+        if is_mobile:
+            width, height = random.choice(self.mobile_screen_resolutions)
+            return {
+                "width": width,
+                "height": height,
+                "color_depth": 24,
+                "pixel_ratio": random.choice([2, 2.5, 3, 3.5]),
+                "orientation": "portrait-primary"
+            }
+
         width, height = random.choice(self.screen_resolutions)
 
         return {
@@ -187,8 +252,17 @@ class ProfileGenerator:
             "orientation": "landscape-primary"
         }
 
-    def _generate_viewport_settings(self) -> Dict:
+    def _generate_viewport_settings(self, is_mobile: bool = False) -> Dict:
         """Generate viewport size based on screen resolution."""
+        if is_mobile:
+            width, height = random.choice(self.mobile_screen_resolutions)
+            # Mobile viewport is usually screen size minus status/nav bars
+            viewport_height = height - random.randint(50, 80)
+            return {
+                "width": width,
+                "height": viewport_height
+            }
+
         screen_width = random.choice([res[0] for res in self.screen_resolutions])
         # Viewport is usually slightly smaller than screen
         viewport_width = screen_width - random.randint(0, 100)
@@ -214,9 +288,20 @@ class ProfileGenerator:
         except Exception:
             return hashlib.md5(f"fallback_{random.randint(1000000, 9999999)}".encode()).hexdigest()
 
-    def _generate_webgl_fingerprint(self) -> Dict:
+    def _generate_webgl_fingerprint(self, is_mobile: bool = False) -> Dict:
         """Generate WebGL fingerprint data."""
-        vendor, renderer = random.choice(self.webgl_vendors)
+        if is_mobile:
+            mobile_webgl = [
+                ("Qualcomm", "Adreno (TM) 730"),
+                ("Qualcomm", "Adreno (TM) 740"),
+                ("Qualcomm", "Adreno (TM) 660"),
+                ("ARM", "Mali-G710 MC10"),
+                ("ARM", "Mali-G78 MC20"),
+                ("Imagination Technologies", "PowerVR GE8320"),
+            ]
+            vendor, renderer = random.choice(mobile_webgl)
+        else:
+            vendor, renderer = random.choice(self.webgl_vendors)
 
         return {
             "vendor": vendor,

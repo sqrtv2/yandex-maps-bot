@@ -10,12 +10,64 @@ from celery import shared_task
 
 from app.database import get_db_session
 from app.models.yandex_target import YandexMapTarget
+from app.models.yandex_search_target import YandexSearchTarget
 from app.models import BrowserProfile
 from app.models.task import Task
 from app.models.profile_target_visit import ProfileTargetVisit
+from app.models.profile_search_visit import ProfileSearchVisit
 from tasks.yandex_maps import visit_yandex_maps_profile_task
 
 logger = logging.getLogger(__name__)
+
+
+def _cleanup_stale_yandex_visit_tasks():
+    """Clean up yandex_visit tasks stuck in 'in_progress' or 'pending' too long.
+    
+    Chrome/Celery workers killed by OOM (SIGKILL) leave tasks in 'in_progress'
+    forever because the finally block never executes. This cleans them up.
+    """
+    try:
+        with get_db_session() as db:
+            now = datetime.utcnow()
+            fixed = 0
+            
+            # In-progress yandex_visit tasks older than 7 minutes are stuck
+            # (hard time_limit is 210s = 3.5 min, so 7 min is generous)
+            stale_threshold = timedelta(minutes=7)
+            stale_in_progress = db.query(Task).filter(
+                Task.task_type == 'yandex_visit',
+                Task.status == 'in_progress',
+                Task.started_at.isnot(None),
+                Task.started_at < (now - stale_threshold)
+            ).all()
+            
+            for t in stale_in_progress:
+                t.status = 'failed'
+                t.error_message = t.error_message or 'Автоматически отменена: задача зависла (>7 мин, вероятно OOM-kill)'
+                t.completed_at = now
+                t.add_log('🧹 Автоочистка: задача зависла в in_progress (Chrome/worker убит OOM)')
+                fixed += 1
+            
+            # Pending yandex_visit tasks older than 15 minutes are orphaned
+            pending_threshold = timedelta(minutes=15)
+            stale_pending = db.query(Task).filter(
+                Task.task_type == 'yandex_visit',
+                Task.status == 'pending',
+                Task.created_at < (now - pending_threshold)
+            ).all()
+            
+            for t in stale_pending:
+                t.status = 'failed'
+                t.error_message = 'Автоматически отменена: задача не запустилась (>15 мин)'
+                t.completed_at = now
+                t.add_log('🧹 Автоочистка: задача зависла в pending')
+                fixed += 1
+            
+            if fixed:
+                db.commit()
+                logger.info(f"🧹 Cleaned up {fixed} stale yandex_visit tasks ({len(stale_in_progress)} in_progress, {len(stale_pending)} pending)")
+    except Exception as e:
+        logger.warning(f"Error cleaning up stale tasks: {e}")
 
 
 @shared_task(name='tasks.yandex_maps.schedule_visits')
@@ -24,6 +76,9 @@ def schedule_yandex_visits():
     Check all active targets and schedule visits based on their configuration.
     This task runs every 5 minutes and checks if any targets need visits.
     """
+    # Clean up stale tasks before scheduling new ones
+    _cleanup_stale_yandex_visit_tasks()
+    
     # Distributed lock to prevent duplicate scheduler runs
     try:
         import redis as _redis
@@ -82,6 +137,11 @@ def schedule_yandex_visits():
             scheduled_count = 0
             current_time = datetime.utcnow()
             
+            # Track profiles used in THIS scheduling round to prevent
+            # the same profile being assigned to multiple concurrent tasks
+            # (two Chrome instances can't share the same user-data-dir)
+            used_profile_ids_this_round = set()
+            
             # Process each target
             for target in targets:
                 try:
@@ -112,13 +172,15 @@ def schedule_yandex_visits():
                     except Exception as ve:
                         logger.warning(f"Could not query visited profiles: {ve}")
                     
-                    available_profiles = [p for p in all_profiles if p.id not in visited_profile_ids]
+                    # Exclude profiles already visited AND profiles already scheduled this round
+                    excluded_ids = visited_profile_ids | used_profile_ids_this_round
+                    available_profiles = [p for p in all_profiles if p.id not in excluded_ids]
                     
                     if not available_profiles:
-                        logger.warning(f"⚠️ All {len(all_profiles)} profiles already visited {target.title}, skipping")
+                        logger.warning(f"⚠️ No profiles available for {target.title} (visited: {len(visited_profile_ids)}, scheduled this round: {len(used_profile_ids_this_round)}), skipping")
                         continue
                     
-                    logger.info(f"🔄 {len(available_profiles)} profiles available for {target.title} (visited: {len(visited_profile_ids)})")
+                    logger.info(f"🔄 {len(available_profiles)} profiles available for {target.title} (visited: {len(visited_profile_ids)}, used this round: {len(used_profile_ids_this_round)})")
                     
                     # Prepare visit parameters from target configuration
                     visit_params = {
@@ -155,8 +217,14 @@ def schedule_yandex_visits():
                     random.shuffle(available_profiles)
                     
                     for i in range(concurrent_visits):
-                        # Select profile from available (not yet visited) profiles
-                        profile = available_profiles[i % len(available_profiles)]
+                        # Select profile from available (not yet visited, not used this round)
+                        if i >= len(available_profiles):
+                            logger.warning(f"⚠️ Not enough unique profiles for {target.title}, stopping at {i} visits")
+                            break
+                        profile = available_profiles[i]
+                        
+                        # Mark this profile as used so no other target picks it
+                        used_profile_ids_this_round.add(profile.id)
                         
                         # Spread visits across the entire 5-minute window (0-280s)
                         # so they don't all start at once — looks more natural
@@ -305,7 +373,10 @@ def daily_stats_reset():
     """
     Reset daily visit statistics for all targets.
     Runs at midnight UTC via celery beat.
-    Also resets profile_target_visits so profiles can visit targets again.
+    NOTE: profile_target_visits are NOT cleared — they are needed by
+          cleanup_used_profiles to identify worked profiles.
+          Profiles that visited a target will not be re-assigned to
+          that same target (this is the intended behavior).
     """
     logger.info("🔄 Starting daily stats reset for Yandex targets")
     
@@ -320,21 +391,16 @@ def daily_stats_reset():
                 target.today_failed = 0
                 target.stats_reset_date = current_time
             
-            # Reset profile-target visits so all profiles can visit again
-            from app.models.profile_target_visit import ProfileTargetVisit as PTV
-            deleted = db.query(PTV).delete()
-            
             db.commit()
             
             logger.info(
-                f"✅ Daily reset done: {len(targets)} targets zeroed, "
-                f"{deleted} profile-visit records cleared"
+                f"✅ Daily reset done: {len(targets)} targets zeroed "
+                f"(profile visit history preserved for cleanup)"
             )
             
             return {
                 'status': 'success',
                 'targets_reset': len(targets),
-                'visit_records_cleared': deleted,
                 'timestamp': current_time.isoformat()
             }
     except Exception as e:
@@ -348,7 +414,11 @@ def daily_stats_reset():
 @shared_task(name='tasks.yandex_maps.cleanup_used_profiles')
 def cleanup_used_profiles():
     """
-    Удаляет профили, которые посетили ВСЕ активные цели.
+    Удаляет отработанные профили.
+    Профиль считается отработанным если:
+      1) Посетил ВСЕ активные цели Яндекс Карт (fully used), ИЛИ
+      2) Посетил ВСЕ активные цели Яндекс Поиска (fully used for search), ИЛИ
+      3) Имеет визиты (карты или поиск), последний визит > STALE_HOURS назад.
     Удаляет: запись из БД (browser_profiles) + папку с диска.
     Запускается каждые 30 минут через celery beat.
     """
@@ -357,57 +427,152 @@ def cleanup_used_profiles():
     from sqlalchemy import func
     from app.config import settings
 
-    logger.info("🧹 Starting cleanup of fully-used profiles...")
+    STALE_HOURS = 24  # профиль с визитами, последний визит > N часов назад → удалить
+
+    logger.info("🧹 Starting cleanup of used profiles...")
 
     try:
         with get_db_session() as db:
-            # Count active targets
+            profiles_to_delete = []
+            already_ids = set()
+
+            # ── 1. Fully-used profiles for Maps (visited ALL active map targets) ──
             active_targets = db.query(YandexMapTarget).filter(
                 YandexMapTarget.is_active == True
             ).all()
             active_target_ids = [t.id for t in active_targets]
-            num_targets = len(active_target_ids)
+            num_map_targets = len(active_target_ids)
 
-            if num_targets == 0:
-                logger.info("No active targets — nothing to clean up")
-                return {'status': 'skipped', 'reason': 'no_active_targets'}
+            if num_map_targets > 0:
+                fully_used_subq = (
+                    db.query(ProfileTargetVisit.profile_id)
+                    .filter(ProfileTargetVisit.target_id.in_(active_target_ids))
+                    .group_by(ProfileTargetVisit.profile_id)
+                    .having(func.count(func.distinct(ProfileTargetVisit.target_id)) >= num_map_targets)
+                    .subquery()
+                )
 
-            # Find profiles that visited ALL active targets
-            fully_used_subq = (
-                db.query(ProfileTargetVisit.profile_id)
-                .filter(ProfileTargetVisit.target_id.in_(active_target_ids))
+                fully_used = (
+                    db.query(BrowserProfile)
+                    .filter(BrowserProfile.id.in_(db.query(fully_used_subq.c.profile_id)))
+                    .all()
+                )
+                for p in fully_used:
+                    profiles_to_delete.append((p, 'fully_used_maps'))
+                    already_ids.add(p.id)
+
+                logger.info(f"Found {len(fully_used)} fully-used maps profiles (visited all {num_map_targets} targets)")
+
+            # ── 2. Fully-used profiles for Search (visited ALL active search targets) ──
+            active_search_targets = db.query(YandexSearchTarget).filter(
+                YandexSearchTarget.is_active == True
+            ).all()
+            active_search_ids = [t.id for t in active_search_targets]
+            num_search_targets = len(active_search_ids)
+
+            if num_search_targets > 0:
+                fully_used_search_subq = (
+                    db.query(ProfileSearchVisit.profile_id)
+                    .filter(ProfileSearchVisit.search_target_id.in_(active_search_ids))
+                    .group_by(ProfileSearchVisit.profile_id)
+                    .having(func.count(func.distinct(ProfileSearchVisit.search_target_id)) >= num_search_targets)
+                    .subquery()
+                )
+
+                fully_used_search = (
+                    db.query(BrowserProfile)
+                    .filter(BrowserProfile.id.in_(db.query(fully_used_search_subq.c.profile_id)))
+                    .all()
+                )
+                for p in fully_used_search:
+                    if p.id not in already_ids:
+                        profiles_to_delete.append((p, 'fully_used_search'))
+                        already_ids.add(p.id)
+
+                logger.info(f"Found {len(fully_used_search)} fully-used search profiles (visited all {num_search_targets} search targets)")
+
+            # ── 3. Stale profiles: have completed visits (maps OR search), last visit > STALE_HOURS ago ──
+            stale_cutoff = datetime.utcnow() - timedelta(hours=STALE_HOURS)
+
+            # Stale map profiles
+            stale_map_subq = (
+                db.query(
+                    ProfileTargetVisit.profile_id,
+                    func.max(ProfileTargetVisit.visited_at).label('last_visit')
+                )
+                .filter(ProfileTargetVisit.status == "completed")
                 .group_by(ProfileTargetVisit.profile_id)
-                .having(func.count(func.distinct(ProfileTargetVisit.target_id)) >= num_targets)
+                .having(func.max(ProfileTargetVisit.visited_at) < stale_cutoff)
                 .subquery()
             )
 
-            fully_used_profiles = (
-                db.query(BrowserProfile)
-                .filter(BrowserProfile.id.in_(db.query(fully_used_subq.c.profile_id)))
-                .all()
+            stale_map_ids = {r[0] for r in db.query(stale_map_subq.c.profile_id).all()}
+
+            # Stale search profiles
+            stale_search_subq = (
+                db.query(
+                    ProfileSearchVisit.profile_id,
+                    func.max(ProfileSearchVisit.visited_at).label('last_visit')
+                )
+                .filter(ProfileSearchVisit.status == "completed")
+                .group_by(ProfileSearchVisit.profile_id)
+                .having(func.max(ProfileSearchVisit.visited_at) < stale_cutoff)
+                .subquery()
             )
 
-            if not fully_used_profiles:
-                logger.info(f"✅ No fully-used profiles to clean (targets: {num_targets})")
+            stale_search_ids = {r[0] for r in db.query(stale_search_subq.c.profile_id).all()}
+
+            stale_all_ids = stale_map_ids | stale_search_ids
+
+            if stale_all_ids:
+                stale_profiles = (
+                    db.query(BrowserProfile)
+                    .filter(
+                        BrowserProfile.id.in_(stale_all_ids),
+                        BrowserProfile.status.notin_(['warming_up']),
+                    )
+                    .all()
+                )
+
+                for p in stale_profiles:
+                    if p.id not in already_ids:
+                        profiles_to_delete.append((p, 'stale'))
+                        already_ids.add(p.id)
+
+                logger.info(
+                    f"Found {len(stale_profiles)} stale profiles "
+                    f"(have visits, last visit > {STALE_HOURS}h ago)"
+                )
+            else:
+                logger.info(f"Found 0 stale profiles")
+
+            if not profiles_to_delete:
+                logger.info(f"✅ No profiles to clean up")
                 return {
                     'status': 'success',
                     'deleted_profiles': 0,
                     'deleted_dirs': 0,
-                    'active_targets': num_targets
+                    'active_map_targets': num_map_targets,
+                    'active_search_targets': num_search_targets
                 }
 
             deleted_profiles = 0
             deleted_dirs = 0
             errors = []
 
-            for profile in fully_used_profiles:
+            for profile, reason in profiles_to_delete:
                 profile_name = profile.name
                 profile_id = profile.id
 
                 try:
-                    # 1) Delete profile_target_visits records
+                    # 1) Delete profile_target_visits records (maps)
                     db.query(ProfileTargetVisit).filter(
                         ProfileTargetVisit.profile_id == profile_id
+                    ).delete(synchronize_session=False)
+
+                    # 1b) Delete profile_search_visits records (search)
+                    db.query(ProfileSearchVisit).filter(
+                        ProfileSearchVisit.profile_id == profile_id
                     ).delete(synchronize_session=False)
 
                     # 2) Nullify profile_id in tasks table (preserve task history)
@@ -424,9 +589,9 @@ def cleanup_used_profiles():
                     if os.path.exists(profile_dir):
                         shutil.rmtree(profile_dir, ignore_errors=True)
                         deleted_dirs += 1
-                        logger.info(f"🗑️ Deleted profile {profile_name} (id={profile_id}) + disk folder")
+                        logger.info(f"🗑️ Deleted profile {profile_name} (id={profile_id}) [{reason}] + disk folder")
                     else:
-                        logger.info(f"🗑️ Deleted profile {profile_name} (id={profile_id}), no folder on disk")
+                        logger.info(f"🗑️ Deleted profile {profile_name} (id={profile_id}) [{reason}], no folder on disk")
 
                 except Exception as e:
                     errors.append(f"{profile_name}: {e}")
@@ -443,11 +608,107 @@ def cleanup_used_profiles():
                 'status': 'success',
                 'deleted_profiles': deleted_profiles,
                 'deleted_dirs': deleted_dirs,
-                'active_targets': num_targets,
+                'active_map_targets': num_map_targets,
+                'active_search_targets': num_search_targets,
                 'errors': errors if errors else None
             }
             return result
 
     except Exception as e:
         logger.error(f"❌ Cleanup error: {e}", exc_info=True)
+        return {'status': 'error', 'error': str(e)}
+
+
+@shared_task(name='tasks.yandex_scheduler.queue_watchdog')
+def queue_watchdog():
+    """Watchdog that monitors Redis queues and DB task states.
+    
+    Prevents queue overflow by:
+    1. Purging Redis queue if it exceeds the threshold
+    2. Cleaning up orphaned pending/in_progress tasks in DB
+    3. Logging queue health for monitoring
+    
+    Runs every 3 minutes via celery beat.
+    """
+    import redis as _redis
+    from app.config import settings as _s
+
+    QUEUE_MAX = 30  # Max tasks in Redis queue before purge
+    PENDING_MAX_MINUTES = 15  # Max age for pending tasks
+    IN_PROGRESS_MAX_MINUTES = 10  # Max age for in_progress tasks
+
+    results = {}
+
+    try:
+        r = _redis.Redis(host=_s.redis_host, port=_s.redis_port)
+
+        # --- 1. Check all queues ---
+        queues_to_watch = ['yandex_maps', 'yandex_search', 'default', 'warmup']
+        for queue_name in queues_to_watch:
+            qlen = r.llen(queue_name) or 0
+            results[f'queue_{queue_name}'] = qlen
+
+            if qlen > QUEUE_MAX:
+                logger.warning(
+                    f"🚨 Queue '{queue_name}' overflow: {qlen} tasks (max {QUEUE_MAX}). Purging..."
+                )
+                r.delete(queue_name)
+                results[f'purged_{queue_name}'] = qlen
+                logger.info(f"✅ Purged queue '{queue_name}': {qlen} → 0")
+
+        # --- 2. Clean up stale DB tasks for ALL task types ---
+        with get_db_session() as db:
+            now = datetime.utcnow()
+            total_fixed = 0
+
+            for task_type in ['yandex_visit', 'yandex_search', 'warmup']:
+                # Stale in_progress
+                stale_ip = db.query(Task).filter(
+                    Task.task_type == task_type,
+                    Task.status == 'in_progress',
+                    Task.started_at.isnot(None),
+                    Task.started_at < (now - timedelta(minutes=IN_PROGRESS_MAX_MINUTES))
+                ).all()
+
+                for t in stale_ip:
+                    t.status = 'failed'
+                    t.error_message = t.error_message or f'Watchdog: зависла в in_progress (>{IN_PROGRESS_MAX_MINUTES} мин)'
+                    t.completed_at = now
+                    t.add_log(f'🐕 Watchdog: задача зависла в in_progress')
+                    total_fixed += 1
+
+                # Stale pending
+                stale_pending = db.query(Task).filter(
+                    Task.task_type == task_type,
+                    Task.status == 'pending',
+                    Task.created_at < (now - timedelta(minutes=PENDING_MAX_MINUTES))
+                ).all()
+
+                for t in stale_pending:
+                    t.status = 'failed'
+                    t.error_message = f'Watchdog: не запустилась (>{PENDING_MAX_MINUTES} мин)'
+                    t.completed_at = now
+                    t.add_log(f'🐕 Watchdog: задача зависла в pending')
+                    total_fixed += 1
+
+                if stale_ip or stale_pending:
+                    results[f'cleaned_{task_type}'] = {
+                        'in_progress': len(stale_ip),
+                        'pending': len(stale_pending)
+                    }
+
+            if total_fixed:
+                db.commit()
+                logger.info(f"🐕 Watchdog cleaned up {total_fixed} stale tasks")
+
+            results['total_cleaned'] = total_fixed
+
+        # --- 3. Log health summary ---
+        queue_summary = ', '.join(f"{q}={results.get(f'queue_{q}', '?')}" for q in queues_to_watch)
+        logger.info(f"🐕 Watchdog OK | Queues: {queue_summary} | Cleaned: {results.get('total_cleaned', 0)}")
+
+        return results
+
+    except Exception as e:
+        logger.error(f"🐕 Watchdog error: {e}", exc_info=True)
         return {'status': 'error', 'error': str(e)}

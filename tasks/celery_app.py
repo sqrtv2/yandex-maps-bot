@@ -38,7 +38,7 @@ celery_app.conf.update(
 
     # Worker settings
     worker_prefetch_multiplier=1,
-    task_acks_late=True,
+    task_acks_late=False,
     worker_max_tasks_per_child=1000,
 
     # Task settings
@@ -96,7 +96,7 @@ celery_app.conf.update(
         },
         'periodic-rewarmup': {
             'task': 'tasks.warmup.periodic_rewarmup',
-            'schedule': crontab(minute=0, hour='*'),
+            'schedule': crontab(minute='*/15'),
         },
         'yandex-search-scheduler': {
             'task': 'tasks.yandex_search.schedule_search_visits',
@@ -105,6 +105,14 @@ celery_app.conf.update(
         'yandex-search-daily-stats-reset': {
             'task': 'tasks.yandex_search.daily_search_stats_reset',
             'schedule': crontab(minute=0, hour=0),
+        },
+        'queue-watchdog': {
+            'task': 'tasks.yandex_scheduler.queue_watchdog',
+            'schedule': crontab(minute='*/3'),
+        },
+        'auto-initial-warmup': {
+            'task': 'tasks.warmup.auto_schedule_initial_warmup',
+            'schedule': crontab(minute='*/5'),
         },
     }
 )
@@ -132,6 +140,102 @@ def _pre_patch_chromedriver_on_worker_init(**kwargs):
         logger.info(f"🔧 Chromedriver pre-patched at worker init: {path}")
     except Exception as e:
         logger.warning(f"⚠️ Failed to pre-patch chromedriver at worker init: {e}")
+
+
+# Reap zombie Chrome processes periodically and on worker shutdown.
+# Chrome spawns many sub-processes; if the parent dies (e.g. Celery SIGKILL
+# from time_limit), children become orphans and eventually zombies.
+def _reap_zombie_chrome():
+    """Kill orphaned Chrome/chromedriver processes and reap zombies."""
+    import subprocess, os
+    killed = 0
+    try:
+        # Reap any zombie children of this process
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+                killed += 1
+            except ChildProcessError:
+                break
+    except Exception:
+        pass
+
+    try:
+        from core.browser_manager import cleanup_orphaned_chrome
+        killed += cleanup_orphaned_chrome()
+    except Exception:
+        pass
+
+    if killed:
+        logger.info(f"🧹 Reaped {killed} zombie/orphaned Chrome processes")
+    return killed
+
+
+@signals.worker_process_init.connect
+def _reseed_random_on_fork(**kwargs):
+    """Re-seed random module after fork to avoid all workers sharing the same sequence."""
+    import random
+    import os
+    random.seed(os.urandom(32))
+    logger.info("🎲 Random re-seeded in forked worker (pid=%d)", os.getpid())
+
+
+@signals.worker_shutdown.connect
+def _cleanup_chrome_on_worker_shutdown(**kwargs):
+    """Kill all Chrome processes when Celery worker shuts down."""
+    logger.info("🛑 Worker shutting down — cleaning up Chrome processes...")
+    _reap_zombie_chrome()
+
+
+@signals.task_postrun.connect
+def _reap_zombies_after_task(**kwargs):
+    """Reap zombie children after every task completes."""
+    import os
+    try:
+        while True:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                break
+    except ChildProcessError:
+        pass
+    except Exception:
+        pass
+
+
+@signals.task_failure.connect
+def _cleanup_chrome_after_task_failure(**kwargs):
+    """Clean up stale Chrome processes after a task fails.
+    
+    When uc.Chrome() fails with 'session not created', Chrome/chromedriver
+    processes leak because browser_id is never returned. This targeted
+    cleanup kills Chrome processes that have been running longer than the
+    task time limit, which are certainly orphans.
+    """
+    import os, subprocess
+    try:
+        # Kill chromedriver processes that have no parent (orphaned)
+        # Use ps to find chrome processes older than 5 minutes
+        result = subprocess.run(
+            ['sh', '-c',
+             "ps -eo pid,etimes,comm | grep -E 'chrome|chromedriver' | awk '$2 > 300 {print $1}'"],
+            capture_output=True, text=True, timeout=5
+        )
+        stale_pids = result.stdout.strip().split('\n')
+        killed = 0
+        for pid_str in stale_pids:
+            pid_str = pid_str.strip()
+            if pid_str and pid_str.isdigit():
+                try:
+                    os.kill(int(pid_str), 9)
+                    killed += 1
+                except (ProcessLookupError, PermissionError):
+                    pass
+        if killed:
+            logger.info(f"🧹 Killed {killed} stale Chrome processes (>5min old) after task failure")
+    except Exception:
+        pass
 
 
 # Task failure callback
@@ -165,7 +269,13 @@ class BaseTask(celery_app.Task):
 
     def on_success(self, retval, task_id, args, kwargs):
         """Called when task succeeds."""
-        logger.info(f"Task {task_id} completed successfully")
+        # Check if the task returned an error status (caught exception, returned dict with status='error')
+        is_logical_error = isinstance(retval, dict) and retval.get('status') in ('error', 'not_found')
+
+        if is_logical_error:
+            logger.info(f"Task {task_id} finished with logical error: {retval.get('error', retval.get('status', 'unknown'))[:120]}")
+        else:
+            logger.info(f"Task {task_id} completed successfully")
 
         # Update task status in database
         try:
@@ -175,9 +285,18 @@ class BaseTask(celery_app.Task):
             with get_db_session() as db:
                 task_obj = db.query(Task).filter(Task.celery_task_id == task_id).first()
                 if task_obj:
-                    result = retval if isinstance(retval, dict) else {"result": retval}
-                    task_obj.complete_successfully(result)
-                    db.commit()
+                    if is_logical_error:
+                        # Task caught its own error — keep the 'failed' status that was already set
+                        # by _update_search_task_log. Only update if still in_progress (safety net).
+                        if task_obj.status == 'in_progress':
+                            error_msg = str(retval.get('error', 'Unknown error'))[:500]
+                            task_obj.fail_with_error(error_msg)
+                            db.commit()
+                        # Otherwise don't overwrite — the task already set the correct status
+                    else:
+                        result = retval if isinstance(retval, dict) else {"result": retval}
+                        task_obj.complete_successfully(result)
+                        db.commit()
         except Exception as e:
             logger.error(f"Error updating task success status: {e}")
 
@@ -274,7 +393,7 @@ def task_prerun(sender=None, task_id=None, task=None, args=None, kwargs=None, **
         with get_db_session() as db:
             task_obj = db.query(Task).filter(Task.celery_task_id == task_id).first()
             if task_obj:
-                task_obj.start_execution(worker_id=sender, celery_task_id=task_id)
+                task_obj.start_execution(worker_id=str(sender), celery_task_id=task_id)
                 db.commit()
     except Exception as e:
         logger.error(f"Error updating task prerun status: {e}")

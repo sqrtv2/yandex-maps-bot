@@ -9,6 +9,8 @@ from .warmup_url import WarmupUrl
 from .yandex_target import YandexMapTarget
 from .yandex_search_target import YandexSearchTarget
 from .profile_target_visit import ProfileTargetVisit
+from .profile_search_visit import ProfileSearchVisit
+from .search_position_history import SearchPositionHistory
 
 __all__ = [
     "BrowserProfile",
@@ -21,5 +23,7 @@ __all__ = [
     "WarmupUrl",
     "YandexMapTarget",
     "YandexSearchTarget",
-    "ProfileTargetVisit"
+    "ProfileTargetVisit",
+    "ProfileSearchVisit",
+    "SearchPositionHistory"
 ]

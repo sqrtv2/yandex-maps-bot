@@ -42,6 +42,32 @@ _CHROMEDRIVER_LOCK_PATH = os.path.join(tempfile.gettempdir(), '.chromedriver_pat
 
 # Cache for the pre-patched chromedriver path
 _patched_chromedriver_path = None
+_chrome_version_main = None
+
+
+def _detect_chrome_version() -> int:
+    """Auto-detect installed Chrome major version."""
+    global _chrome_version_main
+    if _chrome_version_main:
+        return _chrome_version_main
+    try:
+        for binary in ['/opt/google/chrome/chrome', 'google-chrome', 'google-chrome-stable', 'chromium-browser', 'chromium']:
+            try:
+                result = subprocess.run([binary, '--version'], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    import re as _re
+                    match = _re.search(r'(\d+)\.', result.stdout)
+                    if match:
+                        _chrome_version_main = int(match.group(1))
+                        logger.info(f"🔍 Detected Chrome version: {_chrome_version_main}")
+                        return _chrome_version_main
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+    except Exception as e:
+        logger.warning(f"Could not detect Chrome version: {e}")
+    _chrome_version_main = 145  # fallback
+    logger.warning(f"⚠️ Using fallback Chrome version: {_chrome_version_main}")
+    return _chrome_version_main
 
 
 def _ensure_patched_chromedriver() -> str:
@@ -67,8 +93,9 @@ def _ensure_patched_chromedriver() -> str:
         if _patched_chromedriver_path and os.path.exists(_patched_chromedriver_path):
             return _patched_chromedriver_path
         
-        logger.info("🔧 Pre-patching chromedriver (one-time)...")
-        patcher = uc.Patcher(version_main=144)
+        chrome_ver = _detect_chrome_version()
+        logger.info(f"🔧 Pre-patching chromedriver for Chrome {chrome_ver} (one-time)...")
+        patcher = uc.Patcher(version_main=chrome_ver)
         patcher.auto()
         _patched_chromedriver_path = patcher.executable_path
         logger.info(f"✅ Chromedriver pre-patched: {_patched_chromedriver_path}")
@@ -269,7 +296,7 @@ class _LocalProxyForwarder:
                 sockets = [client, remote]
                 try:
                     while True:
-                        readable, _, err = select.select(sockets, [], sockets, 60)
+                        readable, _, err = select.select(sockets, [], sockets, 300)
                         if err or not readable:
                             break
                         for s in readable:
@@ -406,15 +433,82 @@ class BrowserManager:
         except Exception as e:
             logger.error(f"Error setting up driver: {e}")
 
+    @staticmethod
+    def repair_profile_dir(profile_dir: str):
+        """Repair a Chrome profile directory before launch.
+        
+        Fixes common corruption caused by Chrome being SIGKILL'd:
+        - Bloated Preferences file (can grow to GBs when Chrome is killed mid-write)
+        - Stale lock files preventing Chrome from starting
+        - Accumulated crash artifacts eating disk space
+        """
+        if not os.path.isdir(profile_dir):
+            return
+        
+        # 1. Fix bloated Preferences file (normal size is <1MB, corrupted can be GBs)
+        prefs_file = os.path.join(profile_dir, 'Default', 'Preferences')
+        if os.path.exists(prefs_file):
+            try:
+                size_mb = os.path.getsize(prefs_file) / (1024 * 1024)
+                if size_mb > 5:  # > 5MB is definitely corrupted
+                    logger.warning(f"🔧 Repairing bloated Preferences ({size_mb:.0f}MB): {prefs_file}")
+                    with open(prefs_file, 'w') as f:
+                        f.write('{}')
+            except Exception as e:
+                logger.warning(f"Could not check/repair Preferences: {e}")
+        
+        # 2. Remove stale lock files
+        for lock_file in ['SingletonLock', 'SingletonSocket', 'SingletonCookie']:
+            lock_path = os.path.join(profile_dir, lock_file)
+            if os.path.exists(lock_path) or os.path.islink(lock_path):
+                try:
+                    os.remove(lock_path)
+                    logger.warning(f"🗑️ Removed stale {lock_file} for {os.path.basename(profile_dir)}")
+                except OSError:
+                    pass
+        
+        # 3. Clean crash artifacts
+        for artifact in ['.com.google.Chrome.*']:
+            import glob
+            for f in glob.glob(os.path.join(profile_dir, artifact)):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+        
+        # 4. Clean caches if profile is too large (>500MB)
+        try:
+            total_size = sum(
+                os.path.getsize(os.path.join(dirpath, filename))
+                for dirpath, dirnames, filenames in os.walk(profile_dir)
+                for filename in filenames
+            ) / (1024 * 1024)  # MB
+            
+            if total_size > 500:
+                logger.warning(f"🧹 Profile too large ({total_size:.0f}MB), cleaning caches")
+                import shutil
+                for cache_dir in ['Cache', 'Code Cache', 'GPUCache']:
+                    cache_path = os.path.join(profile_dir, 'Default', cache_dir)
+                    if os.path.isdir(cache_path):
+                        shutil.rmtree(cache_path, ignore_errors=True)
+                        os.makedirs(cache_path, exist_ok=True)
+                for cache_dir in ['GrShaderCache', 'GraphiteDawnCache', 'ShaderCache']:
+                    cache_path = os.path.join(profile_dir, cache_dir)
+                    if os.path.isdir(cache_path):
+                        shutil.rmtree(cache_path, ignore_errors=True)
+                        os.makedirs(cache_path, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"Could not check/clean profile size: {e}")
+
     def create_browser_session(self, profile_data: Dict, proxy_data: Optional[Dict] = None) -> str:
         """Create a new browser session with specified profile."""
         local_proxy_forwarder = None
         try:
             browser_id = f"browser_{int(time.time())}_{random.randint(1000, 9999)}"
 
-            # Remove stale SingletonLock that prevents Chrome from starting
-            # This happens when Chrome was killed (e.g. by Celery time_limit) without quit()
+            # Repair profile directory (fix corrupted Preferences, stale locks, etc.)
             profile_dir = os.path.join(settings.browser_user_data_dir, profile_data["name"])
+            self.repair_profile_dir(profile_dir)
             singleton_lock = os.path.join(profile_dir, "SingletonLock")
             if os.path.exists(singleton_lock) or os.path.islink(singleton_lock):
                 try:
@@ -445,21 +539,44 @@ class BrowserManager:
             patched_driver = _ensure_patched_chromedriver()
             logger.info(f"Creating browser with pre-patched chromedriver: {patched_driver}")
 
-            if settings.debug:
-                driver = uc.Chrome(
-                    options=chrome_options,
-                    driver_executable_path=patched_driver,
-                    user_data_dir=profile_dir,
-                    service_args=["--verbose"],
-                    version_main=144
-                )
-            else:
-                driver = uc.Chrome(
-                    options=chrome_options,
-                    driver_executable_path=patched_driver,
-                    user_data_dir=profile_dir,
-                    version_main=144
-                )
+            chrome_ver = _detect_chrome_version()
+            try:
+                if settings.debug:
+                    driver = uc.Chrome(
+                        options=chrome_options,
+                        driver_executable_path=patched_driver,
+                        user_data_dir=profile_dir,
+                        service_args=["--verbose"],
+                        version_main=chrome_ver
+                    )
+                else:
+                    driver = uc.Chrome(
+                        options=chrome_options,
+                        driver_executable_path=patched_driver,
+                        user_data_dir=profile_dir,
+                        version_main=chrome_ver
+                    )
+            except Exception as chrome_exc:
+                # Chrome failed to start — clean up orphaned Chrome/chromedriver
+                # processes for this profile directory to prevent process leaks.
+                logger.warning(f"Chrome launch failed, cleaning up orphans for {profile_dir}: {chrome_exc}")
+                self._kill_chrome_by_profile_dir(profile_dir)
+                # Also kill any chromedriver that might still be running from this attempt
+                try:
+                    subprocess.run(
+                        ['pkill', '-9', '-f', f'chromedriver.*{os.path.basename(profile_dir)}'],
+                        capture_output=True, timeout=5
+                    )
+                except Exception:
+                    pass
+                # Remove stale SingletonLock left by the crashed Chrome
+                singleton_lock = os.path.join(profile_dir, "SingletonLock")
+                if os.path.exists(singleton_lock) or os.path.islink(singleton_lock):
+                    try:
+                        os.remove(singleton_lock)
+                    except OSError:
+                        pass
+                raise chrome_exc
             logger.info("✅ Browser created successfully")
 
             # Apply profile settings
@@ -567,6 +684,33 @@ class BrowserManager:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        # Chrome 111+: allow chromedriver WebSocket connection
+        options.add_argument("--remote-allow-origins=*")
+        # Prevent Chrome from closing window unexpectedly
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-background-timer-throttling")
+        options.add_argument("--disable-backgrounding-occluded-windows")
+        options.add_argument("--disable-renderer-backgrounding")
+        options.add_argument("--disable-hang-monitor")
+        # Memory optimization — prevent OOM kills in containers
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-software-rasterizer")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-component-extensions-with-background-pages")
+        options.add_argument("--js-flags=--max-old-space-size=256")
+        options.add_argument("--renderer-process-limit=1")
+        # Additional memory savings
+        options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins,site-per-process")
+        options.add_argument("--disable-site-isolation-trials")
+        options.add_argument("--disable-ipc-flooding-protection")
+        options.add_argument("--memory-pressure-off")
+        options.add_argument("--disable-canvas-aa")
+        options.add_argument("--disable-2d-canvas-clip-aa")
+        options.add_argument("--aggressive-cache-discard")
+        options.add_argument("--disable-application-cache")
+        options.add_argument("--media-cache-size=1")
+        options.add_argument("--disk-cache-size=1")
 
         # Prefs
         prefs = {
@@ -591,10 +735,19 @@ class BrowserManager:
     def _apply_profile_settings(self, driver: webdriver.Chrome, profile_data: Dict):
         """Apply JavaScript-based profile settings to browser."""
         try:
+            is_mobile = profile_data.get('is_mobile', False)
+            
             # Set viewport size
             viewport = profile_data.get("viewport", {})
             if viewport:
-                driver.set_window_size(viewport.get("width", 1366), viewport.get("height", 768))
+                if is_mobile:
+                    # For mobile: set a larger window so CDP emulation controls viewport
+                    driver.set_window_size(
+                        viewport.get("width", 412) + 100,
+                        viewport.get("height", 915) + 200
+                    )
+                else:
+                    driver.set_window_size(viewport.get("width", 1366), viewport.get("height", 768))
 
             # Inject fingerprinting scripts
             self._inject_fingerprint_scripts(driver, profile_data)
@@ -628,7 +781,100 @@ class BrowserManager:
                 except Exception as e:
                     logger.debug(f"Could not set Accept-Language via CDP: {e}")
 
-            logger.info(f"Applied profile settings for: {profile_data['name']}")
+                # === Mobile device emulation via CDP ===
+                if is_mobile and viewport:
+                    try:
+                        screen = profile_data.get('screen', {})
+                        device_scale = screen.get('pixel_ratio', 3)
+                        driver.execute_cdp_cmd('Emulation.setDeviceMetricsOverride', {
+                            'width': viewport.get('width', 412),
+                            'height': viewport.get('height', 915),
+                            'deviceScaleFactor': device_scale,
+                            'mobile': True,
+                            'screenWidth': screen.get('width', viewport.get('width', 412)),
+                            'screenHeight': screen.get('height', viewport.get('height', 915)),
+                            'screenOrientation': {
+                                'type': 'portraitPrimary',
+                                'angle': 0
+                            }
+                        })
+                        logger.info(f"📱 Mobile emulation set: {viewport.get('width')}x{viewport.get('height')} @{device_scale}x")
+                    except Exception as e:
+                        logger.warning(f"Could not set mobile device metrics via CDP: {e}")
+
+                    # Enable touch events for mobile
+                    try:
+                        driver.execute_cdp_cmd('Emulation.setTouchEmulationEnabled', {
+                            'enabled': True,
+                            'maxTouchPoints': profile_data.get('max_touch_points', 5)
+                        })
+                        logger.info("📱 Touch emulation enabled")
+                    except Exception as e:
+                        logger.debug(f"Could not enable touch emulation: {e}")
+
+                # Override userAgentData to match the user-agent string
+                # This prevents detection via navigator.userAgentData mismatch
+                try:
+                    import re
+                    ua_str = profile_data.get('user_agent', '')
+                    chrome_match = re.search(r'Chrome/(\d+)\.(\d+)\.(\d+)\.(\d+)', ua_str)
+                    if chrome_match:
+                        major_ver = chrome_match.group(1)
+                        full_ver = chrome_match.group(0).replace('Chrome/', '')
+                        
+                        if is_mobile:
+                            # Mobile Android platform
+                            ua_platform = 'Android'
+                            mobile_device = profile_data.get('mobile_device', {})
+                            platform_ver = mobile_device.get('android', '14') + '.0.0'
+                            model = mobile_device.get('model', '')
+                            architecture = ''
+                            bitness = ''
+                        else:
+                            # Determine platform from UA
+                            model = ''
+                            if 'Windows' in ua_str:
+                                ua_platform = 'Windows'
+                                platform_ver = '15.0.0' if 'Windows NT 10' in ua_str else '10.0.0'
+                            elif 'Macintosh' in ua_str or 'Mac OS X' in ua_str:
+                                ua_platform = 'macOS'
+                                platform_ver = '14.7.6'
+                            else:
+                                ua_platform = 'Linux'
+                                platform_ver = '6.5.0'
+                            architecture = 'x86' if 'x86' in ua_str or 'Win' in ua_str else 'arm'
+                            bitness = '64'
+                        
+                        driver.execute_cdp_cmd('Emulation.setUserAgentOverride', {
+                            'userAgent': ua_str,
+                            'platform': profile_data.get('platform', 'Linux armv81' if is_mobile else 'Win32'),
+                            'userAgentMetadata': {
+                                'brands': [
+                                    {'brand': 'Chromium', 'version': major_ver},
+                                    {'brand': 'Google Chrome', 'version': major_ver},
+                                    {'brand': 'Not-A.Brand', 'version': '99'}
+                                ],
+                                'fullVersionList': [
+                                    {'brand': 'Chromium', 'version': full_ver},
+                                    {'brand': 'Google Chrome', 'version': full_ver},
+                                    {'brand': 'Not-A.Brand', 'version': '99.0.0.0'}
+                                ],
+                                'fullVersion': full_ver,
+                                'platform': ua_platform,
+                                'platformVersion': platform_ver,
+                                'architecture': architecture if is_mobile else ('x86' if 'x86' in ua_str or 'Win' in ua_str else 'arm'),
+                                'model': model,
+                                'mobile': is_mobile,
+                                'bitness': bitness if is_mobile else '64',
+                                'wow64': False
+                            }
+                        })
+                        device_label = f"📱 {model}" if is_mobile else f"🖥️ {ua_platform}"
+                        logger.info(f"🛡️ userAgentData override set: Chrome/{major_ver} {device_label}")
+                except Exception as e:
+                    logger.warning(f"Could not override userAgentData: {e}")
+
+            logger.info(f"Applied profile settings for: {profile_data['name']} ({'mobile' if is_mobile else 'desktop'})")
 
         except Exception as e:
             logger.error(f"Error applying profile settings: {e}")
@@ -644,6 +890,7 @@ class BrowserManager:
             hw_concurrency = profile_data.get('hardware_concurrency', 4)
             dev_memory = profile_data.get('device_memory', 8)
             platform = profile_data.get("platform", "Win32")
+            max_touch = profile_data.get('max_touch_points', 0)
             webgl_vendor = webgl_data.get("vendor", "Google Inc. (NVIDIA)")
             webgl_renderer = webgl_data.get("renderer", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB Direct3D11 vs_5_0 ps_5_0, D3D11)")
 
@@ -669,7 +916,7 @@ class BrowserManager:
                 platform: '{platform}',
                 language: 'ru-RU',
                 languages: Object.freeze(['ru-RU', 'ru', 'en-US', 'en']),
-                maxTouchPoints: 0
+                maxTouchPoints: {max_touch}
             }};
 
             for (const [prop, value] of Object.entries(navigatorOverrides)) {{

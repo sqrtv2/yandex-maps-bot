@@ -21,6 +21,7 @@ class BrowserProfile(Base):
     timezone = Column(String(100), default="Europe/Moscow")
     language = Column(String(50), default="ru-RU")
     platform = Column(String(50), default="Win32")
+    is_mobile = Column(Boolean, default=False, index=True)  # True for Android mobile profiles
 
     # Fingerprinting Data
     canvas_fingerprint = Column(Text, nullable=True)
@@ -94,6 +95,7 @@ class BrowserProfile(Base):
             'timezone': self.timezone,
             'language': self.language,
             'platform': self.platform,
+            'is_mobile': self.is_mobile or False,
             'status': self.status,
             'is_active': self.is_active,
             'warmup_completed': self.warmup_completed,

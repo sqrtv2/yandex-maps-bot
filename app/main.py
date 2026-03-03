@@ -129,7 +129,7 @@ def _start_celery_worker():
             "-A", "tasks.celery_app.celery_app",
             "worker",
             "--loglevel=info",
-            "--concurrency=3",
+            "--concurrency=1",
             "--queues=default,warmup,yandex_maps,yandex_search,proxy,maintenance",
             f"--logfile={os.path.join(log_dir, 'celery.log')}",
             f"--pidfile={os.path.join(log_dir, 'celery.pid')}",
@@ -217,16 +217,19 @@ async def lifespan(app: FastAPI):
     if not redis_ok:
         logger.error("❌ Redis is required but could not be started!")
 
-    # 2. Celery Worker
-    if redis_ok:
-        _start_celery_worker()
+    # 2. Celery Worker — DISABLED: dedicated Celery containers handle task processing.
+    # Running a Celery worker inside the app container caused 20K+ zombie Chrome processes
+    # because the app container lacked init:true and Chrome children were never reaped.
+    # if redis_ok:
+    #     _start_celery_worker()
 
-    # 3. Celery Beat
-    if redis_ok:
-        _start_celery_beat()
+    # 3. Celery Beat — DISABLED to prevent auto-scheduling tasks
+    # Enable manually when needed: python3 -m celery -A tasks.celery_app.celery_app beat
+    # if redis_ok:
+    #     _start_celery_beat()
 
     if redis_ok:
-        logger.info("✅ All background services started successfully!")
+        logger.info("✅ Background services started (Beat disabled — manual mode)")
     else:
         logger.warning("⚠️  Server started but background services are unavailable (no Redis)")
 
@@ -1250,6 +1253,57 @@ async def create_proxy(proxy_data: Dict[str, Any], db: Session = Depends(get_db)
         logger.error(f"Error creating proxy: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail="Failed to create proxy")
+
+
+@app.post("/api/proxies/{proxy_id}/toggle")
+async def toggle_proxy(proxy_id: int, data: Dict[str, Any], db: Session = Depends(get_db)):
+    """Enable or disable a proxy server."""
+    try:
+        proxy = db.query(ProxyServer).filter(ProxyServer.id == proxy_id).first()
+        if not proxy:
+            raise HTTPException(status_code=404, detail="Proxy not found")
+
+        is_active = data.get("is_active", not proxy.is_active)
+        proxy.is_active = is_active
+
+        if not is_active:
+            proxy.status = "disabled"
+        else:
+            proxy.status = "working" if proxy.is_working else "unchecked"
+
+        db.commit()
+        db.refresh(proxy)
+
+        status_str = "enabled" if is_active else "disabled"
+        await manager.broadcast(f"Proxy {proxy.name} {status_str}")
+        return {"success": True, "proxy": proxy.to_dict()}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error toggling proxy {proxy_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to toggle proxy")
+
+
+@app.delete("/api/proxies/{proxy_id}")
+async def delete_proxy(proxy_id: int, db: Session = Depends(get_db)):
+    """Delete a proxy server."""
+    try:
+        proxy = db.query(ProxyServer).filter(ProxyServer.id == proxy_id).first()
+        if not proxy:
+            raise HTTPException(status_code=404, detail="Proxy not found")
+
+        db.delete(proxy)
+        db.commit()
+        return {"success": True, "message": f"Proxy {proxy_id} deleted"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting proxy {proxy_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to delete proxy")
 
 
 # Tasks API

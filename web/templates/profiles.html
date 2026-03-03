@@ -439,15 +439,15 @@ let currentFilters = {};
 document.addEventListener('DOMContentLoaded', function() {
     loadProfiles();
 
-    // Auto-refresh every 15 seconds for large-scale systems
-    setInterval(loadProfiles, 15000);
+    // Auto-refresh every 60 seconds
+    setInterval(loadProfiles, 60000);
 
-    // Update overall progress every 5 seconds
-    setInterval(updateOverallProgress, 5000);
+    // Update overall progress every 60 seconds
+    setInterval(updateOverallProgress, 60000);
 
-    // Process monitor: check every 20 seconds
+    // Process monitor: check every 2 minutes
     updateProcessMonitor();
-    setInterval(updateProcessMonitor, 20000);
+    setInterval(updateProcessMonitor, 120000);
 
     // Add event listeners for real-time filtering
     document.getElementById('searchProfiles').addEventListener('input', debounce(applyFilters, 500));

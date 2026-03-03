@@ -74,6 +74,7 @@ def create_tables():
             ProfileTargetVisit
         )
         from .models.yandex_search_target import YandexSearchTarget
+        from .models.search_position_history import SearchPositionHistory
 
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables created successfully")

@@ -2,6 +2,7 @@ services:
   # Main application
   app:
     build: .
+    init: true
     container_name: yandex_maps_app
     expose:
       - "8000"
@@ -42,8 +43,13 @@ services:
   celery_warmup:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5 -Q default,warmup,proxy,maintenance -n warmup@%h
-    shm_size: '2gb'
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=15 -Q default,warmup,proxy,maintenance -n warmup@%h --max-memory-per-child=1500000
+    shm_size: '4gb'
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d warmup@$$HOSTNAME --timeout=10 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
     environment:
       - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
       - YANDEX_BOT_REDIS_HOST=redis
@@ -71,7 +77,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 12G
+          memory: 32G
           cpus: '8'
     networks:
       - yandex_maps_network
@@ -80,8 +86,13 @@ services:
   celery_yandex_maps:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=3 -Q yandex_maps -n yandex_maps@%h
-    shm_size: '2gb'
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=2 -Q yandex_maps -n yandex_maps@%h --max-memory-per-child=4000000
+    shm_size: '4gb'
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d yandex_maps@$$HOSTNAME --timeout=10 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
     environment:
       - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
       - YANDEX_BOT_REDIS_HOST=redis
@@ -110,7 +121,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 8G
+          memory: 16G
           cpus: '4'
     networks:
       - yandex_maps_network
@@ -119,8 +130,13 @@ services:
   celery_yandex_search:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=3 -Q yandex_search -n yandex_search@%h
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=3 -Q yandex_search -n yandex_search@%h --max-memory-per-child=4000000
     shm_size: '2gb'
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d yandex_search@$$HOSTNAME --timeout=10 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
     environment:
       - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
       - YANDEX_BOT_REDIS_HOST=redis
@@ -149,7 +165,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 8G
+          memory: 16G
           cpus: '4'
     networks:
       - yandex_maps_network
@@ -159,6 +175,11 @@ services:
     build: .
     container_name: yandex_maps_beat
     command: celery -A tasks.celery_app beat --loglevel=info
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'celery.*beat' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     environment:
       - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
       - YANDEX_BOT_REDIS_HOST=redis

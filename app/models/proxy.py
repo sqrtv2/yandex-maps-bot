@@ -105,14 +105,16 @@ class ProxyServer(Base):
 
     def update_success(self, response_time_ms: float = None):
         """Update statistics after successful request."""
-        self.total_requests += 1
-        self.successful_requests += 1
-        self.times_used += 1
+        self.total_requests = (self.total_requests or 0) + 1
+        self.successful_requests = (self.successful_requests or 0) + 1
+        self.times_used = (self.times_used or 0) + 1
         self.consecutive_failures = 0
         self.last_used_at = datetime.utcnow()
         self.last_success_at = datetime.utcnow()
         self.last_check_at = datetime.utcnow()
-        self.status = "working"
+        # Don't override status if proxy is manually disabled
+        if self.is_active:
+            self.status = "working"
         self.is_working = True
 
         if response_time_ms is not None:
@@ -126,9 +128,9 @@ class ProxyServer(Base):
 
     def update_failure(self, error_message: str = None):
         """Update statistics after failed request. Proxy always stays working."""
-        self.total_requests += 1
-        self.failed_requests += 1
-        self.consecutive_failures += 1
+        self.total_requests = (self.total_requests or 0) + 1
+        self.failed_requests = (self.failed_requests or 0) + 1
+        self.consecutive_failures = (self.consecutive_failures or 0) + 1
         self.last_failure_at = datetime.utcnow()
         self.last_check_at = datetime.utcnow()
 
@@ -137,14 +139,18 @@ class ProxyServer(Base):
 
         # Never ban or disable — proxy always stays available
         self.is_working = True
-        self.status = "working"
+        # Don't override status if proxy is manually disabled
+        if self.is_active:
+            self.status = "working"
 
         self._update_success_rate()
 
     def _update_success_rate(self):
         """Update success rate percentage."""
-        if self.total_requests > 0:
-            self.success_rate = (self.successful_requests / self.total_requests) * 100
+        total = self.total_requests or 0
+        successful = self.successful_requests or 0
+        if total > 0:
+            self.success_rate = (successful / total) * 100
         else:
             self.success_rate = 0.0
 

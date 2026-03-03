@@ -1,0 +1,1056 @@
+{% extends "base.html" %}
+
+{% block title %}Аналитика позиций — Яндекс Поиск{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2"><i class="bi bi-graph-up-arrow"></i> Аналитика позиций</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <button class="btn btn-outline-secondary me-2" onclick="refreshAll()">
+            <i class="bi bi-arrow-clockwise"></i> Обновить
+        </button>
+    </div>
+</div>
+
+<!-- Target Selector + Period -->
+<div class="card shadow-sm mb-4">
+    <div class="card-body py-3">
+        <div class="row align-items-end">
+            <div class="col-md-5">
+                <label class="form-label fw-bold mb-1">Цель (домен)</label>
+                <select class="form-select" id="targetSelect" onchange="onTargetChange()">
+                    <option value="">— Загрузка... —</option>
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-bold mb-1">Период</label>
+                <div class="btn-group w-100" id="periodSelector">
+                    <button class="btn btn-outline-primary" onclick="setPeriod(7)">7 дн</button>
+                    <button class="btn btn-outline-primary active" onclick="setPeriod(14)">14 дн</button>
+                    <button class="btn btn-outline-primary" onclick="setPeriod(30)">30 дн</button>
+                    <button class="btn btn-outline-primary" onclick="setPeriod(90)">90 дн</button>
+                </div>
+            </div>
+            <div class="col-md-4 text-end">
+                <button class="btn btn-info" onclick="loadStrategy()">
+                    <i class="bi bi-lightbulb"></i> Стратегия продвижения
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Summary Cards -->
+<div class="row mb-4" id="summaryRow">
+    <div class="col-md-2">
+        <div class="card border-primary shadow-sm h-100">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Ср. позиция</small>
+                <h3 class="mb-0 text-primary" id="summaryAvgPos">—</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card border-success shadow-sm h-100">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Найдено</small>
+                <h3 class="mb-0 text-success" id="summaryFoundRate">—</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card border-info shadow-sm h-100">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Проверок</small>
+                <h3 class="mb-0 text-info" id="summaryChecks">0</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card shadow-sm h-100" id="summaryTrendCard">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Тренд</small>
+                <h3 class="mb-0" id="summaryTrend">—</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card border-warning shadow-sm h-100">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Ключей</small>
+                <h3 class="mb-0 text-warning" id="summaryKeywords">0</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card border-danger shadow-sm h-100">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Не найдено</small>
+                <h3 class="mb-0 text-danger" id="summaryNotFound">0</h3>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- TOP Distribution Chart -->
+<div class="card shadow-sm mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-bar-chart-line"></i> Динамика позиций по дням</h5>
+        <div class="d-flex align-items-center gap-3">
+            <div class="btn-group btn-group-sm" id="chartModeSelector">
+                <button class="btn btn-outline-primary active" onclick="setChartMode('top')" id="chartModeTop">TOP распределение</button>
+                <button class="btn btn-outline-primary" onclick="setChartMode('keywords')" id="chartModeKw">По ключам</button>
+            </div>
+            <div class="form-check form-switch" id="showAllKeywordsWrap" style="display:none;">
+                <input class="form-check-input" type="checkbox" id="showAllKeywords" checked onchange="renderChart()">
+                <label class="form-check-label" for="showAllKeywords">Все ключи</label>
+            </div>
+        </div>
+    </div>
+    <div class="card-body">
+        <div style="position: relative; height: 400px;">
+            <canvas id="positionChart"></canvas>
+        </div>
+    </div>
+</div>
+
+<!-- Not Found Keywords Management -->
+<div class="card shadow-sm mb-4 border-danger" id="notFoundCard" style="display:none;">
+    <div class="card-header bg-danger text-white d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-exclamation-triangle"></i> Ключевые слова не найдены в выдаче</h5>
+        <div class="d-flex align-items-center gap-2">
+            <select class="form-select form-select-sm" style="width: 140px; background: rgba(255,255,255,0.9);" id="notFoundDays" onchange="loadNotFoundKeywords()">
+                <option value="1" selected>За вчера</option>
+                <option value="3">За 3 дня</option>
+                <option value="7">За 7 дней</option>
+                <option value="14">За 14 дней</option>
+                <option value="30">За 30 дней</option>
+            </select>
+            <button class="btn btn-sm btn-outline-light" onclick="loadNotFoundKeywords()">
+                <i class="bi bi-arrow-clockwise"></i>
+            </button>
+        </div>
+    </div>
+    <div class="card-body">
+        <div id="notFoundContent">
+            <div class="text-center text-muted py-3">Загрузка...</div>
+        </div>
+    </div>
+</div>
+
+<!-- Two-column layout: Keywords Table + Strategy -->
+<div class="row">
+    <!-- Keywords Table -->
+    <div class="col-lg-7">
+        <div class="card shadow-sm mb-4">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><i class="bi bi-key"></i> Ключевые слова — позиции</h5>
+                <div class="btn-group btn-group-sm">
+                    <button class="btn btn-outline-secondary active" onclick="sortKeywords('position')" id="sortPosBtn">По позиции</button>
+                    <button class="btn btn-outline-secondary" onclick="sortKeywords('trend')" id="sortTrendBtn">По тренду</button>
+                    <button class="btn btn-outline-secondary" onclick="sortKeywords('name')" id="sortNameBtn">По имени</button>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
+                    <table class="table table-sm table-hover mb-0">
+                        <thead class="table-light sticky-top">
+                            <tr>
+                                <th>Ключевое слово</th>
+                                <th class="text-center">Текущая</th>
+                                <th class="text-center">Средняя</th>
+                                <th class="text-center">Лучшая</th>
+                                <th class="text-center">Худшая</th>
+                                <th class="text-center">Найдено</th>
+                                <th class="text-center">Тренд</th>
+                                <th class="text-center">Проверок</th>
+                            </tr>
+                        </thead>
+                        <tbody id="keywordsBody">
+                            <tr><td colspan="8" class="text-center py-4 text-muted">Выберите цель для анализа</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Strategy Panel -->
+    <div class="col-lg-5">
+        <div class="card shadow-sm mb-4" id="strategyCard">
+            <div class="card-header bg-info text-white">
+                <h5 class="mb-0"><i class="bi bi-lightbulb"></i> Стратегия продвижения</h5>
+            </div>
+            <div class="card-body" id="strategyContent">
+                <div class="text-center text-muted py-4">
+                    <i class="bi bi-lightbulb fs-1 d-block mb-2 opacity-25"></i>
+                    Нажмите «Стратегия продвижения» для получения рекомендаций
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Daily Positions Pivot Table -->
+<div class="card shadow-sm mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-table"></i> Позиции по дням</h5>
+        <div class="d-flex align-items-center gap-2">
+            <small class="text-muted" id="pivotInfo">—</small>
+            <button class="btn btn-sm btn-outline-secondary" onclick="loadPivot()">
+                <i class="bi bi-arrow-clockwise"></i>
+            </button>
+        </div>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive" style="max-height: 600px; overflow: auto;">
+            <table class="table table-sm table-bordered table-hover mb-0" id="pivotTable">
+                <thead class="table-light sticky-top" id="pivotHead">
+                    <tr><th colspan="100" class="text-center py-4 text-muted">Выберите цель для просмотра позиций по дням</th></tr>
+                </thead>
+                <tbody id="pivotBody">
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Position History Log -->
+<div class="card shadow-sm mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-clock-history"></i> История проверок позиций</h5>
+        <div class="d-flex align-items-center gap-2">
+            <select class="form-select form-select-sm" style="width: 200px;" id="historyKeywordFilter" onchange="loadHistory()">
+                <option value="">Все ключи</option>
+            </select>
+            <button class="btn btn-sm btn-outline-secondary" onclick="loadHistory()">
+                <i class="bi bi-arrow-clockwise"></i>
+            </button>
+        </div>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+            <table class="table table-sm table-hover mb-0">
+                <thead class="table-light sticky-top">
+                    <tr>
+                        <th>Дата/время</th>
+                        <th>Ключевое слово</th>
+                        <th class="text-center">Страница</th>
+                        <th class="text-center">Позиция</th>
+                        <th class="text-center">Абс. поз.</th>
+                        <th class="text-center">Найден</th>
+                        <th class="text-center">Клик</th>
+                        <th class="text-center">Время на сайте</th>
+                        <th>Профиль</th>
+                    </tr>
+                </thead>
+                <tbody id="historyBody">
+                    <tr><td colspan="9" class="text-center py-4 text-muted">Выберите цель для просмотра истории</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>
+let currentTargetId = null;
+let currentPeriod = 14;
+let positionChart = null;
+let analyticsData = null;
+let currentSort = 'position';
+
+const chartColors = [
+    '#0d6efd', '#198754', '#dc3545', '#ffc107', '#0dcaf0',
+    '#6f42c1', '#fd7e14', '#20c997', '#d63384', '#6610f2',
+    '#adb5bd', '#495057', '#0b5ed7', '#146c43', '#b02a37',
+    '#cc9a06'
+];
+
+document.addEventListener('DOMContentLoaded', () => {
+    loadTargets();
+});
+
+// ===== Data Loading =====
+
+async function loadTargets() {
+    try {
+        const targets = await apiCall('/yandex-search-targets');
+        const select = document.getElementById('targetSelect');
+        select.innerHTML = '<option value="">— Выберите цель —</option>';
+        targets.forEach(t => {
+            const kwCount = t.keywords_count || 0;
+            const opt = document.createElement('option');
+            opt.value = t.id;
+            opt.textContent = `${t.domain} (${kwCount} ключей, ${t.today_visits || 0}/${t.visits_per_day} сегодня)`;
+            select.appendChild(opt);
+        });
+
+        // Auto-select from URL hash
+        const hash = window.location.hash.replace('#', '');
+        if (hash && targets.find(t => t.id == hash)) {
+            select.value = hash;
+            onTargetChange();
+        } else if (targets.length === 1) {
+            select.value = targets[0].id;
+            onTargetChange();
+        }
+    } catch (err) {
+        console.error('Failed to load targets:', err);
+    }
+}
+
+function onTargetChange() {
+    const id = document.getElementById('targetSelect').value;
+    if (!id) return;
+    currentTargetId = parseInt(id);
+    window.location.hash = id;
+    document.getElementById('strategyContent').innerHTML = '<div class="text-center text-muted py-4"><i class="bi bi-lightbulb fs-1 d-block mb-2 opacity-25"></i>Нажмите «Стратегия продвижения»</div>';
+    refreshAll();
+}
+
+function setPeriod(days) {
+    currentPeriod = days;
+    document.querySelectorAll('#periodSelector .btn').forEach(btn => {
+        btn.classList.remove('active');
+        if (btn.textContent.includes(days)) btn.classList.add('active');
+    });
+    if (currentTargetId) {
+        loadAnalytics();
+        loadHistory();
+        loadPivot();
+    }
+}
+
+async function refreshAll() {
+    if (!currentTargetId) return;
+    document.getElementById('notFoundCard').style.display = 'block';
+    await Promise.all([loadAnalytics(), loadHistory(), loadPivot(), loadNotFoundKeywords()]);
+}
+
+async function loadAnalytics() {
+    if (!currentTargetId) return;
+    try {
+        analyticsData = await apiCall(`/yandex-search-targets/${currentTargetId}/analytics?days=${currentPeriod}`);
+        renderSummary(analyticsData.summary);
+        renderKeywordsTable(analyticsData.keywords);
+        renderChart();
+        populateKeywordFilter(analyticsData.keywords);
+    } catch (err) {
+        console.error('Analytics load failed:', err);
+    }
+}
+
+async function loadHistory() {
+    if (!currentTargetId) return;
+    const kwFilter = document.getElementById('historyKeywordFilter').value;
+    const params = `days=${currentPeriod}${kwFilter ? '&keyword=' + encodeURIComponent(kwFilter) : ''}`;
+    try {
+        const records = await apiCall(`/yandex-search-targets/${currentTargetId}/position-history?${params}`);
+        renderHistory(records);
+    } catch (err) {
+        console.error('History load failed:', err);
+    }
+}
+
+// ===== Rendering =====
+
+function renderSummary(s) {
+    document.getElementById('summaryAvgPos').textContent = s.avg_position ? s.avg_position.toFixed(1) : '—';
+    document.getElementById('summaryFoundRate').textContent = s.found_rate ? s.found_rate + '%' : '—';
+    document.getElementById('summaryChecks').textContent = s.total_checks || 0;
+    document.getElementById('summaryKeywords').textContent = s.keywords_count || 0;
+    document.getElementById('summaryNotFound').textContent = s.total_not_found || 0;
+
+    const trendEl = document.getElementById('summaryTrend');
+    const trendCard = document.getElementById('summaryTrendCard');
+    const trendMap = {
+        'improving': { text: '▲ Рост', cls: 'border-success', color: 'text-success' },
+        'declining': { text: '▼ Падение', cls: 'border-danger', color: 'text-danger' },
+        'stable':    { text: '— Стабильно', cls: 'border-warning', color: 'text-warning' },
+        'no_data':   { text: '—', cls: 'border-secondary', color: 'text-muted' }
+    };
+    const t = trendMap[s.trend] || trendMap['no_data'];
+    trendEl.textContent = t.text;
+    trendEl.className = 'mb-0 ' + t.color;
+    trendCard.className = 'card shadow-sm h-100 ' + t.cls;
+}
+
+function populateKeywordFilter(keywords) {
+    const sel = document.getElementById('historyKeywordFilter');
+    const current = sel.value;
+    sel.innerHTML = '<option value="">Все ключи</option>';
+    keywords.forEach(kw => {
+        const opt = document.createElement('option');
+        opt.value = kw.keyword;
+        opt.textContent = kw.keyword;
+        if (kw.keyword === current) opt.selected = true;
+        sel.appendChild(opt);
+    });
+}
+
+function renderKeywordsTable(keywords) {
+    const sortedKw = sortKeywordsList(keywords, currentSort);
+    const tbody = document.getElementById('keywordsBody');
+
+    if (!sortedKw.length) {
+        tbody.innerHTML = '<tr><td colspan="8" class="text-center py-4 text-muted">Нет данных о позициях. Запустите визиты.</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = sortedKw.map(kw => {
+        const posClass = !kw.current_avg ? 'text-muted' :
+            kw.current_avg <= 3 ? 'text-success fw-bold fs-6' :
+            kw.current_avg <= 5 ? 'text-success fw-bold' :
+            kw.current_avg <= 10 ? 'text-primary fw-bold' :
+            kw.current_avg <= 20 ? 'text-warning fw-bold' : 'text-danger';
+
+        const trendBadge = {
+            'improving': '<span class="badge bg-success"><i class="bi bi-arrow-up"></i> Рост</span>',
+            'declining': '<span class="badge bg-danger"><i class="bi bi-arrow-down"></i> Падение</span>',
+            'stable':    '<span class="badge bg-warning text-dark"><i class="bi bi-dash"></i> Стаб.</span>',
+        }[kw.trend] || '<span class="badge bg-secondary">—</span>';
+
+        const foundBadge = kw.found_rate >= 80 ? 'bg-success' :
+            kw.found_rate >= 50 ? 'bg-warning text-dark' : 'bg-danger';
+
+        // Position bar visual
+        const barWidth = kw.current_avg ? Math.min(100, Math.max(5, (1 - kw.current_avg / 50) * 100)) : 0;
+        const barColor = kw.current_avg <= 5 ? '#198754' : kw.current_avg <= 10 ? '#0d6efd' : kw.current_avg <= 20 ? '#ffc107' : '#dc3545';
+
+        return `<tr onclick="filterByKeyword('${kw.keyword.replace(/'/g, "\\'")}')" style="cursor:pointer" title="Нажмите для фильтрации истории">
+            <td>
+                <strong>${kw.keyword}</strong>
+                <div style="height:3px; background:#eee; border-radius:2px; margin-top:2px;">
+                    <div style="height:100%; width:${barWidth}%; background:${barColor}; border-radius:2px;"></div>
+                </div>
+            </td>
+            <td class="text-center ${posClass}">${kw.current_avg ? kw.current_avg.toFixed(1) : '—'}</td>
+            <td class="text-center">${kw.avg_position ? kw.avg_position.toFixed(1) : '—'}</td>
+            <td class="text-center text-success">${kw.best_position || '—'}</td>
+            <td class="text-center text-danger">${kw.worst_position || '—'}</td>
+            <td class="text-center"><span class="badge ${foundBadge}">${kw.found_rate}%</span></td>
+            <td class="text-center">${trendBadge}</td>
+            <td class="text-center"><span class="badge bg-light text-dark">${kw.total_checks}</span></td>
+        </tr>`;
+    }).join('');
+}
+
+function sortKeywordsList(keywords, by) {
+    const kw = [...keywords];
+    if (by === 'position') {
+        kw.sort((a, b) => (a.current_avg || 999) - (b.current_avg || 999));
+    } else if (by === 'trend') {
+        const order = { 'declining': 0, 'stable': 1, 'improving': 2 };
+        kw.sort((a, b) => (order[a.trend] ?? 3) - (order[b.trend] ?? 3));
+    } else if (by === 'name') {
+        kw.sort((a, b) => a.keyword.localeCompare(b.keyword, 'ru'));
+    }
+    return kw;
+}
+
+function sortKeywords(by) {
+    currentSort = by;
+    document.querySelectorAll('#sortPosBtn,#sortTrendBtn,#sortNameBtn').forEach(b => b.classList.remove('active'));
+    document.getElementById(by === 'position' ? 'sortPosBtn' : by === 'trend' ? 'sortTrendBtn' : 'sortNameBtn').classList.add('active');
+    if (analyticsData) renderKeywordsTable(analyticsData.keywords);
+}
+
+function filterByKeyword(kw) {
+    document.getElementById('historyKeywordFilter').value = kw;
+    loadHistory();
+    // Scroll to history
+    document.getElementById('historyBody').closest('.card').scrollIntoView({ behavior: 'smooth' });
+}
+
+// ===== Chart =====
+
+let chartMode = 'top'; // 'top' or 'keywords'
+
+function setChartMode(mode) {
+    chartMode = mode;
+    document.getElementById('chartModeTop').classList.toggle('active', mode === 'top');
+    document.getElementById('chartModeKw').classList.toggle('active', mode === 'keywords');
+    document.getElementById('showAllKeywordsWrap').style.display = mode === 'keywords' ? '' : 'none';
+    renderChart();
+}
+
+function renderChart() {
+    if (chartMode === 'top') {
+        renderTopDistributionChart();
+    } else {
+        renderKeywordsChart();
+    }
+}
+
+function renderTopDistributionChart() {
+    if (!analyticsData) return;
+    const ctx = document.getElementById('positionChart').getContext('2d');
+    if (positionChart) positionChart.destroy();
+
+    const dist = analyticsData.top_distribution;
+    if (!dist || !dist.length) {
+        positionChart = null;
+        ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+        ctx.font = '16px sans-serif';
+        ctx.fillStyle = '#aaa';
+        ctx.textAlign = 'center';
+        ctx.fillText('Нет данных для графика. Запустите визиты для сбора позиций.', ctx.canvas.width / 2, 200);
+        return;
+    }
+
+    const labels = dist.map(d => {
+        const parts = d.date.split('-');
+        return parts[2] + '.' + parts[1];
+    });
+
+    const datasets = [
+        {
+            label: 'TOP-3',
+            data: dist.map(d => d.top3),
+            borderColor: '#198754',
+            backgroundColor: '#19875420',
+            borderWidth: 3,
+            pointRadius: 5,
+            pointHoverRadius: 8,
+            pointBackgroundColor: '#198754',
+            tension: 0.3,
+            fill: true,
+            order: 5
+        },
+        {
+            label: 'TOP-5',
+            data: dist.map(d => d.top5),
+            borderColor: '#0d6efd',
+            backgroundColor: '#0d6efd15',
+            borderWidth: 2.5,
+            pointRadius: 4,
+            pointHoverRadius: 7,
+            pointBackgroundColor: '#0d6efd',
+            tension: 0.3,
+            fill: true,
+            order: 4
+        },
+        {
+            label: 'TOP-10',
+            data: dist.map(d => d.top10),
+            borderColor: '#0dcaf0',
+            backgroundColor: '#0dcaf010',
+            borderWidth: 2,
+            pointRadius: 4,
+            pointHoverRadius: 6,
+            pointBackgroundColor: '#0dcaf0',
+            tension: 0.3,
+            fill: true,
+            order: 3
+        },
+        {
+            label: 'TOP-20',
+            data: dist.map(d => d.top20),
+            borderColor: '#ffc107',
+            backgroundColor: '#ffc10710',
+            borderWidth: 2,
+            pointRadius: 3,
+            pointHoverRadius: 6,
+            pointBackgroundColor: '#ffc107',
+            tension: 0.3,
+            fill: true,
+            order: 2
+        },
+        {
+            label: 'TOP-50',
+            data: dist.map(d => d.top50),
+            borderColor: '#dc3545',
+            backgroundColor: '#dc354508',
+            borderWidth: 1.5,
+            pointRadius: 3,
+            pointHoverRadius: 5,
+            pointBackgroundColor: '#dc3545',
+            tension: 0.3,
+            fill: true,
+            borderDash: [4, 2],
+            order: 1
+        }
+    ];
+
+    positionChart = new Chart(ctx, {
+        type: 'line',
+        data: { labels, datasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    title: { display: true, text: 'Количество ключевых слов', font: { size: 13 } },
+                    grid: { color: '#f0f0f0' },
+                    ticks: {
+                        stepSize: 1,
+                        callback: function(value) {
+                            if (Number.isInteger(value)) return value;
+                            return null;
+                        }
+                    }
+                },
+                x: {
+                    title: { display: true, text: 'Дата' },
+                    grid: { display: false }
+                }
+            },
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: { boxWidth: 14, padding: 15, font: { size: 13 } }
+                },
+                tooltip: {
+                    backgroundColor: 'rgba(0,0,0,0.85)',
+                    titleFont: { size: 13 },
+                    bodyFont: { size: 12 },
+                    callbacks: {
+                        title: function(contexts) {
+                            if (!contexts.length) return '';
+                            const idx = contexts[0].dataIndex;
+                            const d = analyticsData.top_distribution[idx];
+                            return d ? d.date + ' (всего ключей: ' + d.total_keywords + ')' : '';
+                        },
+                        label: function(context) {
+                            const val = context.parsed.y;
+                            const total = analyticsData.top_distribution[context.dataIndex]?.total_keywords || 0;
+                            const pct = total > 0 ? Math.round(val / total * 100) : 0;
+                            return `${context.dataset.label}: ${val} ключей (${pct}%)`;
+                        }
+                    }
+                }
+            },
+            interaction: { mode: 'index', intersect: false }
+        }
+    });
+}
+
+function renderKeywordsChart() {
+    if (!analyticsData) return;
+    const ctx = document.getElementById('positionChart').getContext('2d');
+
+    if (positionChart) positionChart.destroy();
+
+    const keywords = analyticsData.keywords;
+    const kwWithData = keywords.filter(kw => kw.chart_data && kw.chart_data.length > 0);
+
+    if (!kwWithData.length) {
+        positionChart = null;
+        ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+        ctx.font = '16px sans-serif';
+        ctx.fillStyle = '#aaa';
+        ctx.textAlign = 'center';
+        ctx.fillText('Нет данных для графика. Запустите визиты для сбора позиций.', ctx.canvas.width / 2, 200);
+        return;
+    }
+
+    // Collect all dates
+    const allDates = new Set();
+    kwWithData.forEach(kw => kw.chart_data.forEach(d => allDates.add(d.date)));
+    const labels = Array.from(allDates).sort();
+
+    const showAll = document.getElementById('showAllKeywords').checked;
+    const toChart = showAll ? kwWithData : kwWithData.slice(0, 5);
+
+    const datasets = toChart.map((kw, i) => {
+        const dateMap = {};
+        kw.chart_data.forEach(d => { dateMap[d.date] = d.avg_position; });
+
+        return {
+            label: kw.keyword.length > 35 ? kw.keyword.substring(0, 32) + '...' : kw.keyword,
+            data: labels.map(d => dateMap[d] ?? null),
+            borderColor: chartColors[i % chartColors.length],
+            backgroundColor: chartColors[i % chartColors.length] + '15',
+            borderWidth: 2,
+            pointRadius: 4,
+            pointHoverRadius: 6,
+            tension: 0.3,
+            spanGaps: true,
+            fill: false
+        };
+    });
+
+    positionChart = new Chart(ctx, {
+        type: 'line',
+        data: { labels, datasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: {
+                    reverse: true,
+                    beginAtZero: false,
+                    min: 0,
+                    title: { display: true, text: 'Позиция (меньше = лучше)', font: { size: 13 } },
+                    grid: { color: '#f0f0f0' },
+                    ticks: {
+                        callback: function(value) {
+                            if (value <= 10) return 'TOP-' + value;
+                            return value;
+                        }
+                    }
+                },
+                x: {
+                    title: { display: true, text: 'Дата' },
+                    grid: { display: false }
+                }
+            },
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: { boxWidth: 14, padding: 10, font: { size: 12 } }
+                },
+                tooltip: {
+                    backgroundColor: 'rgba(0,0,0,0.85)',
+                    titleFont: { size: 13 },
+                    bodyFont: { size: 12 },
+                    callbacks: {
+                        label: function(context) {
+                            const val = context.parsed.y;
+                            if (!val) return context.dataset.label + ': нет данных';
+                            const zone = val <= 3 ? 'TOP-3' : val <= 5 ? 'TOP-5' : val <= 10 ? 'TOP-10' : val <= 20 ? 'Стр. 2' : 'Стр. 3+';
+                            return `${context.dataset.label}: поз. ${val.toFixed(1)} (${zone})`;
+                        }
+                    }
+                }
+            },
+            interaction: { mode: 'index', intersect: false }
+        }
+    });
+}
+
+// ===== Strategy =====
+
+async function loadStrategy() {
+    if (!currentTargetId) {
+        alert('Сначала выберите цель');
+        return;
+    }
+    const content = document.getElementById('strategyContent');
+    content.innerHTML = '<div class="text-center py-4"><div class="spinner-border text-info"></div><p class="mt-2 text-muted">Анализирую позиции...</p></div>';
+
+    try {
+        const data = await apiCall(`/yandex-search-targets/${currentTargetId}/strategy`);
+
+        let html = '';
+
+        // General advice
+        if (data.general_advice && data.general_advice.length) {
+            html += '<div class="mb-3">';
+            data.general_advice.forEach(a => {
+                html += `<div class="alert alert-info py-1 px-3 mb-1 small">${a}</div>`;
+            });
+            html += '</div>';
+        }
+
+        // Recommendations table
+        if (data.recommendations && data.recommendations.length) {
+            html += '<div class="table-responsive"><table class="table table-sm table-hover mb-0">';
+            html += '<thead class="table-light"><tr><th>Ключ</th><th class="text-center">Поз.</th><th class="text-center">Фаза</th><th class="text-center">Сегодня</th></tr></thead><tbody>';
+
+            const phaseLabels = {
+                'start': { text: 'Старт', cls: 'bg-secondary' },
+                'ramp_up': { text: 'Разгон', cls: 'bg-warning text-dark' },
+                'peak': { text: 'Пик', cls: 'bg-danger' },
+                'ramp_down': { text: 'Снижение', cls: 'bg-info' },
+                'maintain': { text: 'Поддержка', cls: 'bg-success' },
+                'recovery': { text: 'Восстанов.', cls: 'bg-danger' },
+                'not_found': { text: 'Не найден', cls: 'bg-dark' },
+                'error': { text: 'Ошибка', cls: 'bg-dark' },
+            };
+
+            data.recommendations.forEach(r => {
+                const posText = r.current_position ? r.current_position.toFixed(0) : '—';
+                const phase = phaseLabels[r.phase] || { text: r.phase, cls: 'bg-secondary' };
+
+                const trendArrow = {
+                    'improving': '<span class="text-success">▲</span>',
+                    'declining': '<span class="text-danger">▼</span>',
+                    'stable': '',
+                    'not_found': '<span class="text-danger">✗</span>',
+                }[r.trend] || '';
+
+                const done = r.today_done || 0;
+                const budget = r.suggested_clicks || 0;
+                const pct = budget > 0 ? Math.round(done / budget * 100) : 0;
+                const barColor = pct >= 100 ? '#198754' : pct >= 50 ? '#ffc107' : '#dc3545';
+
+                html += `<tr title="${r.message}">
+                    <td><small><strong>${r.keyword}</strong></small> ${trendArrow}</td>
+                    <td class="text-center">${posText}</td>
+                    <td class="text-center"><span class="badge ${phase.cls}" style="font-size:0.65rem;">${phase.text}</span></td>
+                    <td class="text-center" style="min-width:80px;">
+                        <div class="d-flex align-items-center justify-content-center gap-1">
+                            <small class="fw-bold">${done}/${budget}</small>
+                        </div>
+                        <div style="height:3px; background:#eee; border-radius:2px; margin-top:1px;">
+                            <div style="height:100%; width:${Math.min(100, pct)}%; background:${barColor}; border-radius:2px;"></div>
+                        </div>
+                    </td>
+                </tr>`;
+            });
+
+            html += '</tbody></table></div>';
+
+            // Summary bar
+            const totalBudget = data.algorithm_budget || 0;
+            const totalDone = data.today_done || 0;
+            html += `<div class="mt-2 small text-muted text-center">
+                Бюджет алгоритма: <strong>${totalBudget}</strong> кл/день
+                | Выполнено: <strong>${totalDone}</strong>
+                | Лимит цели: <strong>${data.visits_per_day}</strong>
+            </div>`;
+        }
+
+        content.innerHTML = html || '<div class="text-center text-muted py-3">Нет данных для стратегии</div>';
+    } catch (err) {
+        content.innerHTML = '<div class="text-center text-danger py-3">Ошибка загрузки стратегии</div>';
+        console.error('Strategy load failed:', err);
+    }
+}
+
+// ===== Pivot Table =====
+
+async function loadPivot() {
+    if (!currentTargetId) return;
+    try {
+        const data = await apiCall(`/yandex-search-targets/${currentTargetId}/positions-pivot?days=${currentPeriod}`);
+        renderPivot(data);
+    } catch (err) {
+        console.error('Pivot load failed:', err);
+    }
+}
+
+function renderPivot(data) {
+    const thead = document.getElementById('pivotHead');
+    const tbody = document.getElementById('pivotBody');
+    const info = document.getElementById('pivotInfo');
+
+    if (!data || !data.dates || !data.dates.length || !data.keywords || !data.keywords.length) {
+        thead.innerHTML = '<tr><th colspan="100" class="text-center py-4 text-muted">Нет данных о позициях за выбранный период</th></tr>';
+        tbody.innerHTML = '';
+        info.textContent = '—';
+        return;
+    }
+
+    info.textContent = `${data.keywords.length} ключей × ${data.dates.length} дней`;
+
+    // Format dates for display (DD.MM)
+    const fmtDate = d => {
+        const parts = d.split('-');
+        return parts[2] + '.' + parts[1];
+    };
+
+    // Header row: keyword column + date columns (latest first)
+    let headHtml = '<tr><th class="sticky-start bg-light" style="min-width:200px; position:sticky; left:0; z-index:2;">Ключевое слово</th>';
+    data.dates.forEach(d => {
+        headHtml += `<th class="text-center text-nowrap" style="min-width:55px; font-size:0.75rem;">${fmtDate(d)}</th>`;
+    });
+    headHtml += '</tr>';
+    thead.innerHTML = headHtml;
+
+    // Body: one row per keyword
+    let bodyHtml = '';
+    data.keywords.forEach(kw => {
+        bodyHtml += `<tr><td class="fw-bold small bg-light" style="position:sticky; left:0; z-index:1; white-space:nowrap; max-width:250px; overflow:hidden; text-overflow:ellipsis;" title="${kw}">${kw}</td>`;
+        data.dates.forEach(d => {
+            const cell = data.pivot[kw] ? data.pivot[kw][d] : null;
+            if (!cell) {
+                bodyHtml += '<td class="text-center text-muted" style="font-size:0.75rem;">—</td>';
+            } else if (cell.avg_position === null) {
+                // Checks happened but not found
+                bodyHtml += `<td class="text-center" style="font-size:0.75rem; background:#fff0f0;" title="Не найден (${cell.not_found} проверок)">✗</td>`;
+            } else {
+                const pos = cell.avg_position;
+                let bg, fg;
+                if (pos <= 3) { bg = '#198754'; fg = '#fff'; }
+                else if (pos <= 5) { bg = '#28a745'; fg = '#fff'; }
+                else if (pos <= 10) { bg = '#0d6efd'; fg = '#fff'; }
+                else if (pos <= 20) { bg = '#ffc107'; fg = '#000'; }
+                else if (pos <= 30) { bg = '#fd7e14'; fg = '#fff'; }
+                else { bg = '#dc3545'; fg = '#fff'; }
+
+                const clickIcon = cell.clicked > 0 ? ' 🖱' : '';
+                const title = `Позиция: ${pos}\nПроверок: ${cell.checks}\nНайден: ${cell.found}\nКликов: ${cell.clicked}`;
+                bodyHtml += `<td class="text-center" style="font-size:0.75rem; background:${bg}; color:${fg}; font-weight:600;" title="${title}">${pos % 1 === 0 ? pos.toFixed(0) : pos.toFixed(1)}${clickIcon}</td>`;
+            }
+        });
+        bodyHtml += '</tr>';
+    });
+    tbody.innerHTML = bodyHtml;
+}
+
+// ===== History =====
+
+function renderHistory(records) {
+    const tbody = document.getElementById('historyBody');
+    if (!records || !records.length) {
+        tbody.innerHTML = '<tr><td colspan="9" class="text-center py-4 text-muted">Нет записей за выбранный период</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = records.map(r => {
+        const dt = r.checked_at ? new Date(r.checked_at).toLocaleString('ru-RU', {
+            day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'
+        }) : '—';
+
+        const foundBadge = r.found
+            ? '<span class="badge bg-success">Да</span>'
+            : '<span class="badge bg-danger">Нет</span>';
+
+        const clickBadge = r.clicked
+            ? '<span class="badge bg-success">Да</span>'
+            : (r.found ? '<span class="badge bg-warning text-dark">Нет</span>' : '<span class="text-muted">—</span>');
+
+        const posClass = !r.absolute_position ? '' :
+            r.absolute_position <= 5 ? 'text-success fw-bold' :
+            r.absolute_position <= 10 ? 'text-primary fw-bold' :
+            r.absolute_position <= 20 ? 'text-warning' : 'text-danger';
+
+        const browseTime = r.browse_time ? `${Math.round(r.browse_time)}с` : '—';
+
+        return `<tr>
+            <td><small>${dt}</small></td>
+            <td><small class="fw-bold">${r.keyword || '—'}</small></td>
+            <td class="text-center">${r.page || '—'}</td>
+            <td class="text-center">${r.position || '—'}</td>
+            <td class="text-center ${posClass}">${r.absolute_position || '—'}</td>
+            <td class="text-center">${foundBadge}</td>
+            <td class="text-center">${clickBadge}</td>
+            <td class="text-center">${browseTime}</td>
+            <td><small>#${r.profile_id || '—'}</small></td>
+        </tr>`;
+    }).join('');
+}
+// ===== Not Found Keywords Management =====
+
+let notFoundData = null;
+
+async function loadNotFoundKeywords() {
+    if (!currentTargetId) return;
+    const days = document.getElementById('notFoundDays').value || 1;
+    const content = document.getElementById('notFoundContent');
+    content.innerHTML = '<div class="text-center py-3"><div class="spinner-border spinner-border-sm text-danger"></div> Загрузка...</div>';
+
+    try {
+        notFoundData = await apiCall(`/yandex-search-targets/${currentTargetId}/not-found-keywords?days=${days}`);
+        renderNotFoundKeywords();
+    } catch (err) {
+        content.innerHTML = '<div class="text-center text-danger py-3">Ошибка загрузки</div>';
+        console.error('Not found keywords load failed:', err);
+    }
+}
+
+function renderNotFoundKeywords() {
+    const content = document.getElementById('notFoundContent');
+    if (!notFoundData) {
+        content.innerHTML = '<div class="text-center text-muted py-3">Нет данных</div>';
+        return;
+    }
+
+    const nfKws = notFoundData.not_found_keywords || [];
+    const neverChecked = notFoundData.never_checked_keywords || [];
+
+    if (nfKws.length === 0 && neverChecked.length === 0) {
+        content.innerHTML = '<div class="text-center text-success py-3"><i class="bi bi-check-circle fs-4"></i><br>Все ключевые слова находятся в выдаче!</div>';
+        return;
+    }
+
+    let html = '';
+
+    // Summary
+    html += `<div class="alert alert-warning py-2 mb-3">
+        <div class="d-flex justify-content-between align-items-center">
+            <span><strong>${nfKws.length}</strong> ключ(ей) не найдено в выдаче${neverChecked.length > 0 ? `, <strong>${neverChecked.length}</strong> ещё не проверялись` : ''}</span>
+            <span class="text-muted">Всего ключей: ${notFoundData.total_keywords}</span>
+        </div>
+    </div>`;
+
+    if (nfKws.length > 0) {
+        html += `<div class="mb-2 d-flex justify-content-between align-items-center">
+            <div>
+                <button class="btn btn-sm btn-outline-secondary me-1" onclick="toggleAllNotFound(true)"><i class="bi bi-check-all"></i> Выбрать все</button>
+                <button class="btn btn-sm btn-outline-secondary me-1" onclick="toggleAllNotFound(false)"><i class="bi bi-x-lg"></i> Снять все</button>
+            </div>
+            <div>
+                <button class="btn btn-sm btn-danger" onclick="removeSelectedNotFound()"><i class="bi bi-trash"></i> Удалить выбранные</button>
+            </div>
+        </div>`;
+
+        html += '<div class="table-responsive" style="max-height: 300px; overflow-y: auto;">';
+        html += '<table class="table table-sm table-hover mb-0">';
+        html += '<thead class="table-light sticky-top"><tr>';
+        html += '<th style="width:30px;"><input type="checkbox" id="nfSelectAll" onchange="toggleAllNotFound(this.checked)"></th>';
+        html += '<th>Ключевое слово</th>';
+        html += '<th class="text-center">Проверок</th>';
+        html += '<th class="text-center">Последняя проверка</th>';
+        html += '</tr></thead><tbody>';
+
+        nfKws.forEach((kw, idx) => {
+            const lastChecked = kw.last_checked ? new Date(kw.last_checked).toLocaleString('ru-RU', {
+                day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'
+            }) : '—';
+            html += `<tr>
+                <td><input type="checkbox" class="nf-checkbox" value="${escapeHtml(kw.keyword)}" checked></td>
+                <td><strong>${escapeHtml(kw.keyword)}</strong></td>
+                <td class="text-center"><span class="badge bg-secondary">${kw.checks}</span></td>
+                <td class="text-center"><small class="text-muted">${lastChecked}</small></td>
+            </tr>`;
+        });
+
+        html += '</tbody></table></div>';
+    }
+
+    if (neverChecked.length > 0) {
+        html += `<div class="mt-3 mb-2"><strong class="text-muted"><i class="bi bi-question-circle"></i> Ещё не проверялись (${neverChecked.length}):</strong></div>`;
+        html += '<div class="d-flex flex-wrap gap-1">';
+        neverChecked.forEach(kw => {
+            html += `<span class="badge bg-light text-dark border">${escapeHtml(kw)}</span>`;
+        });
+        html += '</div>';
+    }
+
+    content.innerHTML = html;
+}
+
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+function toggleAllNotFound(checked) {
+    document.querySelectorAll('.nf-checkbox').forEach(cb => cb.checked = checked);
+    const selectAllCb = document.getElementById('nfSelectAll');
+    if (selectAllCb) selectAllCb.checked = checked;
+}
+
+async function removeSelectedNotFound() {
+    const checkboxes = document.querySelectorAll('.nf-checkbox:checked');
+    const keywords = Array.from(checkboxes).map(cb => cb.value);
+
+    if (keywords.length === 0) {
+        alert('Не выбрано ни одного ключевого слова');
+        return;
+    }
+
+    if (!confirm(`Удалить ${keywords.length} ключевых слов из цели?\n\n${keywords.join('\n')}\n\nЭто действие необратимо!`)) {
+        return;
+    }
+
+    try {
+        const result = await apiCall(`/yandex-search-targets/${currentTargetId}/remove-keywords`, 'POST', { keywords });
+        alert(`Удалено: ${result.removed} ключевых слов. Осталось: ${result.remaining}`);
+        // Reload everything
+        await Promise.all([loadNotFoundKeywords(), loadAnalytics(), loadPivot()]);
+    } catch (err) {
+        alert('Ошибка удаления: ' + (err.message || err));
+    }
+}
+
+</script>
+{% endblock %}

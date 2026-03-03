@@ -94,6 +94,7 @@
                 <th>Address</th>
                 <th>Type</th>
                 <th>Status</th>
+                <th>Active</th>
                 <th>Response Time</th>
                 <th>Usage Count</th>
                 <th>Success Rate</th>
@@ -179,22 +180,34 @@ function loadProxies() {
             }
 
             tbody.innerHTML = proxies.map(proxy => `
-                <tr>
+                <tr class="${!proxy.is_active ? 'table-secondary' : ''}">
                     <td>${proxy.id}</td>
                     <td><strong>${proxy.name}</strong></td>
                     <td>${proxy.host}:${proxy.port}</td>
                     <td><span class="badge bg-secondary">${proxy.proxy_type.toUpperCase()}</span></td>
-                    <td><span class="badge bg-${getProxyStatusColor(proxy.status)}">${proxy.status}</span></td>
-                    <td>${proxy.response_time_ms || '-'}ms</td>
+                    <td>
+                        <span class="badge bg-${proxy.is_active ? getProxyStatusColor(proxy.status) : 'dark'}">
+                            ${proxy.is_active ? proxy.status : 'disabled'}
+                        </span>
+                    </td>
+                    <td>
+                        <span class="badge bg-${proxy.is_active ? 'success' : 'secondary'}">
+                            ${proxy.is_active ? 'Active' : 'Inactive'}
+                        </span>
+                    </td>
+                    <td>${proxy.response_time_ms ? Math.round(proxy.response_time_ms) + 'ms' : '-'}</td>
                     <td>${proxy.times_used || 0}</td>
                     <td>
-                        <span class="badge bg-${proxy.times_used > 0 ? 'success' : 'secondary'}">
-                            ${proxy.times_used > 0 ? Math.round((proxy.successful_requests / proxy.total_requests) * 100) + '%' : 'N/A'}
+                        <span class="badge bg-${proxy.total_requests > 0 ? (proxy.success_rate >= 50 ? 'success' : proxy.success_rate >= 30 ? 'warning' : 'danger') : 'secondary'}">
+                            ${proxy.total_requests > 0 ? Math.round(proxy.success_rate) + '%' : 'N/A'}
                         </span>
                     </td>
                     <td>${proxy.last_check_at ? new Date(proxy.last_check_at).toLocaleString() : 'Never'}</td>
                     <td>
                         <div class="btn-group btn-group-sm">
+                            <button class="btn btn-outline-${proxy.is_active ? 'warning' : 'success'}" onclick="toggleProxy(${proxy.id}, ${!proxy.is_active})" title="${proxy.is_active ? 'Disable' : 'Enable'}">
+                                <i class="bi bi-${proxy.is_active ? 'pause-circle' : 'play-circle'}"></i>
+                            </button>
                             <button class="btn btn-outline-primary" onclick="testProxy(${proxy.id})" title="Test Proxy">
                                 <i class="bi bi-check"></i>
                             </button>
@@ -218,8 +231,8 @@ function loadProxies() {
 
 function updateProxyStats(proxies) {
     const total = proxies.length;
-    const working = proxies.filter(p => p.status === 'working').length;
-    const failed = proxies.filter(p => p.status === 'failed').length;
+    const working = proxies.filter(p => p.is_active && p.status === 'working').length;
+    const failed = proxies.filter(p => !p.is_active || p.status === 'failed').length;
     const proxiesWithTime = proxies.filter(p => p.response_time_ms > 0);
     const avgTime = proxiesWithTime.length > 0 ? Math.round(proxiesWithTime.reduce((sum, p) => sum + (p.response_time_ms || 0), 0) / proxiesWithTime.length) : 0;
 
@@ -339,6 +352,29 @@ function deleteProxy(proxyId) {
                 console.error('Error deleting proxy:', error);
                 alert('Error deleting proxy');
             });
+    }
+}
+
+function toggleProxy(proxyId, enable) {
+    const action = enable ? 'enable' : 'disable';
+    if (confirm(`Are you sure you want to ${action} this proxy?`)) {
+        fetch(`/api/proxies/${proxyId}/toggle`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({is_active: enable})
+        })
+        .then(response => response.json())
+        .then(result => {
+            if (result.success) {
+                loadProxies();
+            } else {
+                alert('Error: ' + (result.error || 'Unknown error'));
+            }
+        })
+        .catch(error => {
+            console.error('Error toggling proxy:', error);
+            alert('Error toggling proxy');
+        });
     }
 }
 

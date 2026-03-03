@@ -15,6 +15,28 @@
     </div>
 </div>
 
+<!-- Profile Status Overview -->
+<div class="card mb-3 border-0 bg-light">
+    <div class="card-body py-2">
+        <div class="d-flex align-items-center gap-4 flex-wrap">
+            <span class="fw-bold text-muted" style="font-size:0.85rem"><i class="bi bi-people-fill"></i> Профили:</span>
+            <span class="badge bg-success fs-6" id="profileReady" title="Прогреты и готовы для визитов">0 готовы</span>
+            <span class="badge bg-primary fs-6" id="profileWarming" title="Сейчас греются">0 греются</span>
+            <span class="badge bg-secondary fs-6" id="profileCreated" title="Ещё не начали нагул">0 ожидают</span>
+            <span class="badge bg-danger fs-6" id="profileError" title="Ошибка" style="display:none">0 ошибка</span>
+            <span class="text-muted" style="font-size:0.8rem" id="profileTotal">Всего: 0</span>
+            <div class="flex-grow-1"></div>
+            <div id="profileProgress" style="width:200px">
+                <div class="progress" style="height:8px">
+                    <div class="progress-bar bg-success" id="profileBarReady" style="width:0%"></div>
+                    <div class="progress-bar bg-primary" id="profileBarWarming" style="width:0%"></div>
+                    <div class="progress-bar bg-secondary" id="profileBarCreated" style="width:0%"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Statistics -->
 <div class="row mb-4">
     <div class="col-md-3">
@@ -309,22 +331,85 @@
 
 <script>
 let targets = [];
+let taskStatus = {};  // per-target task status
+let authFailed = false;  // Stop everything on auth failure
+
+// Auth check helper — redirect to login on 401
+function checkAuth(response) {
+    if (response.status === 401) {
+        if (!authFailed) {
+            authFailed = true;
+            // Stop auto-refresh to prevent repeated redirects
+            if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+            window.location.href = '/login';
+        }
+        throw new Error('Not authenticated');
+    }
+    return response;
+}
 
 // Load targets on page load
 document.addEventListener('DOMContentLoaded', function() {
     loadTargets();
+    loadProfilesSummary();
 });
 
-async function loadTargets() {
+async function loadProfilesSummary() {
+    if (authFailed) return;
     try {
-        const response = await fetch('/api/yandex-targets');
-        targets = await response.json();
+        const response = await fetch('/api/profiles/summary');
+        checkAuth(response);
+        if (!response.ok) return;
+        const data = await response.json();
+
+        document.getElementById('profileReady').textContent = `${data.ready_for_visits} готовы`;
+        document.getElementById('profileWarming').textContent = `${data.warming_up} греются`;
+        document.getElementById('profileCreated').textContent = `${data.created} ожидают`;
+        document.getElementById('profileTotal').textContent = `Всего: ${data.total}`;
+
+        const errEl = document.getElementById('profileError');
+        if (data.error > 0) {
+            errEl.textContent = `${data.error} ошибка`;
+            errEl.style.display = '';
+        } else {
+            errEl.style.display = 'none';
+        }
+
+        const t = data.total || 1;
+        document.getElementById('profileBarReady').style.width = `${(data.ready_for_visits / t * 100).toFixed(1)}%`;
+        document.getElementById('profileBarWarming').style.width = `${(data.warming_up / t * 100).toFixed(1)}%`;
+        document.getElementById('profileBarCreated').style.width = `${(data.created / t * 100).toFixed(1)}%`;
+    } catch (error) {
+        console.error('Error loading profiles summary:', error);
+    }
+}
+
+async function loadTargets() {
+    if (authFailed) return;
+    try {
+        // Load targets and task status in parallel
+        const [targetsResp, statusResp] = await Promise.all([
+            fetch('/api/yandex-targets'),
+            fetch('/api/yandex-targets/task-status')
+        ]);
+        checkAuth(targetsResp);
+        checkAuth(statusResp);
+        if (!targetsResp.ok) {
+            document.getElementById('targetsTableBody').innerHTML = '<tr><td colspan="7" class="text-center text-danger">Ошибка загрузки (HTTP ' + targetsResp.status + ')</td></tr>';
+            return;
+        }
+        targets = await targetsResp.json();
+        
+        if (statusResp.ok) {
+            taskStatus = await statusResp.json();
+        }
         
         updateStatistics();
         renderTargetsTable();
     } catch (error) {
+        if (error.message === 'Not authenticated') return;
         console.error('Error loading targets:', error);
-        showAlert('danger', 'Ошибка загрузки целей');
+        document.getElementById('targetsTableBody').innerHTML = '<tr><td colspan="7" class="text-center text-danger"><i class="bi bi-exclamation-triangle"></i> Ошибка загрузки целей: ' + (error.message || 'Неизвестная ошибка') + '</td></tr>';
     }
 }
 
@@ -349,7 +434,11 @@ function renderTargetsTable() {
         return;
     }
     
-    tbody.innerHTML = targets.map(target => `
+    tbody.innerHTML = targets.map(target => {
+        const ts = taskStatus[String(target.id)] || {};
+        const statusHtml = buildTaskStatusHtml(target, ts);
+        
+        return `
         <tr>
             <td>${target.id}</td>
             <td>
@@ -373,11 +462,7 @@ function renderTargetsTable() {
                     <span class="text-muted">Всего: ${target.total_visits} (✅${target.successful_visits})</span>
                 </small>
             </td>
-            <td>
-                <span class="badge ${target.is_active ? 'bg-success' : 'bg-secondary'}">
-                    ${target.is_active ? 'Активна' : 'Неактивна'}
-                </span>
-            </td>
+            <td>${statusHtml}</td>
             <td>
                 <button class="btn btn-sm btn-success" id="launch-btn-${target.id}" onclick="launchVisits(${target.id})" title="Запустить визиты">
                     <i class="bi bi-rocket-takeoff"></i> Запуск
@@ -394,15 +479,66 @@ function renderTargetsTable() {
                 </button>
             </td>
         </tr>
-    `).join('');
+        `;
+    }).join('');
     
     // Load profile visit info for each target
     targets.forEach(target => loadProfileVisits(target.id));
 }
 
+function buildTaskStatusHtml(target, ts) {
+    let badge = '';
+    let detail = '';
+    
+    if (!target.is_active) {
+        badge = '<span class="badge bg-secondary">⏸ Неактивна</span>';
+    } else if (ts.running > 0) {
+        badge = `<span class="badge bg-success"><span class="spinner-grow spinner-grow-sm" style="width:0.5rem;height:0.5rem"></span> Работает (${ts.running})</span>`;
+    } else if (ts.pending > 0) {
+        badge = `<span class="badge bg-warning text-dark">⏳ В очереди (${ts.pending})</span>`;
+    } else {
+        badge = '<span class="badge bg-info text-dark">💤 Ожидание</span>';
+    }
+    
+    // Show pending count below running badge
+    if (ts.running > 0 && ts.pending > 0) {
+        detail += `<div><small class="text-warning">+ ${ts.pending} в очереди</small></div>`;
+    }
+    
+    // Last hour stats
+    if (ts.completed_1h > 0 || ts.failed_1h > 0) {
+        detail += `<div style="font-size:0.75rem" class="text-muted mt-1">За час: `;
+        if (ts.completed_1h > 0) detail += `<span class="text-success">✅${ts.completed_1h}</span> `;
+        if (ts.failed_1h > 0) detail += `<span class="text-danger">❌${ts.failed_1h}</span>`;
+        detail += '</div>';
+    }
+    
+    // Last activity time
+    if (ts.last_completed) {
+        const ago = timeAgo(new Date(ts.last_completed + 'Z'));
+        detail += `<div style="font-size:0.7rem" class="text-muted">Послед: ${ago}</div>`;
+    }
+    
+    return `<div style="min-width:100px">${badge}${detail}</div>`;
+}
+
+function timeAgo(date) {
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return 'только что';
+    if (diffMin < 60) return `${diffMin} мин назад`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr} ч назад`;
+    return `${Math.floor(diffHr / 24)} д назад`;
+}
+
 async function loadProfileVisits(targetId) {
+    if (authFailed) return;
     try {
         const response = await fetch(`/api/yandex-targets/${targetId}/profile-visits`);
+        checkAuth(response);
+        if (!response.ok) return;
         const data = await response.json();
         const cell = document.getElementById(`profile-visits-${targetId}`);
         if (!cell) return;
@@ -419,16 +555,31 @@ async function loadProfileVisits(targetId) {
         const barPercent = total > 0 ? Math.round((used / total) * 100) : 0;
         const barColor = available > 0 ? 'bg-success' : 'bg-danger';
         
+        // Build status breakdown for visited profiles
+        let visitedDetail = '';
+        if (data.visits && data.visits.length > 0) {
+            const completed = data.visits.filter(v => v.status === 'completed').length;
+            const pending = data.visits.filter(v => v.status === 'pending' || v.status === 'in_progress').length;
+            const failed = data.visits.filter(v => v.status === 'failed').length;
+            const parts = [];
+            if (completed > 0) parts.push(`<span class="text-success">✅${completed}</span>`);
+            if (pending > 0) parts.push(`<span class="text-primary">⏳${pending}</span>`);
+            if (failed > 0) parts.push(`<span class="text-danger">❌${failed}</span>`);
+            visitedDetail = parts.join(' ');
+        }
+
         cell.innerHTML = `
-            <div style="min-width: 120px">
-                <div class="d-flex justify-content-between mb-1">
-                    <small><strong>${used}/${total}</strong></small>
-                    <small class="text-muted">${available > 0 ? `ост. ${available}` : '<span class=\\"text-danger\\">все\\u00a0исп.</span>'}</small>
+            <div style="min-width: 140px">
+                <div class="d-flex justify-content-between align-items-center mb-1">
+                    <small><strong>${used}</strong> <span class="text-muted">из</span> <strong>${total}</strong></small>
+                    ${available > 0 
+                        ? `<span class="badge bg-success" style="font-size:0.7rem">ост. ${available}</span>` 
+                        : `<span class="badge bg-danger" style="font-size:0.7rem">все исп.</span>`}
                 </div>
                 <div class="progress" style="height: 6px;">
-                    <div class="progress-bar ${barColor}" style="width: ${barPercent}%"></div>
+                    <div class="progress-bar ${barColor}" style="width: ${barPercent}%" title="${used} из ${total} профилей использовано"></div>
                 </div>
-                ${profileNames ? `<small class="text-muted d-block mt-1" title="${profileNames}">${profileNames.substring(0, 30)}${profileNames.length > 30 ? '...' : ''}</small>` : ''}
+                ${visitedDetail ? `<div class="mt-1" style="font-size:0.75rem">${visitedDetail}</div>` : ''}
                 ${used > 0 ? `<button class="btn btn-outline-secondary btn-sm mt-1 py-0 px-1" style="font-size:0.7rem" onclick="resetVisits(${targetId})">
                     <i class="bi bi-arrow-counterclockwise"></i> Сброс
                 </button>` : ''}
@@ -682,7 +833,8 @@ function startAutoRefresh() {
     autoRefreshInterval = setInterval(() => {
         loadVisitLogs();
         loadTargets();
-    }, 5000);
+        loadProfilesSummary();
+    }, 60000);
 }
 
 function toggleAutoRefresh() {
@@ -700,12 +852,15 @@ function toggleAutoRefresh() {
 }
 
 async function loadVisitLogs() {
+    if (authFailed) return;
     try {
         const response = await fetch('/api/visit-logs?limit=20');
+        checkAuth(response);
         if (!response.ok) return;
         const logs = await response.json();
         renderVisitLogs(logs);
     } catch (error) {
+        if (error.message === 'Not authenticated') return;
         console.error('Error loading visit logs:', error);
     }
 }
