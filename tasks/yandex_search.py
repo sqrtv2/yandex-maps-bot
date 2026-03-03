@@ -66,7 +66,8 @@ def _update_search_task_log(task_id: int, message: str, status: str = None,
 def _safe_click(driver, element, pause_min=0.3, pause_max=0.8):
     """Safely click an element: scroll into view, try ActionChains, fallback to JS click.
     
-    Handles 'move target out of bounds' by scrolling element into viewport first.
+    Handles 'move target out of bounds' and 'element not interactable' by
+    scrolling element into viewport first with multiple strategies.
     """
     try:
         # First scroll element into viewport
@@ -76,11 +77,43 @@ def _safe_click(driver, element, pause_min=0.3, pause_max=0.8):
         )
         time.sleep(random.uniform(0.3, 0.7))
         
+        # Ensure element is visible and not covered by overlays
+        driver.execute_script("""
+            var elem = arguments[0];
+            var rect = elem.getBoundingClientRect();
+            // If element is outside viewport, scroll again
+            if (rect.top < 0 || rect.bottom > window.innerHeight) {
+                elem.scrollIntoView({block: 'center'});
+            }
+            // Remove any potential overlay/popup blocking the click
+            var overlay = document.querySelector('.popup-overlay, .modal-overlay, .overlay');
+            if (overlay) overlay.remove();
+        """, element)
+        time.sleep(random.uniform(0.2, 0.4))
+        
         # Try ActionChains click (more human-like)
         ActionChains(driver).move_to_element(element).pause(
             random.uniform(pause_min, pause_max)
         ).click().perform()
     except Exception as e:
+        error_msg = str(e).lower()
+        # If element not interactable, try clicking a child <a> or the parent
+        if 'not interactable' in error_msg or 'not clickable' in error_msg:
+            try:
+                # Try finding a clickable child link
+                child_links = element.find_elements(By.TAG_NAME, 'a')
+                if child_links:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block: 'center'});",
+                        child_links[0]
+                    )
+                    time.sleep(random.uniform(0.2, 0.4))
+                    ActionChains(driver).move_to_element(child_links[0]).pause(
+                        random.uniform(pause_min, pause_max)
+                    ).click().perform()
+                    return
+            except Exception:
+                pass
         # Fallback: JS click
         try:
             driver.execute_script("arguments[0].click();", element)
@@ -1510,6 +1543,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
 
         # === Step 4: Click completed — finish immediately (no site browsing) ===
         total_time = time.time() - start_time
+        actual_browse_time = 0  # No site browsing in this mode
 
         if task_id:
             _update_search_task_log(task_id,
