@@ -1262,35 +1262,61 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             # === Keyboard emulation: click input, then type character by character ===
             logger.info(f"   Moving to search input and clicking...")
             
-            # Move mouse to input field naturally
-            _safe_click(driver, search_input, 0.3, 0.7)
-            time.sleep(random.uniform(0.5, 1.0))
-            
-            # Clear any existing text
-            search_input.clear()
-            time.sleep(random.uniform(0.2, 0.5))
-
-            # Type keyword character by character with human-like delays
-            logger.info(f"   Typing '{keyword}' character by character...")
-            for i, char in enumerate(keyword):
-                search_input.send_keys(char)
-                # Variable delay: faster in middle of word, slower at start/after space
-                if char == ' ':
-                    time.sleep(random.uniform(0.15, 0.4))
-                elif i < 2:
-                    time.sleep(random.uniform(0.1, 0.3))
-                else:
-                    time.sleep(random.uniform(0.04, 0.18))
-            
-            logger.info(f"   Keyword typed. Waiting for suggestions...")
-            time.sleep(random.uniform(1.0, 2.5))
-            
-            # Check what's in the input now
+            typing_succeeded = False
             try:
-                current_value = search_input.get_attribute('value') or ''
-                logger.info(f"   Input value after typing: '{current_value}'")
-            except:
-                pass
+                # Move mouse to input field naturally
+                _safe_click(driver, search_input, 0.3, 0.7)
+                time.sleep(random.uniform(0.5, 1.0))
+                
+                # Clear any existing text
+                try:
+                    search_input.clear()
+                except Exception:
+                    driver.execute_script("arguments[0].value = '';", search_input)
+                time.sleep(random.uniform(0.2, 0.5))
+
+                # Type keyword character by character with human-like delays
+                logger.info(f"   Typing '{keyword}' character by character...")
+                for i, char in enumerate(keyword):
+                    search_input.send_keys(char)
+                    # Variable delay: faster in middle of word, slower at start/after space
+                    if char == ' ':
+                        time.sleep(random.uniform(0.15, 0.4))
+                    elif i < 2:
+                        time.sleep(random.uniform(0.1, 0.3))
+                    else:
+                        time.sleep(random.uniform(0.04, 0.18))
+                typing_succeeded = True
+            except Exception as type_err:
+                logger.warning(f"   send_keys failed ({type_err}), falling back to JS typing")
+                # Fallback: type via JavaScript
+                try:
+                    driver.execute_script("""
+                        var input = arguments[0];
+                        var text = arguments[1];
+                        input.focus();
+                        input.value = '';
+                        // Use native input setter to trigger React/Vue events
+                        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        nativeInputValueSetter.call(input, text);
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                    """, search_input, keyword)
+                    typing_succeeded = True
+                    logger.info(f"   JS typing succeeded")
+                except Exception as js_type_err:
+                    logger.warning(f"   JS typing also failed: {js_type_err}")
+            
+            if typing_succeeded:
+                logger.info(f"   Keyword typed. Waiting for suggestions...")
+                time.sleep(random.uniform(1.0, 2.5))
+                
+                # Check what's in the input now
+                try:
+                    current_value = search_input.get_attribute('value') or ''
+                    logger.info(f"   Input value after typing: '{current_value}'")
+                except:
+                    pass
             
             # Try to find and click the search button first (most reliable)
             search_submitted = False
@@ -1326,9 +1352,22 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     break
             
             if not search_submitted:
-                # Fallback: press Enter in the input
+                # Fallback: press Enter in the input or submit form via JS
                 logger.info("   No search button found, pressing Enter...")
-                search_input.send_keys(Keys.RETURN)
+                try:
+                    search_input.send_keys(Keys.RETURN)
+                except Exception:
+                    # JS fallback for submit
+                    logger.info("   send_keys(RETURN) failed, submitting form via JS...")
+                    driver.execute_script("""
+                        var input = arguments[0];
+                        var form = input.closest('form');
+                        if (form) {
+                            form.submit();
+                        } else {
+                            input.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true}));
+                        }
+                    """, search_input)
             
             time.sleep(random.uniform(4, 7))
             
