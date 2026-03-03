@@ -1345,58 +1345,159 @@ def _get_kaleidoscope_v2_step(driver, capsola) -> int:
             logger.error(f"❌ [V2] Cannot parse task array: {task_str[:100]}")
             return None
         
-        # Download image THROUGH THE BROWSER via fetch() to use the same proxy/IP/session
-        # This is critical — requests.get bypasses the proxy and may get a different/invalid image
+        # Download image THROUGH THE BROWSER to use the same proxy/IP/session
+        # This is critical — requests.get without proxy bypasses the proxy and gets a different image
+        image_b64 = None
+        
         try:
             # Set generous script timeout for image download via slow proxy
             try:
                 driver.set_script_timeout(60)
             except Exception:
                 pass
+            
+            # Method 1: Try extracting from existing <img> element on the page (most reliable)
             image_b64 = driver.execute_async_script("""
                 var callback = arguments[arguments.length - 1];
                 var url = arguments[0];
-                fetch(url, {credentials: 'include'})
-                    .then(function(resp) {
-                        if (!resp.ok) { callback({error: 'HTTP ' + resp.status}); return; }
-                        return resp.blob();
-                    })
-                    .then(function(blob) {
+                
+                // Method A: Find existing <img> with this src already loaded
+                var imgs = document.querySelectorAll('img');
+                for (var i = 0; i < imgs.length; i++) {
+                    if (imgs[i].src && imgs[i].src.indexOf('captchaimage') !== -1 && imgs[i].complete && imgs[i].naturalWidth > 0) {
+                        try {
+                            var canvas = document.createElement('canvas');
+                            canvas.width = imgs[i].naturalWidth;
+                            canvas.height = imgs[i].naturalHeight;
+                            canvas.getContext('2d').drawImage(imgs[i], 0, 0);
+                            var dataUrl = canvas.toDataURL('image/png');
+                            callback({data: dataUrl.split(',')[1], size: imgs[i].naturalWidth * imgs[i].naturalHeight, method: 'existing_img'});
+                            return;
+                        } catch(e) { /* tainted canvas, try next method */ }
+                    }
+                }
+                
+                // Method B: XMLHttpRequest (goes through browser proxy, unlike fetch which may fail)
+                var xhr = new XMLHttpRequest();
+                xhr.open('GET', url, true);
+                xhr.responseType = 'blob';
+                xhr.withCredentials = true;
+                xhr.onload = function() {
+                    if (xhr.status === 200) {
                         var reader = new FileReader();
                         reader.onloadend = function() {
-                            callback({data: reader.result.split(',')[1], size: blob.size});
+                            callback({data: reader.result.split(',')[1], size: xhr.response.size, method: 'xhr'});
                         };
-                        reader.readAsDataURL(blob);
-                    })
-                    .catch(function(e) {
-                        callback({error: e.message});
-                    });
+                        reader.readAsDataURL(xhr.response);
+                    } else {
+                        callback({error: 'XHR HTTP ' + xhr.status});
+                    }
+                };
+                xhr.onerror = function() {
+                    // Method C: fetch as last browser attempt
+                    fetch(url, {credentials: 'include'})
+                        .then(function(resp) {
+                            if (!resp.ok) { callback({error: 'fetch HTTP ' + resp.status}); return; }
+                            return resp.blob();
+                        })
+                        .then(function(blob) {
+                            if (!blob) return;
+                            var reader2 = new FileReader();
+                            reader2.onloadend = function() {
+                                callback({data: reader2.result.split(',')[1], size: blob.size, method: 'fetch'});
+                            };
+                            reader2.readAsDataURL(blob);
+                        })
+                        .catch(function(e) {
+                            callback({error: 'all browser methods failed: ' + e.message});
+                        });
+                };
+                xhr.send();
             """, image_src)
         except Exception as fetch_err:
             fetch_err_str = str(fetch_err)
             if 'Timed out' in fetch_err_str or 'timeout' in fetch_err_str.lower():
-                logger.warning(f"⚠️ [V2] Renderer timeout during image fetch — falling back to requests: {fetch_err_str[:150]}")
+                logger.warning(f"⚠️ [V2] Renderer timeout during image download — falling back to requests: {fetch_err_str[:150]}")
             else:
-                logger.warning(f"⚠️ [V2] execute_async_script failed: {fetch_err}")
+                logger.warning(f"⚠️ [V2] Browser image download failed: {fetch_err}")
             image_b64 = None
         
-        if not image_b64 or image_b64.get('error'):
-            logger.warning(f"⚠️ [V2] Browser fetch failed: {image_b64}, falling back to requests.get")
-            # Fallback to requests.get (without proxy — may not work but worth trying)
-            import requests as req
-            cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-            resp = req.get(image_src, cookies=cookies, timeout=15, headers={
-                'User-Agent': driver.execute_script("return navigator.userAgent"),
-                'Referer': driver.current_url
-            })
-            if resp.status_code != 200 or len(resp.content) < 100:
-                logger.error(f"❌ [V2] Fallback download also failed: {resp.status_code}")
-                return None
-            image_data = resp.content
-        else:
+        if image_b64 and not image_b64.get('error') and image_b64.get('data'):
             import base64
             image_data = base64.b64decode(image_b64['data'])
-            logger.info(f"✅ [V2] Image downloaded via browser fetch: {len(image_data)} bytes")
+            dl_method = image_b64.get('method', 'unknown')
+            logger.info(f"✅ [V2] Image downloaded via browser ({dl_method}): {len(image_data)} bytes")
+        else:
+            logger.warning(f"⚠️ [V2] All browser download methods failed: {image_b64}, falling back to requests.get with proxy")
+            import requests as req
+            cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+            ua = driver.execute_script("return navigator.userAgent")
+            referer = driver.current_url
+            
+            # Try to get proxy info from the browser to use same IP
+            proxy_url = None
+            try:
+                # Check Chrome's proxy settings via CDP
+                # The proxy extension or --proxy-server flag routes through local proxy
+                # Try to find the local proxy port
+                chrome_args = driver.execute_script("return navigator.userAgent")  # just to verify driver is alive
+                # Look for proxy in Chrome capabilities
+                caps = driver.capabilities
+                proxy_info = caps.get('proxy', {})
+                if proxy_info:
+                    logger.info(f"📋 [V2] Browser proxy info: {proxy_info}")
+            except Exception:
+                pass
+            
+            # First try with proxy from proxy_ext if available
+            downloaded = False
+            try:
+                import glob
+                proxy_ext_bg = glob.glob('/tmp/proxy_ext_*/background.js')
+                if proxy_ext_bg:
+                    with open(proxy_ext_bg[-1], 'r') as f:
+                        bg_content = f.read()
+                    # Extract proxy details from background.js
+                    import re as re_mod
+                    host_match = re_mod.search(r'host:\s*["\']([^"\']+)', bg_content)
+                    port_match = re_mod.search(r'port:\s*["\']?(\d+)', bg_content)
+                    user_match = re_mod.search(r'username:\s*["\']([^"\']+)', bg_content)
+                    pass_match = re_mod.search(r'password:\s*["\']([^"\']+)', bg_content)
+                    if host_match and port_match:
+                        p_host = host_match.group(1)
+                        p_port = port_match.group(1)
+                        p_user = user_match.group(1) if user_match else ''
+                        p_pass = pass_match.group(1) if pass_match else ''
+                        if p_user and p_pass:
+                            proxy_url = f"http://{p_user}:{p_pass}@{p_host}:{p_port}"
+                        else:
+                            proxy_url = f"http://{p_host}:{p_port}"
+                        logger.info(f"📋 [V2] Found proxy from ext: {p_host}:{p_port}")
+                        resp = req.get(image_src, cookies=cookies, timeout=20,
+                                       proxies={'http': proxy_url, 'https': proxy_url},
+                                       headers={'User-Agent': ua, 'Referer': referer},
+                                       verify=False)
+                        if resp.status_code == 200 and len(resp.content) > 100:
+                            image_data = resp.content
+                            downloaded = True
+                            logger.info(f"✅ [V2] Image downloaded via requests+proxy: {len(image_data)} bytes")
+            except Exception as proxy_err:
+                logger.warning(f"⚠️ [V2] Proxy requests.get failed: {proxy_err}")
+            
+            if not downloaded:
+                # Last resort: requests.get without proxy (LIKELY WRONG IMAGE but better than nothing)
+                try:
+                    resp = req.get(image_src, cookies=cookies, timeout=15, headers={
+                        'User-Agent': ua, 'Referer': referer
+                    })
+                    if resp.status_code != 200 or len(resp.content) < 100:
+                        logger.error(f"❌ [V2] All download methods failed: HTTP {resp.status_code}")
+                        return None
+                    image_data = resp.content
+                    logger.warning(f"⚠️ [V2] Image downloaded WITHOUT proxy (may be wrong image): {len(image_data)} bytes")
+                except Exception as req_err:
+                    logger.error(f"❌ [V2] All download methods failed: {req_err}")
+                    return None
         
         logger.info(f"📤 [V2] Sending image={len(image_data)}b, permutations={len(permutations)} items")
         
@@ -1465,8 +1566,9 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
         logger.info(f"🎯 Setting rep={step} (max={max_step})")
         
         # Wait for PoW (pdata) AND fingerprint fields to be computed by page JavaScript
+        # Increased from 30s to 90s — with 12 concurrent Chrome workers, PoW needs more CPU time
         fields_ready = False
-        for wait_i in range(30):
+        for wait_i in range(90):
             try:
                 field_status = driver.execute_script("""
                     var pdata = document.querySelector('input[name="pdata"]');
@@ -1505,7 +1607,7 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
                 logger.info(f"⏳ Waiting for form fields... ({wait_i + 1}s, pdata={pdata_len}, rdata={rdata_len}, picasso={picasso_len})")
         
         if not fields_ready:
-            logger.warning("⚠️ Form fields not fully computed after 30s, proceeding anyway")
+            logger.warning("⚠️ Form fields not fully computed after 90s, proceeding anyway")
         
         # Also check that rdata and picasso are present (with timeout recovery)
         try:

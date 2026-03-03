@@ -1230,14 +1230,14 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             captcha_solver = CaptchaSolver()
             
             heavy_captcha_detected = any(t in detected_types for t in ('kaleidoscope', 'silhouette', 'advanced_captcha'))
-            max_home_captcha_attempts = 1 if heavy_captcha_detected else 2
+            max_home_captcha_attempts = 2  # Give heavy captchas 2 outer attempts (7 inner each)
 
             # Try solving captcha with limited attempts
             solved = False
             for captcha_attempt in range(1, max_home_captcha_attempts + 1):
                 solve_start = time.time()
                 try:
-                    solved = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=4)
+                    solved = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=7)
                 except Exception as _hp_err:
                     _hp_str = str(_hp_err)
                     if 'Timed out' in _hp_str or 'timeout' in _hp_str.lower():
@@ -1635,14 +1635,14 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             captcha_solver = CaptchaSolver()
             
             heavy_search_captcha = any(t in search_detected for t in ('kaleidoscope', 'silhouette', 'advanced_captcha'))
-            max_search_captcha_attempts = 1 if heavy_search_captcha else 2
+            max_search_captcha_attempts = 2  # Give heavy captchas 2 outer attempts (7 inner each)
 
             # Try solving with limited attempts
             solved2 = False
             for search_captcha_attempt in range(1, max_search_captcha_attempts + 1):
                 solve_start2 = time.time()
                 try:
-                    solved2 = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=4)
+                    solved2 = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=7)
                 except Exception as _hp2_err:
                     _hp2_str = str(_hp2_err)
                     if 'Timed out' in _hp2_str or 'timeout' in _hp2_str.lower():
