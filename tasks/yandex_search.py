@@ -1673,14 +1673,14 @@ def schedule_search_visits():
     # Don't flood the queue — check both Redis queue AND active DB tasks
     try:
         queue_len = r.llen('yandex_search') or 0
-        if queue_len > 25:
+        if queue_len > 50:
             scheduler_logger.warning(f"⏭️ yandex_search queue already has {queue_len} tasks, skipping")
             return {'status': 'skipped', 'reason': f'queue_full ({queue_len})', 'scheduled': 0}
     except Exception as qe:
         scheduler_logger.warning(f"Could not check queue length: {qe}")
 
     # ── Limit total concurrent tasks to avoid overloading proxies ──
-    MAX_CONCURRENT_SEARCH_TASKS = 10
+    MAX_CONCURRENT_SEARCH_TASKS = 20
     try:
         with get_db_session() as db:
             active_count = db.query(Task).filter(
