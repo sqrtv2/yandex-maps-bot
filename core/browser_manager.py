@@ -428,7 +428,15 @@ class BrowserManager:
                 self.driver_path = settings.browser_binary_path
             else:
                 # Use webdriver manager to download driver
-                self.driver_path = ChromeDriverManager().install()
+                installed_path = ChromeDriverManager().install()
+                # webdriver-manager may return THIRD_PARTY_NOTICES or LICENSE
+                # instead of the actual chromedriver binary — fix that
+                if installed_path and 'chromedriver' in os.path.basename(installed_path) and os.path.basename(installed_path) != 'chromedriver':
+                    # e.g. .../THIRD_PARTY_NOTICES.chromedriver — point to actual binary
+                    real_binary = os.path.join(os.path.dirname(installed_path), 'chromedriver')
+                    if os.path.exists(real_binary):
+                        installed_path = real_binary
+                self.driver_path = installed_path
             logger.info(f"Chrome driver setup: {self.driver_path}")
         except Exception as e:
             logger.error(f"Error setting up driver: {e}")
