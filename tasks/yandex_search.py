@@ -2248,7 +2248,8 @@ def schedule_search_visits():
         scheduler_logger.warning(f"Could not check queue length: {qe}")
 
     # ── Limit total concurrent tasks to avoid overloading proxies ──
-    MAX_CONCURRENT_SEARCH_TASKS = 40
+    # With 3 proxies, max ~2 concurrent tasks per proxy to avoid Yandex captchas
+    MAX_CONCURRENT_SEARCH_TASKS = 6
     try:
         with get_db_session() as db:
             active_count = db.query(Task).filter(
