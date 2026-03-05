@@ -2602,16 +2602,17 @@ async def get_positions_pivot(target_id: int, db: Session = Depends(get_db), day
         # Sort dates latest first
         dates_sorted = sorted(all_dates, reverse=True)
 
-        # Build pivot: keyword -> {date: {avg_pos, checks, found, clicked}}
+        # Build pivot: keyword -> {date: {position (last check), checks, found, clicked}}
         pivot = {}
         for kw, date_data in keyword_date_positions.items():
             pivot[kw] = {}
             for d in dates_sorted:
                 if d in date_data:
                     dd = date_data[d]
-                    avg_pos = round(sum(dd["positions"]) / len(dd["positions"]), 1) if dd["positions"] else None
+                    # Use the LAST position of the day (most recent check)
+                    last_pos = dd["positions"][-1] if dd["positions"] else None
                     pivot[kw][d] = {
-                        "avg_position": avg_pos,
+                        "avg_position": last_pos,
                         "checks": dd["found"] + dd["not_found"],
                         "found": dd["found"],
                         "not_found": dd["not_found"],
@@ -2716,7 +2717,8 @@ async def get_search_analytics(target_id: int, db: Session = Depends(get_db), da
             positions = [r.absolute_position for r in found_records if r.absolute_position]
             all_positions.extend(positions)
             
-            avg_pos = round(sum(positions) / len(positions), 1) if positions else None
+            # Use the LAST (most recent) position instead of average
+            avg_pos = positions[-1] if positions else None
             
             # Trend: compare first half vs second half
             trend = "stable"
@@ -2735,10 +2737,9 @@ async def get_search_analytics(target_id: int, db: Session = Depends(get_db), da
             best_pos = min(positions) if positions else None
             worst_pos = max(positions) if positions else None
             
-            # Last 5 checks
-            last_5 = kw_records[-5:]
-            last_5_positions = [r.absolute_position for r in last_5 if r.found and r.absolute_position]
-            current_avg = round(sum(last_5_positions) / len(last_5_positions), 1) if last_5_positions else None
+            # Current position = last successful check
+            last_found = [r for r in kw_records if r.found and r.absolute_position]
+            current_avg = last_found[-1].absolute_position if last_found else None
             
             # Position history for chart (aggregate by date)
             daily_positions = {}
@@ -2755,10 +2756,11 @@ async def get_search_analytics(target_id: int, db: Session = Depends(get_db), da
             
             chart_data = []
             for day, data in sorted(daily_positions.items()):
-                avg_day_pos = round(sum(data["positions"]) / len(data["positions"]), 1) if data["positions"] else None
+                # Use LAST position of the day
+                last_day_pos = data["positions"][-1] if data["positions"] else None
                 chart_data.append({
                     "date": day,
-                    "avg_position": avg_day_pos,
+                    "avg_position": last_day_pos,
                     "checks": data["found"] + data["not_found"],
                     "found": data["found"],
                     "not_found": data["not_found"]
@@ -2782,8 +2784,8 @@ async def get_search_analytics(target_id: int, db: Session = Depends(get_db), da
         # Sort by avg position (best first), keywords not found go last
         keyword_analytics.sort(key=lambda x: (x["avg_position"] is None, x["avg_position"] or 999))
         
-        # Overall summary
-        overall_avg = round(sum(all_positions) / len(all_positions), 1) if all_positions else None
+        # Overall summary — last position across all keywords
+        overall_avg = all_positions[-1] if all_positions else None
         overall_found_rate = round(total_found / total_checks * 100, 1) if total_checks else 0
         
         # Overall trend
@@ -2801,29 +2803,21 @@ async def get_search_analytics(target_id: int, db: Session = Depends(get_db), da
                 overall_trend = "stable"
         
         # === TOP distribution by day ===
-        # For each day, count how many UNIQUE keywords had their AVG position in TOP-3/5/10/20/50
-        # Uses average position (same as the pivot table) for consistency
-        daily_keyword_avg = {}  # {date: {keyword: avg_position}}
-        daily_keyword_positions = {}  # {date: {keyword: [positions]}}
+        # For each day, count how many UNIQUE keywords had their LAST position in TOP-3/5/10/20/50
+        # Uses last (most recent) position of the day, same as pivot table
+        daily_keyword_last = {}  # {date: {keyword: last_position}}
         for r in records:
             if r.found and r.absolute_position and r.checked_at:
                 day_key = r.checked_at.strftime("%Y-%m-%d")
                 kw = r.keyword
-                if day_key not in daily_keyword_positions:
-                    daily_keyword_positions[day_key] = {}
-                if kw not in daily_keyword_positions[day_key]:
-                    daily_keyword_positions[day_key][kw] = []
-                daily_keyword_positions[day_key][kw].append(r.absolute_position)
-        
-        # Calculate averages
-        for day, kw_dict in daily_keyword_positions.items():
-            daily_keyword_avg[day] = {}
-            for kw, positions in kw_dict.items():
-                daily_keyword_avg[day][kw] = round(sum(positions) / len(positions), 1)
+                if day_key not in daily_keyword_last:
+                    daily_keyword_last[day_key] = {}
+                # Records are ordered by checked_at ASC, so last write = latest
+                daily_keyword_last[day_key][kw] = r.absolute_position
         
         top_distribution = []
-        for day in sorted(daily_keyword_avg.keys()):
-            kw_positions = daily_keyword_avg[day]
+        for day in sorted(daily_keyword_last.keys()):
+            kw_positions = daily_keyword_last[day]
             total_kw_day = len(kw_positions)
             top3 = sum(1 for p in kw_positions.values() if p <= 3)
             top5 = sum(1 for p in kw_positions.values() if p <= 5)

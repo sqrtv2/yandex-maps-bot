@@ -45,7 +45,7 @@
     <div class="col-md-2">
         <div class="card border-primary shadow-sm h-100">
             <div class="card-body py-2 text-center">
-                <small class="text-muted d-block">Ср. позиция</small>
+                <small class="text-muted d-block">Позиция</small>
                 <h3 class="mb-0 text-primary" id="summaryAvgPos">—</h3>
             </div>
         </div>
@@ -158,7 +158,7 @@
                             <tr>
                                 <th>Ключевое слово</th>
                                 <th class="text-center">Текущая</th>
-                                <th class="text-center">Средняя</th>
+                                <th class="text-center">Последняя</th>
                                 <th class="text-center">Лучшая</th>
                                 <th class="text-center">Худшая</th>
                                 <th class="text-center">Найдено</th>
@@ -427,8 +427,8 @@ function renderKeywordsTable(keywords) {
                     <div style="height:100%; width:${barWidth}%; background:${barColor}; border-radius:2px;"></div>
                 </div>
             </td>
-            <td class="text-center ${posClass}">${kw.current_avg ? kw.current_avg.toFixed(1) : '—'}</td>
-            <td class="text-center">${kw.avg_position ? kw.avg_position.toFixed(1) : '—'}</td>
+            <td class="text-center ${posClass}">${kw.current_avg ? kw.current_avg : '—'}</td>
+            <td class="text-center">${kw.avg_position ? kw.avg_position : '—'}</td>
             <td class="text-center text-success">${kw.best_position || '—'}</td>
             <td class="text-center text-danger">${kw.worst_position || '—'}</td>
             <td class="text-center"><span class="badge ${foundBadge}">${kw.found_rate}%</span></td>
@@ -713,7 +713,7 @@ function renderKeywordsChart() {
                             const val = context.parsed.y;
                             if (!val) return context.dataset.label + ': нет данных';
                             const zone = val <= 3 ? 'TOP-3' : val <= 5 ? 'TOP-5' : val <= 10 ? 'TOP-10' : val <= 20 ? 'Стр. 2' : 'Стр. 3+';
-                            return `${context.dataset.label}: поз. ${val.toFixed(1)} (${zone})`;
+                            return `${context.dataset.label}: поз. ${val} (${zone})`;
                         }
                     }
                 }
@@ -876,7 +876,7 @@ function renderPivot(data) {
 
                 const clickIcon = cell.clicked > 0 ? ' 🖱' : '';
                 const title = `Позиция: ${pos}\nПроверок: ${cell.checks}\nНайден: ${cell.found}\nКликов: ${cell.clicked}`;
-                bodyHtml += `<td class="text-center" style="font-size:0.75rem; background:${bg}; color:${fg}; font-weight:600;" title="${title}">${pos % 1 === 0 ? pos.toFixed(0) : pos.toFixed(1)}${clickIcon}</td>`;
+                bodyHtml += `<td class="text-center" style="font-size:0.75rem; background:${bg}; color:${fg}; font-weight:600;" title="${title}">${pos}${clickIcon}</td>`;
             }
         });
         bodyHtml += '</tr>';
