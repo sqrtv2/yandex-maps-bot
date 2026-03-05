@@ -475,12 +475,35 @@ class BrowserManager:
                 except OSError:
                     pass
         
-        # 3. Clean crash artifacts
+        # 3. Clean crash artifacts and session restore data
+        # Session restore files can cause "Browser window not found" crashes
         for artifact in ['.com.google.Chrome.*']:
             import glob
             for f in glob.glob(os.path.join(profile_dir, artifact)):
                 try:
                     os.remove(f)
+                except OSError:
+                    pass
+        
+        # Clean crash sentinel and session storage that may crash Chrome on startup
+        default_dir = os.path.join(profile_dir, 'Default')
+        if os.path.isdir(default_dir):
+            for crash_file in ['Current Session', 'Current Tabs', 'Last Session', 'Last Tabs',
+                               'Visited Links', 'TransportSecurity']:
+                fpath = os.path.join(default_dir, crash_file)
+                if os.path.exists(fpath):
+                    try:
+                        fsize = os.path.getsize(fpath) / (1024 * 1024)
+                        if fsize > 10:  # >10MB means likely corrupted
+                            os.remove(fpath)
+                            logger.warning(f"🗑️ Removed bloated {crash_file} ({fsize:.0f}MB)")
+                    except OSError:
+                        pass
+            # Remove crash sentinel
+            sentinel = os.path.join(profile_dir, 'Default', '.org.chromium.Chromium.crash')
+            if os.path.exists(sentinel):
+                try:
+                    os.remove(sentinel)
                 except OSError:
                     pass
         
@@ -589,6 +612,19 @@ class BrowserManager:
 
             # Apply profile settings
             self._apply_profile_settings(driver, profile_data)
+
+            # Verify browser is still alive after applying profile settings
+            try:
+                _ = driver.current_url
+            except Exception as health_err:
+                logger.error(f"💀 Browser died during profile setup: {health_err}")
+                # Clean up the dead Chrome process
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                self._kill_chrome_by_profile_dir(profile_dir)
+                raise WebDriverException(f"Browser crashed during profile setup: {health_err}")
 
             # Store browser instance
             self.active_browsers[browser_id] = driver
@@ -885,6 +921,13 @@ class BrowserManager:
             logger.info(f"Applied profile settings for: {profile_data['name']} ({'mobile' if is_mobile else 'desktop'})")
 
         except Exception as e:
+            error_str = str(e)
+            # Fatal browser errors — browser window crashed or session died
+            fatal_keywords = ['Browser window not found', 'invalid session id', 'session deleted',
+                              'browser has closed', 'not reachable', 'disconnected']
+            if any(kw.lower() in error_str.lower() for kw in fatal_keywords):
+                logger.error(f"💀 Fatal error applying profile settings (browser crashed): {e}")
+                raise  # Re-raise so create_browser_session knows browser is dead
             logger.error(f"Error applying profile settings: {e}")
 
     def _inject_fingerprint_scripts(self, driver: webdriver.Chrome, profile_data: Dict):

@@ -2159,6 +2159,23 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         error_str = str(e)
         logger.error(f"Error in search click-through for profile {profile_id}: {e}")
         
+        # Retry on browser session crashes (invalid session id / browser window not found)
+        if 'invalid session id' in error_str or 'Browser window not found' in error_str or 'Browser crashed during profile setup' in error_str:
+            logger.warning(f"🔄 Browser session crashed — will retry (profile {profile_id})")
+            if task_id:
+                _update_search_task_log(task_id, f"🔄 Браузер упал при запуске, повторяем...")
+            # Close current browser before retry
+            if browser_manager and browser_id:
+                try:
+                    browser_manager.close_browser_session(browser_id)
+                    browser_id = None
+                except Exception:
+                    pass
+            try:
+                raise self.retry(exc=e, countdown=15, max_retries=2)
+            except self.MaxRetriesExceededError:
+                logger.error(f"Max retries exceeded for browser crash (profile {profile_id})")
+
         # Retry on proxy tunnel failures (ERR_TUNNEL_CONNECTION_FAILED)
         if 'ERR_TUNNEL_CONNECTION_FAILED' in error_str or 'ERR_PROXY_CONNECTION_FAILED' in error_str:
             logger.warning("🔄 Proxy tunnel failed — will retry with different proxy")
