@@ -2250,8 +2250,8 @@ def schedule_search_visits():
     # ── Limit total concurrent tasks to avoid overloading proxies ──
     # concurrency=6 in docker-compose limits actual simultaneous workers (2 per proxy)
     # This limit controls how many tasks sit in queue (pending+in_progress)
-    # Set higher than concurrency so workers always have work ready
-    MAX_CONCURRENT_SEARCH_TASKS = 20
+    # Keep slightly above concurrency so workers always have work ready
+    MAX_CONCURRENT_SEARCH_TASKS = 10
     try:
         with get_db_session() as db:
             active_count = db.query(Task).filter(
