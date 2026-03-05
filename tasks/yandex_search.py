@@ -431,7 +431,7 @@ def _pre_inject_analytics_blocker(driver):
         logger.warning(f"⚠️ Failed to pre-inject analytics blocker: {e}")
 
 
-
+def _block_analytics_on_target(driver):
     """Block Yandex Metrika, Google Analytics, and other analytics/tracking scripts via CDP.
     
     This prevents analytics from loading and detecting bot behavior when visiting target sites.
