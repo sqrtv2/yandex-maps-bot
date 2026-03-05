@@ -2248,8 +2248,10 @@ def schedule_search_visits():
         scheduler_logger.warning(f"Could not check queue length: {qe}")
 
     # ── Limit total concurrent tasks to avoid overloading proxies ──
-    # With 3 proxies, max ~2 concurrent tasks per proxy to avoid Yandex captchas
-    MAX_CONCURRENT_SEARCH_TASKS = 6
+    # concurrency=6 in docker-compose limits actual simultaneous workers (2 per proxy)
+    # This limit controls how many tasks sit in queue (pending+in_progress)
+    # Set higher than concurrency so workers always have work ready
+    MAX_CONCURRENT_SEARCH_TASKS = 20
     try:
         with get_db_session() as db:
             active_count = db.query(Task).filter(
