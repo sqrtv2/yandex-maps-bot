@@ -2801,20 +2801,29 @@ async def get_search_analytics(target_id: int, db: Session = Depends(get_db), da
                 overall_trend = "stable"
         
         # === TOP distribution by day ===
-        # For each day, count how many UNIQUE keywords had their best position in TOP-3/5/10/20/50
-        daily_keyword_best = {}  # {date: {keyword: best_position}}
+        # For each day, count how many UNIQUE keywords had their AVG position in TOP-3/5/10/20/50
+        # Uses average position (same as the pivot table) for consistency
+        daily_keyword_avg = {}  # {date: {keyword: avg_position}}
+        daily_keyword_positions = {}  # {date: {keyword: [positions]}}
         for r in records:
             if r.found and r.absolute_position and r.checked_at:
                 day_key = r.checked_at.strftime("%Y-%m-%d")
                 kw = r.keyword
-                if day_key not in daily_keyword_best:
-                    daily_keyword_best[day_key] = {}
-                if kw not in daily_keyword_best[day_key] or r.absolute_position < daily_keyword_best[day_key][kw]:
-                    daily_keyword_best[day_key][kw] = r.absolute_position
+                if day_key not in daily_keyword_positions:
+                    daily_keyword_positions[day_key] = {}
+                if kw not in daily_keyword_positions[day_key]:
+                    daily_keyword_positions[day_key][kw] = []
+                daily_keyword_positions[day_key][kw].append(r.absolute_position)
+        
+        # Calculate averages
+        for day, kw_dict in daily_keyword_positions.items():
+            daily_keyword_avg[day] = {}
+            for kw, positions in kw_dict.items():
+                daily_keyword_avg[day][kw] = round(sum(positions) / len(positions), 1)
         
         top_distribution = []
-        for day in sorted(daily_keyword_best.keys()):
-            kw_positions = daily_keyword_best[day]
+        for day in sorted(daily_keyword_avg.keys()):
+            kw_positions = daily_keyword_avg[day]
             total_kw_day = len(kw_positions)
             top3 = sum(1 for p in kw_positions.values() if p <= 3)
             top5 = sum(1 for p in kw_positions.values() if p <= 5)
