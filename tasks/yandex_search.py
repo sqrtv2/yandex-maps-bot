@@ -184,161 +184,6 @@ def _human_scroll(driver, min_scrolls=2, max_scrolls=5):
         time.sleep(random.uniform(0.5, 1.0))
 
 
-# === Shared list of analytics URL patterns to block ===
-_ANALYTICS_BLOCKED_URLS = [
-    # Yandex Metrika
-    '*mc.yandex.ru*',
-    '*metrika.yandex.ru*',
-    '*cdn.metrika.yandex.net*',
-    '*watch.metrika*',
-    '*metrica.yandex.com*',
-    '*informer.yandex.ru*',
-    '*webvisor*',
-    '*tag.js*yandex*',
-    # Google Analytics / Tag Manager
-    '*google-analytics.com*',
-    '*googletagmanager.com*',
-    '*gtag*',
-    '*analytics.google.com*',
-    # Other common trackers
-    '*mc.yandex.com*',
-    '*top-fwz1.mail.ru*',
-    '*top.mail.ru*',
-    '*counter.yadro.ru*',
-    '*rating.openstat.ru*',
-    '*hotjar.com*',
-    '*mouseflow.com*',
-    '*clarity.ms*',
-    '*pixel.wp.com*',
-    '*connect.facebook.net*',
-    '*bat.bing.com*',
-]
-
-# JS code that kills Metrica/GA before any page script can use them.
-# Used by Page.addScriptToEvaluateOnNewDocument (runs before ANY page JS).
-_ANALYTICS_KILL_JS = """
-    // === PRE-INJECTED ANALYTICS KILLER (runs before page scripts) ===
-    // Neuter Yandex Metrika
-    window.Ya = window.Ya || {};
-    window.Ya.Metrika2 = function() { return { reachGoal: function(){}, hit: function(){}, params: function(){}, getClientID: function(){ return '0'; }, setUserID: function(){}, userParams: function(){} }; };
-    window.Ya.Metrika = window.Ya.Metrika2;
-    window.ym = function() {};
-    Object.defineProperty(window, 'ym', { value: function(){}, writable: false, configurable: false });
-    
-    // Neuter Google Analytics
-    window.ga = function() {};
-    window.gtag = function() {};
-    window.dataLayer = [];
-    Object.defineProperty(window, 'ga', { value: function(){}, writable: false, configurable: false });
-    Object.defineProperty(window, 'gtag', { value: function(){}, writable: false, configurable: false });
-    
-    // Block beacon/sendBeacon (used by analytics to send data on page unload)
-    if (navigator.sendBeacon) {
-        navigator.sendBeacon = function() { return true; };
-    }
-    
-    // Block fetch to analytics domains
-    var _origFetch = window.fetch;
-    window.fetch = function(url) {
-        if (typeof url === 'string' && (url.indexOf('mc.yandex') !== -1 || url.indexOf('metrika') !== -1 || 
-            url.indexOf('google-analytics') !== -1 || url.indexOf('googletagmanager') !== -1 ||
-            url.indexOf('webvisor') !== -1 || url.indexOf('hotjar') !== -1 || url.indexOf('clarity.ms') !== -1)) {
-            return Promise.resolve(new Response('', {status: 200}));
-        }
-        return _origFetch.apply(this, arguments);
-    };
-    
-    // Block XMLHttpRequest to analytics domains
-    var _origXHROpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(method, url) {
-        if (typeof url === 'string' && (url.indexOf('mc.yandex') !== -1 || url.indexOf('metrika') !== -1 || 
-            url.indexOf('google-analytics') !== -1 || url.indexOf('googletagmanager') !== -1 ||
-            url.indexOf('webvisor') !== -1)) {
-            this._blocked = true;
-            return;
-        }
-        return _origXHROpen.apply(this, arguments);
-    };
-    var _origXHRSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.send = function() {
-        if (this._blocked) return;
-        return _origXHRSend.apply(this, arguments);
-    };
-    
-    // Prevent new script elements from loading analytics
-    var _origCreate = document.createElement;
-    document.createElement = function(tag) {
-        var el = _origCreate.call(document, tag);
-        if (tag.toLowerCase() === 'script') {
-            var _origSrcDesc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
-            Object.defineProperty(el, 'src', {
-                set: function(val) {
-                    if (val && (val.indexOf('metrika') !== -1 || val.indexOf('mc.yandex') !== -1 ||
-                                val.indexOf('google-analytics') !== -1 || val.indexOf('googletagmanager') !== -1 ||
-                                val.indexOf('webvisor') !== -1 || val.indexOf('tag.js') !== -1 ||
-                                val.indexOf('hotjar') !== -1 || val.indexOf('clarity.ms') !== -1)) {
-                        return;  // Block analytics script loading
-                    }
-                    if (_origSrcDesc && _origSrcDesc.set) _origSrcDesc.set.call(el, val);
-                },
-                get: function() {
-                    if (_origSrcDesc && _origSrcDesc.get) return _origSrcDesc.get.call(el);
-                }
-            });
-        }
-        return el;
-    };
-    
-    // Block Image beacon (used by older Metrika)
-    var _origImage = window.Image;
-    window.Image = function(w, h) {
-        var img = new _origImage(w, h);
-        var _origSrcDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-        Object.defineProperty(img, 'src', {
-            set: function(val) {
-                if (val && (val.indexOf('mc.yandex') !== -1 || val.indexOf('metrika') !== -1 ||
-                            val.indexOf('google-analytics') !== -1)) {
-                    return;
-                }
-                if (_origSrcDesc && _origSrcDesc.set) _origSrcDesc.set.call(img, val);
-            },
-            get: function() {
-                if (_origSrcDesc && _origSrcDesc.get) return _origSrcDesc.get.call(img);
-            }
-        });
-        return img;
-    };
-"""
-
-
-def _pre_inject_analytics_blocker(driver):
-    """Pre-inject analytics blocker via CDP Page.addScriptToEvaluateOnNewDocument.
-    
-    This is the MOST IMPORTANT function for blocking Metrica.
-    It injects JS that runs BEFORE any page scripts in ALL new documents,
-    including new tabs opened by clicking links.
-    
-    Must be called BEFORE the click that navigates to the target site.
-    The injected script persists across navigations until the browser is closed.
-    """
-    try:
-        if hasattr(driver, 'execute_cdp_cmd'):
-            # This injects a script that runs before ANY page JS in every new document
-            result = driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': _ANALYTICS_KILL_JS
-            })
-            logger.info(f"🛡️ Pre-injected analytics killer via Page.addScriptToEvaluateOnNewDocument (id={result.get('identifier', '?')})")
-            
-            # Also block analytics URLs at network level
-            driver.execute_cdp_cmd('Network.enable', {})
-            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
-            logger.info(f"🛡️ Pre-blocked {len(_ANALYTICS_BLOCKED_URLS)} analytics URLs via CDP Network")
-        else:
-            logger.warning("⚠️ CDP not available for pre-injection")
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to pre-inject analytics blocker: {e}")
-
-
 def _block_analytics_on_target(driver):
     """Block Yandex Metrika, Google Analytics, and other analytics/tracking scripts via CDP.
     
@@ -346,20 +191,84 @@ def _block_analytics_on_target(driver):
     Uses Network.setBlockedURLs (CDP) to block requests before they are made.
     Also injects JS to neuter common analytics objects.
     """
+    blocked_urls = [
+        # Yandex Metrika
+        '*mc.yandex.ru*',
+        '*metrika.yandex.ru*',
+        '*cdn.metrika.yandex.net*',
+        '*watch.metrika*',
+        '*metrica.yandex.com*',
+        '*informer.yandex.ru*',
+        '*webvisor*',
+        '*tag.js*yandex*',
+        # Google Analytics / Tag Manager
+        '*google-analytics.com*',
+        '*googletagmanager.com*',
+        '*gtag*',
+        '*analytics.google.com*',
+        # Other common trackers
+        '*mc.yandex.com*',
+        '*top-fwz1.mail.ru*',
+        '*top.mail.ru*',
+        '*counter.yadro.ru*',
+        '*rating.openstat.ru*',
+        '*hotjar.com*',
+        '*mouseflow.com*',
+        '*clarity.ms*',
+        '*pixel.wp.com*',
+        '*connect.facebook.net*',
+        '*bat.bing.com*',
+    ]
+    
     try:
         if hasattr(driver, 'execute_cdp_cmd'):
             # Enable network domain first
             driver.execute_cdp_cmd('Network.enable', {})
-            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
-            logger.info(f"🛡️ Blocked {len(_ANALYTICS_BLOCKED_URLS)} analytics/tracker URL patterns via CDP")
+            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': blocked_urls})
+            logger.info(f"🛡️ Blocked {len(blocked_urls)} analytics/tracker URL patterns via CDP")
         else:
             logger.warning("⚠️ CDP not available, cannot block analytics URLs")
     except Exception as e:
         logger.warning(f"⚠️ Failed to set blocked URLs via CDP: {e}")
     
-    # Also inject JS to neuter analytics objects on the current page
+    # Also inject JS to neuter common analytics objects
     try:
-        driver.execute_script(_ANALYTICS_KILL_JS)
+        driver.execute_script("""
+            // Neuter Yandex Metrika
+            window.Ya = window.Ya || {};
+            window.Ya.Metrika2 = function() { return { reachGoal: function(){}, hit: function(){}, params: function(){} }; };
+            window.Ya.Metrika = window.Ya.Metrika2;
+            window.ym = function() {};
+            
+            // Neuter Google Analytics
+            window.ga = function() {};
+            window.gtag = function() {};
+            window.dataLayer = [];
+            
+            // Prevent new script elements from loading analytics
+            var origCreate = document.createElement;
+            document.createElement = function(tag) {
+                var el = origCreate.call(document, tag);
+                if (tag.toLowerCase() === 'script') {
+                    var origSetAttr = el.setAttribute.bind(el);
+                    var _origSrcDesc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+                    Object.defineProperty(el, 'src', {
+                        set: function(val) {
+                            if (val && (val.indexOf('metrika') !== -1 || val.indexOf('mc.yandex') !== -1 ||
+                                        val.indexOf('google-analytics') !== -1 || val.indexOf('googletagmanager') !== -1 ||
+                                        val.indexOf('webvisor') !== -1 || val.indexOf('tag.js') !== -1)) {
+                                return;  // Block analytics script loading
+                            }
+                            if (_origSrcDesc && _origSrcDesc.set) _origSrcDesc.set.call(el, val);
+                        },
+                        get: function() {
+                            if (_origSrcDesc && _origSrcDesc.get) return _origSrcDesc.get.call(el);
+                        }
+                    });
+                }
+                return el;
+            };
+        """)
         logger.info("🛡️ Injected analytics neutralization JS")
     except Exception as e:
         logger.warning(f"⚠️ Failed to inject analytics neutralization JS: {e}")
@@ -384,7 +293,14 @@ def _abort_page_load_fast(driver, wait_before_abort=None):
     
     # Re-inject analytics neutralization after stop
     try:
-        driver.execute_script(_ANALYTICS_KILL_JS)
+        driver.execute_script("""
+            window.Ya = window.Ya || {};
+            window.Ya.Metrika2 = function() { return { reachGoal: function(){}, hit: function(){}, params: function(){} }; };
+            window.Ya.Metrika = window.Ya.Metrika2;
+            window.ym = function() {};
+            window.ga = function() {};
+            window.gtag = function() {};
+        """)
     except Exception:
         pass
 
@@ -396,173 +312,6 @@ def _human_read_page(driver, min_time=5, max_time=15):
     while time.time() - start < read_time:
         _human_scroll(driver, 1, 2)
         time.sleep(random.uniform(1.0, 3.0))
-
-
-def _browse_target_site(driver, domain: str, min_time: int = 30, max_time: int = 120):
-    """
-    Browse the target site naturally after clicking from search results.
-    Simulates realistic human behavior: scrolling, reading, mouse movements,
-    clicking internal links, pausing to read content.
-    
-    This generates proper behavioral signals for Yandex Metrika:
-    - Time on site (30-120 seconds)
-    - Scroll depth
-    - Mouse movements
-    - Internal page navigation
-    
-    Returns actual time spent browsing in seconds.
-    """
-    browse_start = time.time()
-    browse_duration = random.uniform(min_time, max_time)
-    end_time = browse_start + browse_duration
-    domain_clean = domain.lower().replace('https://', '').replace('http://', '').replace('www.', '').rstrip('/')
-    pages_visited = 1
-    max_internal_pages = random.randint(1, 3)  # Visit 1-3 pages total
-    
-    logger.info(f"📖 Browsing {domain} for ~{browse_duration:.0f}s (min={min_time}, max={max_time})")
-    
-    # Wait for page to load
-    time.sleep(random.uniform(2.0, 4.0))
-    
-    # Try to dismiss cookie consent
-    try:
-        cookie_selectors = [
-            "button[class*='cookie']", "button[class*='consent']",
-            "button[class*='accept']", "a[class*='cookie']",
-            "[data-testid*='cookie'] button", ".cookie-banner button",
-            "#cookie-accept", ".js-cookie-accept",
-            "button[class*='agree']", ".gdpr-accept",
-            "button[class*='Cookie']", ".cookie-notice button",
-        ]
-        for sel in cookie_selectors:
-            try:
-                btns = driver.find_elements(By.CSS_SELECTOR, sel)
-                for btn in btns[:2]:
-                    if btn.is_displayed() and btn.size.get('height', 0) > 10:
-                        ActionChains(driver).move_to_element(btn).pause(
-                            random.uniform(0.2, 0.5)
-                        ).click().perform()
-                        time.sleep(random.uniform(0.5, 1.0))
-                        logger.info("   🍪 Dismissed cookie banner")
-                        break
-            except Exception:
-                continue
-    except Exception:
-        pass
-    
-    while time.time() < end_time:
-        remaining = end_time - time.time()
-        if remaining < 2:
-            break
-        
-        # Choose action with human-like weights
-        action = random.choices(
-            ["scroll_down", "scroll_up", "pause_read", "mouse_move", "click_internal_link"],
-            weights=[35, 8, 30, 17, 10],
-            k=1
-        )[0]
-        
-        try:
-            if action == "scroll_down":
-                # Smooth scroll down
-                distance = random.randint(150, 500)
-                steps = random.randint(2, 5)
-                step_size = distance // steps
-                for _ in range(steps):
-                    driver.execute_script(f"window.scrollBy({{top: {step_size}, behavior: 'smooth'}});")
-                    time.sleep(random.uniform(0.03, 0.08))
-                time.sleep(random.uniform(0.5, 2.5))
-            
-            elif action == "scroll_up":
-                # Occasionally scroll back up
-                distance = random.randint(80, 250)
-                driver.execute_script(f"window.scrollBy({{top: -{distance}, behavior: 'smooth'}});")
-                time.sleep(random.uniform(0.4, 1.2))
-            
-            elif action == "pause_read":
-                # Simulate reading content — just pause
-                time.sleep(random.uniform(2.0, 6.0))
-            
-            elif action == "mouse_move":
-                # Move mouse to random position (generates mouse events for Metrika)
-                try:
-                    viewport_w = driver.execute_script("return window.innerWidth") or 1200
-                    viewport_h = driver.execute_script("return window.innerHeight") or 800
-                    body = driver.find_element(By.TAG_NAME, "body")
-                    x = random.randint(50, max(51, viewport_w - 50))
-                    y = random.randint(50, max(51, viewport_h - 50))
-                    ActionChains(driver).move_to_element_with_offset(
-                        body, x, y
-                    ).perform()
-                    time.sleep(random.uniform(0.3, 0.8))
-                    
-                    # Sometimes do a multi-step mouse movement (more natural)
-                    if random.random() < 0.4:
-                        x2 = random.randint(50, max(51, viewport_w - 50))
-                        y2 = random.randint(50, max(51, viewport_h - 50))
-                        ActionChains(driver).move_to_element_with_offset(
-                            body, x2, y2
-                        ).perform()
-                        time.sleep(random.uniform(0.2, 0.5))
-                except Exception:
-                    time.sleep(0.5)
-            
-            elif action == "click_internal_link" and pages_visited < max_internal_pages and remaining > 15:
-                # Try to click an internal link on the page
-                try:
-                    internal_links = driver.execute_script("""
-                        var domain = arguments[0];
-                        var links = document.querySelectorAll('a[href]');
-                        var internal = [];
-                        for (var i = 0; i < links.length; i++) {
-                            var href = links[i].href || '';
-                            var rect = links[i].getBoundingClientRect();
-                            if (rect.height < 10 || rect.width < 20) continue;
-                            if (rect.top < 0 || rect.top > window.innerHeight) continue;
-                            try {
-                                var u = new URL(href);
-                                var host = u.hostname.replace('www.', '');
-                                if (host.indexOf(domain) !== -1 && u.pathname !== window.location.pathname
-                                    && u.pathname.length > 1 && !href.match(/#$/)) {
-                                    internal.push(links[i]);
-                                }
-                            } catch(e) {}
-                        }
-                        return internal.slice(0, 5);
-                    """, domain_clean)
-                    
-                    if internal_links:
-                        link = random.choice(internal_links)
-                        # Scroll to the link naturally
-                        driver.execute_script(
-                            "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});",
-                            link
-                        )
-                        time.sleep(random.uniform(0.5, 1.2))
-                        
-                        # Click it
-                        try:
-                            ActionChains(driver).move_to_element(link).pause(
-                                random.uniform(0.3, 0.7)
-                            ).click().perform()
-                        except Exception:
-                            driver.execute_script("arguments[0].click();", link)
-                        
-                        pages_visited += 1
-                        logger.info(f"   📄 Clicked internal link (page {pages_visited})")
-                        time.sleep(random.uniform(2.0, 4.0))  # Wait for page load
-                    else:
-                        # No internal links found, just scroll instead
-                        driver.execute_script(f"window.scrollBy({{top: {random.randint(200, 400)}, behavior: 'smooth'}});")
-                        time.sleep(random.uniform(1.0, 2.0))
-                except Exception:
-                    time.sleep(1.0)
-        except Exception:
-            time.sleep(0.5)
-    
-    actual_browse_time = time.time() - browse_start
-    logger.info(f"📖 Finished browsing {domain}: {actual_browse_time:.1f}s, {pages_visited} page(s)")
-    return actual_browse_time
 
 
 def _get_real_serp_position(driver, element) -> int:
@@ -1173,14 +922,8 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
             # Remember windows before click
             windows_before = driver.window_handles
             
-            # Allow page to load normally — NO analytics blocking!
-            # We WANT Metrika to see a real human-like visit with proper
-            # time on site, scrolls, and engagement signals.
-            try:
-                driver.set_page_load_timeout(30)
-            except Exception:
-                pass
-            
+            # DO NOT block analytics before click — we need Yandex's click tracking
+            # (yandex.ru/clck redirect) to register the click properly
             try:
                 _safe_click(driver, click_element)
             except Exception as click_err:
@@ -1188,7 +931,9 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
             
             # === Wait for Yandex click redirect to complete ===
             # The click goes through yandex.ru/clck → target site
-            time.sleep(random.uniform(2.0, 4.0))
+            # We need to wait for this redirect to happen (click registered)
+            # but abort BEFORE the target site fully loads (prevent Metrika)
+            time.sleep(random.uniform(1.5, 3.0))
             
             # Check if new tab was opened
             windows_after = driver.window_handles
@@ -1196,85 +941,27 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
                 new_window = [w for w in windows_after if w not in windows_before][0]
                 logger.info(f"   New tab opened, switching to it")
                 driver.switch_to.window(new_window)
-                time.sleep(random.uniform(1.0, 2.0))
+                time.sleep(random.uniform(0.5, 1.5))
             
-            # Check current URL
+            # Check if we've left Yandex (redirect completed)
             try:
                 current_url = driver.current_url.lower()
-            except TimeoutException:
-                current_url = ''
-                logger.info("   ⏳ current_url timed out (page still loading)")
             except Exception:
                 current_url = ''
-            if current_url:
-                logger.info(f"   Current URL after click: {current_url[:150]}")
+            logger.info(f"   Current URL after click: {driver.current_url[:150] if current_url else 'unknown'}")
             
             # Wait a bit more if still on Yandex redirect
-            if current_url and ('yandex.ru/clck' in current_url or 'ya.ru/clck' in current_url):
+            if 'yandex.ru/clck' in current_url or 'ya.ru/clck' in current_url:
                 logger.info(f"   Still on Yandex redirect, waiting...")
-                time.sleep(random.uniform(3.0, 5.0))
+                time.sleep(random.uniform(2.0, 4.0))
                 try:
                     current_url = driver.current_url.lower()
                 except Exception:
-                    current_url = ''
+                    pass
             
-            # === Smart navigation wait ===
-            def _is_on_yandex(url):
-                host = urlparse(url).netloc.lower().replace('www.', '')
-                return 'ya.ru' in host or 'yandex.ru' in host
-            
-            still_on_yandex = _is_on_yandex(current_url) if current_url else True
-            
-            if still_on_yandex:
-                # Poll URL up to ~15s total waiting for navigation off Yandex
-                max_nav_checks = 10
-                nav_wait_each = random.uniform(1.2, 1.8)
-                for nav_i in range(max_nav_checks):
-                    time.sleep(nav_wait_each)
-                    try:
-                        current_url = driver.current_url.lower()
-                    except TimeoutException:
-                        logger.info(f"   ⏳ URL check timed out at poll {nav_i+1} — page loading...")
-                        time.sleep(3)
-                        try:
-                            current_url = driver.current_url.lower()
-                        except Exception:
-                            current_url = ''
-                        break
-                    except Exception:
-                        current_url = ''
-                        break
-                    if not _is_on_yandex(current_url):
-                        logger.info(f"   ✅ Navigation detected after {(nav_i+1)*nav_wait_each:.1f}s: {current_url[:120]}")
-                        break
-                    # On Yandex /clck redirect — keep waiting
-                    if 'clck' in current_url:
-                        logger.info(f"   ⏳ Still on /clck redirect (check {nav_i+1}/{max_nav_checks})...")
-                        continue
-                    # Still on SERP — try clicking again (JS click) on even iterations
-                    if nav_i in (1, 3, 5):
-                        logger.info(f"   🔄 Still on Yandex SERP, retrying JS click (attempt {nav_i+1})...")
-                        try:
-                            driver.execute_script("arguments[0].click();", click_element)
-                        except Exception:
-                            pass
-                else:
-                    logger.warning(f"   ⏰ Navigation did not happen after {max_nav_checks} checks, giving up")
-            
-            # Restore normal page_load_timeout
-            try:
-                driver.set_page_load_timeout(60)
-            except Exception:
-                pass
-            
-            # Wait for target page to fully load
-            try:
-                WebDriverWait(driver, 15).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-                logger.info("   ✅ Target page fully loaded")
-            except Exception:
-                logger.info("   ⏳ Target page load timed out, continuing anyway")
+            # NOW block analytics and abort page load on target site
+            _block_analytics_on_target(driver)
+            _abort_page_load_fast(driver, wait_before_abort=random.uniform(0.3, 1.0))
             
             # Verify click success
             try:
@@ -1284,12 +971,14 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
                 final_url = ''
                 final_host = ''
             
-            on_yandex = _is_on_yandex(final_url) if final_url else True
+            on_yandex = ('ya.ru' in final_host or 'yandex.ru' in final_host)
             clicked = (not on_yandex) and (domain_clean in final_host or domain_clean in final_url)
             
             # If still on Yandex, the redirect might not have worked
             if on_yandex and not clicked:
                 logger.warning(f"   Still on Yandex after click: {final_url[:100]}")
+                # Don't do direct navigation — that defeats the purpose of organic click
+                # Just report as click_failed
             
             logger.info(f"   Final result: clicked={clicked}, host={final_host}")
             
@@ -1381,7 +1070,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
 
 
 @shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=30,
-             soft_time_limit=900, time_limit=960)
+             soft_time_limit=600, time_limit=660)
 def yandex_search_click_task(self, profile_id: int, target_id: int,
                              keyword: str, task_id: int = None,
                              search_params: Dict = None):
@@ -1513,43 +1202,6 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
 
         if task_id:
             _update_search_task_log(task_id, "🌐 Открываем Яндекс...")
-
-        # === Step 0: Optionally visit referrer site (mail.ru) before Yandex ===
-        # This creates a natural referrer header when navigating to ya.ru
-        referrer_percent = 50  # default
-        referrer_site = 'https://mail.ru'
-        try:
-            from app.models.user_settings import UserSettings as _US
-            with get_db_session() as _sdb:
-                _rp = _sdb.query(_US).filter(_US.setting_key == 'search_referrer_percent').first()
-                if _rp:
-                    referrer_percent = int(_rp.setting_value)
-                _rs = _sdb.query(_US).filter(_US.setting_key == 'search_referrer_site').first()
-                if _rs and _rs.setting_value:
-                    referrer_site = _rs.setting_value.strip()
-        except Exception:
-            pass
-
-        use_referrer = random.randint(1, 100) <= referrer_percent
-        if use_referrer and referrer_percent > 0:
-            logger.info(f"🔗 Visiting referrer site first: {referrer_site} (referrer_percent={referrer_percent}%)")
-            if task_id:
-                _update_search_task_log(task_id, f"🔗 Переход через {referrer_site}...")
-            try:
-                driver.get(referrer_site)
-                # Wait for the page to partially load and cookies to be set
-                time.sleep(random.uniform(2.5, 5.0))
-                # Simulate a tiny bit of activity — scroll slightly
-                try:
-                    driver.execute_script(f"window.scrollBy(0, {random.randint(50, 200)})")
-                except Exception:
-                    pass
-                time.sleep(random.uniform(1.0, 2.5))
-                logger.info(f"📄 Referrer page loaded: {driver.current_url[:100]}")
-            except Exception as ref_err:
-                logger.warning(f"⚠️ Referrer site visit failed: {ref_err}")
-        else:
-            logger.info(f"⏩ Skipping referrer (referrer_percent={referrer_percent}%, roll={'use' if use_referrer else 'skip'})")
 
         # === Step 1: Open Yandex ===
         driver.get("https://ya.ru")
@@ -2129,12 +1781,11 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 profile_id=profile_id, task_id=task_id, clicked=False
             )
             
-            # Auto-disable keyword after 3 consecutive not_found — DISABLED
-            # All keywords should always remain active regardless of not_found count
-            # try:
-            #     _check_and_disable_keyword(target_id, keyword, domain, consecutive_threshold=3)
-            # except Exception as disable_err:
-            #     logger.warning(f"Error checking auto-disable for keyword '{keyword}': {disable_err}")
+            # Auto-disable keyword after 3 consecutive not_found
+            try:
+                _check_and_disable_keyword(target_id, keyword, domain, consecutive_threshold=3)
+            except Exception as disable_err:
+                logger.warning(f"Error checking auto-disable for keyword '{keyword}': {disable_err}")
             
             return {
                 'status': 'not_found',
@@ -2158,38 +1809,20 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             )
             return {'status': 'click_failed', **result}
 
-        # === Step 4: Browse target site naturally ===
-        # This is crucial for Yandex Metrika — we MUST spend real time on the site
-        # with scrolls, mouse movements, and engagement to avoid robot detection.
-        if task_id:
-            _update_search_task_log(task_id,
-                f"🔍 Нашли {domain} (стр.{result['page']}, поз.{result['position']}), просматриваем сайт...")
-
-        actual_browse_time = 0
-        try:
-            actual_browse_time = _browse_target_site(
-                driver, domain,
-                min_time=min_time_on_site,
-                max_time=max_time_on_site
-            )
-        except Exception as browse_err:
-            logger.warning(f"⚠️ Error during site browsing: {browse_err}")
-            # Even if browsing fails partially, record the time spent
-            actual_browse_time = max(actual_browse_time, 5.0)
-
+        # === Step 4: Click completed — finish immediately (no site browsing) ===
         total_time = time.time() - start_time
+        actual_browse_time = 0  # No site browsing in this mode
 
         if task_id:
             _update_search_task_log(task_id,
-                f"✅ Визит завершён! {domain} (стр.{result['page']}, поз.{result['position']}), "
-                f"на сайте {actual_browse_time:.0f}с, всего {total_time:.0f}с",
+                f"✅ Клик выполнен! {domain} (стр.{result['page']}, поз.{result['position']}), всего {total_time:.0f}с",
                 status='completed',
                 result_data={
                     'keyword': keyword,
                     'domain': domain,
                     'page_found': result['page'],
                     'position': result['position'],
-                    'browse_time': round(actual_browse_time, 1),
+                    'browse_time': 0,
                     'total_time': round(total_time, 1)
                 },
                 exec_time=total_time)
