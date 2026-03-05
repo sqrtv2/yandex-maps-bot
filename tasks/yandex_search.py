@@ -184,91 +184,273 @@ def _human_scroll(driver, min_scrolls=2, max_scrolls=5):
         time.sleep(random.uniform(0.5, 1.0))
 
 
-def _block_analytics_on_target(driver):
+# === Shared analytics blocking configuration ===
+_ANALYTICS_BLOCKED_URLS = [
+    # Yandex Metrika — all known endpoints
+    '*mc.yandex.ru*',
+    '*mc.yandex.com*',
+    '*metrika.yandex.ru*',
+    '*metrica.yandex.com*',
+    '*cdn.metrika.yandex.net*',
+    '*watch.metrika*',
+    '*informer.yandex.ru*',
+    '*webvisor*',
+    '*webvisor2*',
+    '*watch/*',
+    # Metrika script files
+    '*tag.js*',
+    '*metrika/tag*',
+    '*metrika/watch*',
+    # Google Analytics / Tag Manager
+    '*google-analytics.com*',
+    '*googletagmanager.com*',
+    '*gtag*',
+    '*analytics.google.com*',
+    # Other trackers
+    '*top-fwz1.mail.ru*',
+    '*top.mail.ru*',
+    '*counter.yadro.ru*',
+    '*rating.openstat.ru*',
+    '*hotjar.com*',
+    '*mouseflow.com*',
+    '*clarity.ms*',
+    '*pixel.wp.com*',
+    '*connect.facebook.net*',
+    '*bat.bing.com*',
+    '*an.yandex.ru*',
+    '*yandexadexchange*',
+    '*ads.adfox.ru*',
+]
+
+# Comprehensive JS that kills all analytics BEFORE any page script runs.
+# Used via Page.addScriptToEvaluateOnNewDocument (runs before ANY page JS).
+_ANALYTICS_KILL_JS = """
+(function() {
+    // === ANALYTICS KILLER — runs before any page scripts ===
+
+    // 1. Kill sendBeacon immediately (Metrika uses it to send data on unload)
+    if (navigator.sendBeacon) {
+        navigator.sendBeacon = function() { return true; };
+        Object.defineProperty(navigator, 'sendBeacon', {
+            value: function() { return true; },
+            writable: false, configurable: false
+        });
+    }
+
+    // 2. Neuter Yandex Metrika objects
+    window.Ya = window.Ya || {};
+    window.Ya.Metrika2 = function() {
+        return {
+            reachGoal: function(){}, hit: function(){}, params: function(){},
+            getClientID: function(){ return '0'; }, setUserID: function(){},
+            userParams: function(){}, clickmap: function(){}, trackLinks: function(){},
+            accurateTrackBounce: function(){}, extLink: function(){},
+            file: function(){}, notBounce: function(){}, firstPartyParams: function(){}
+        };
+    };
+    window.Ya.Metrika = window.Ya.Metrika2;
+    Object.defineProperty(window, 'ym', {
+        value: function() {},
+        writable: false, configurable: false
+    });
+
+    // 3. Neuter Google Analytics
+    Object.defineProperty(window, 'ga', {
+        value: function() {},
+        writable: false, configurable: false
+    });
+    Object.defineProperty(window, 'gtag', {
+        value: function() {},
+        writable: false, configurable: false
+    });
+    Object.defineProperty(window, 'dataLayer', {
+        value: [],
+        writable: false, configurable: false
+    });
+
+    // 4. Block fetch() to analytics domains
+    var _origFetch = window.fetch;
+    window.fetch = function(url) {
+        var urlStr = (typeof url === 'string') ? url : (url && url.url ? url.url : '');
+        if (urlStr && (
+            urlStr.indexOf('mc.yandex') !== -1 || urlStr.indexOf('metrika') !== -1 ||
+            urlStr.indexOf('metrica') !== -1 || urlStr.indexOf('google-analytics') !== -1 ||
+            urlStr.indexOf('googletagmanager') !== -1 || urlStr.indexOf('webvisor') !== -1 ||
+            urlStr.indexOf('hotjar') !== -1 || urlStr.indexOf('clarity.ms') !== -1 ||
+            urlStr.indexOf('top-fwz1.mail.ru') !== -1 || urlStr.indexOf('an.yandex') !== -1
+        )) {
+            return Promise.resolve(new Response('', {status: 200}));
+        }
+        return _origFetch.apply(this, arguments);
+    };
+
+    // 5. Block XMLHttpRequest to analytics domains
+    var _origXHROpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url) {
+        if (typeof url === 'string' && (
+            url.indexOf('mc.yandex') !== -1 || url.indexOf('metrika') !== -1 ||
+            url.indexOf('metrica') !== -1 || url.indexOf('google-analytics') !== -1 ||
+            url.indexOf('googletagmanager') !== -1 || url.indexOf('webvisor') !== -1
+        )) {
+            this._analyticsBlocked = true;
+            return;
+        }
+        return _origXHROpen.apply(this, arguments);
+    };
+    var _origXHRSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function() {
+        if (this._analyticsBlocked) return;
+        return _origXHRSend.apply(this, arguments);
+    };
+
+    // 6. Block Image beacon (Metrika uses new Image().src = 'mc.yandex.ru/...')
+    var _OrigImage = window.Image;
+    window.Image = function(w, h) {
+        var img = new _OrigImage(w, h);
+        var _srcDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+        Object.defineProperty(img, 'src', {
+            set: function(val) {
+                if (val && (val.indexOf('mc.yandex') !== -1 || val.indexOf('metrika') !== -1 ||
+                    val.indexOf('metrica') !== -1 || val.indexOf('google-analytics') !== -1 ||
+                    val.indexOf('an.yandex') !== -1 || val.indexOf('informer.yandex') !== -1)) {
+                    return; // Block
+                }
+                if (_srcDesc && _srcDesc.set) _srcDesc.set.call(img, val);
+            },
+            get: function() {
+                if (_srcDesc && _srcDesc.get) return _srcDesc.get.call(img);
+            }
+        });
+        return img;
+    };
+    window.Image.prototype = _OrigImage.prototype;
+
+    // 7. Block script element creation for analytics
+    var _origCreateElement = document.createElement;
+    document.createElement = function(tag) {
+        var el = _origCreateElement.call(document, tag);
+        if (tag.toLowerCase() === 'script') {
+            var _srcDescS = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+            Object.defineProperty(el, 'src', {
+                set: function(val) {
+                    if (val && (val.indexOf('metrika') !== -1 || val.indexOf('mc.yandex') !== -1 ||
+                        val.indexOf('metrica') !== -1 || val.indexOf('google-analytics') !== -1 ||
+                        val.indexOf('googletagmanager') !== -1 || val.indexOf('webvisor') !== -1 ||
+                        val.indexOf('tag.js') !== -1 || val.indexOf('hotjar') !== -1 ||
+                        val.indexOf('clarity.ms') !== -1 || val.indexOf('an.yandex') !== -1)) {
+                        return; // Block analytics script
+                    }
+                    if (_srcDescS && _srcDescS.set) _srcDescS.set.call(el, val);
+                },
+                get: function() {
+                    if (_srcDescS && _srcDescS.get) return _srcDescS.get.call(el);
+                }
+            });
+        }
+        return el;
+    };
+
+    // 8. MutationObserver — remove any <script> or <img> with analytics src that bypass above
+    try {
+        var obs = new MutationObserver(function(mutations) {
+            for (var i = 0; i < mutations.length; i++) {
+                var nodes = mutations[i].addedNodes;
+                for (var j = 0; j < nodes.length; j++) {
+                    var node = nodes[j];
+                    if (node.nodeType !== 1) continue;
+                    var src = node.src || node.getAttribute && node.getAttribute('src') || '';
+                    if (src && (src.indexOf('mc.yandex') !== -1 || src.indexOf('metrika') !== -1 ||
+                        src.indexOf('metrica') !== -1 || src.indexOf('google-analytics') !== -1 ||
+                        src.indexOf('googletagmanager') !== -1 || src.indexOf('webvisor') !== -1 ||
+                        src.indexOf('tag.js') !== -1 || src.indexOf('an.yandex') !== -1)) {
+                        node.remove();
+                    }
+                }
+            }
+        });
+        obs.observe(document.documentElement || document, {childList: true, subtree: true});
+    } catch(e) {}
+
+    // 9. Block iframe creation for analytics
+    var _origCreateEl2 = document.createElement;
+    // Already overridden above, extend for iframes
+    var _prevCreate = document.createElement;
+    document.createElement = function(tag) {
+        var el = _prevCreate.call(document, tag);
+        if (tag.toLowerCase() === 'iframe') {
+            var _srcDescI = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'src');
+            Object.defineProperty(el, 'src', {
+                set: function(val) {
+                    if (val && (val.indexOf('mc.yandex') !== -1 || val.indexOf('metrika') !== -1 ||
+                        val.indexOf('metrica') !== -1 || val.indexOf('informer') !== -1)) {
+                        return;
+                    }
+                    if (_srcDescI && _srcDescI.set) _srcDescI.set.call(el, val);
+                },
+                get: function() {
+                    if (_srcDescI && _srcDescI.get) return _srcDescI.get.call(el);
+                }
+            });
+        }
+        return el;
+    };
+})();
+"""
+
+
+def _pre_inject_analytics_blocker(driver):
+    """Pre-inject analytics blocker via CDP before ANY page navigation.
+    
+    Uses Page.addScriptToEvaluateOnNewDocument — this injects JS that runs
+    BEFORE any page scripts in ALL new documents (including new tabs).
+    Combined with Network.setBlockedURLs to block at network level.
+    
+    MUST be called BEFORE the click that navigates to the target site.
+    """
+    try:
+        if hasattr(driver, 'execute_cdp_cmd'):
+            # 1. Pre-inject JS killer that runs before ANY page scripts
+            result = driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': _ANALYTICS_KILL_JS
+            })
+            logger.info(f"🛡️ Pre-injected analytics killer via CDP (id={result.get('identifier', '?')})")
+            
+            # 2. Block analytics URLs at network level (requests never sent)
+            driver.execute_cdp_cmd('Network.enable', {})
+            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
+            logger.info(f"🛡️ Pre-blocked {len(_ANALYTICS_BLOCKED_URLS)} analytics URLs via CDP Network")
+
+            # 3. Set short page load timeout so we can abort fast
+            try:
+                driver.set_page_load_timeout(8)
+            except Exception:
+                pass
+        else:
+            logger.warning("⚠️ CDP not available for pre-injection")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to pre-inject analytics blocker: {e}")
+
+
+
     """Block Yandex Metrika, Google Analytics, and other analytics/tracking scripts via CDP.
     
     This prevents analytics from loading and detecting bot behavior when visiting target sites.
     Uses Network.setBlockedURLs (CDP) to block requests before they are made.
     Also injects JS to neuter common analytics objects.
     """
-    blocked_urls = [
-        # Yandex Metrika
-        '*mc.yandex.ru*',
-        '*metrika.yandex.ru*',
-        '*cdn.metrika.yandex.net*',
-        '*watch.metrika*',
-        '*metrica.yandex.com*',
-        '*informer.yandex.ru*',
-        '*webvisor*',
-        '*tag.js*yandex*',
-        # Google Analytics / Tag Manager
-        '*google-analytics.com*',
-        '*googletagmanager.com*',
-        '*gtag*',
-        '*analytics.google.com*',
-        # Other common trackers
-        '*mc.yandex.com*',
-        '*top-fwz1.mail.ru*',
-        '*top.mail.ru*',
-        '*counter.yadro.ru*',
-        '*rating.openstat.ru*',
-        '*hotjar.com*',
-        '*mouseflow.com*',
-        '*clarity.ms*',
-        '*pixel.wp.com*',
-        '*connect.facebook.net*',
-        '*bat.bing.com*',
-    ]
-    
     try:
         if hasattr(driver, 'execute_cdp_cmd'):
-            # Enable network domain first
             driver.execute_cdp_cmd('Network.enable', {})
-            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': blocked_urls})
-            logger.info(f"🛡️ Blocked {len(blocked_urls)} analytics/tracker URL patterns via CDP")
+            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
+            logger.info(f"🛡️ Blocked {len(_ANALYTICS_BLOCKED_URLS)} analytics/tracker URL patterns via CDP")
         else:
             logger.warning("⚠️ CDP not available, cannot block analytics URLs")
     except Exception as e:
         logger.warning(f"⚠️ Failed to set blocked URLs via CDP: {e}")
     
-    # Also inject JS to neuter common analytics objects
+    # Also inject JS to neuter analytics objects on the current page
     try:
-        driver.execute_script("""
-            // Neuter Yandex Metrika
-            window.Ya = window.Ya || {};
-            window.Ya.Metrika2 = function() { return { reachGoal: function(){}, hit: function(){}, params: function(){} }; };
-            window.Ya.Metrika = window.Ya.Metrika2;
-            window.ym = function() {};
-            
-            // Neuter Google Analytics
-            window.ga = function() {};
-            window.gtag = function() {};
-            window.dataLayer = [];
-            
-            // Prevent new script elements from loading analytics
-            var origCreate = document.createElement;
-            document.createElement = function(tag) {
-                var el = origCreate.call(document, tag);
-                if (tag.toLowerCase() === 'script') {
-                    var origSetAttr = el.setAttribute.bind(el);
-                    var _origSrcDesc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
-                    Object.defineProperty(el, 'src', {
-                        set: function(val) {
-                            if (val && (val.indexOf('metrika') !== -1 || val.indexOf('mc.yandex') !== -1 ||
-                                        val.indexOf('google-analytics') !== -1 || val.indexOf('googletagmanager') !== -1 ||
-                                        val.indexOf('webvisor') !== -1 || val.indexOf('tag.js') !== -1)) {
-                                return;  // Block analytics script loading
-                            }
-                            if (_origSrcDesc && _origSrcDesc.set) _origSrcDesc.set.call(el, val);
-                        },
-                        get: function() {
-                            if (_origSrcDesc && _origSrcDesc.get) return _origSrcDesc.get.call(el);
-                        }
-                    });
-                }
-                return el;
-            };
-        """)
+        driver.execute_script(_ANALYTICS_KILL_JS)
         logger.info("🛡️ Injected analytics neutralization JS")
     except Exception as e:
         logger.warning(f"⚠️ Failed to inject analytics neutralization JS: {e}")
@@ -281,7 +463,7 @@ def _abort_page_load_fast(driver, wait_before_abort=None):
     then call window.stop() to kill all pending requests including Metrika.
     """
     if wait_before_abort is None:
-        wait_before_abort = random.uniform(0.8, 2.0)
+        wait_before_abort = random.uniform(0.3, 0.8)
     
     time.sleep(wait_before_abort)
     
@@ -293,14 +475,7 @@ def _abort_page_load_fast(driver, wait_before_abort=None):
     
     # Re-inject analytics neutralization after stop
     try:
-        driver.execute_script("""
-            window.Ya = window.Ya || {};
-            window.Ya.Metrika2 = function() { return { reachGoal: function(){}, hit: function(){}, params: function(){} }; };
-            window.Ya.Metrika = window.Ya.Metrika2;
-            window.ym = function() {};
-            window.ga = function() {};
-            window.gtag = function() {};
-        """)
+        driver.execute_script(_ANALYTICS_KILL_JS)
     except Exception:
         pass
 
@@ -922,18 +1097,24 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
             # Remember windows before click
             windows_before = driver.window_handles
             
-            # DO NOT block analytics before click — we need Yandex's click tracking
-            # (yandex.ru/clck redirect) to register the click properly
+            # === PRE-INJECT ANALYTICS BLOCKER BEFORE CLICK ===
+            # Critical: Page.addScriptToEvaluateOnNewDocument persists across all
+            # navigations and new tabs. The injected JS runs BEFORE any page scripts,
+            # so Metrica is dead on arrival when the target page loads.
+            # Network.setBlockedURLs blocks requests at network level (never sent).
+            _pre_inject_analytics_blocker(driver)
+            
+            # Click the result — Yandex /clck redirect registers the click
             try:
                 _safe_click(driver, click_element)
             except Exception as click_err:
                 logger.warning(f"   Click failed: {click_err}")
             
-            # === Wait for Yandex click redirect to complete ===
-            # The click goes through yandex.ru/clck → target site
-            # We need to wait for this redirect to happen (click registered)
-            # but abort BEFORE the target site fully loads (prevent Metrika)
-            time.sleep(random.uniform(1.5, 3.0))
+            # === Wait for Yandex click redirect ===
+            # Click goes yandex.ru/clck → target site.
+            # Pre-injected script + CDP blocks are already active.
+            # We poll URL to detect when we leave Yandex, then abort immediately.
+            time.sleep(random.uniform(1.0, 2.0))
             
             # Check if new tab was opened
             windows_after = driver.window_handles
@@ -941,29 +1122,117 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
                 new_window = [w for w in windows_after if w not in windows_before][0]
                 logger.info(f"   New tab opened, switching to it")
                 driver.switch_to.window(new_window)
-                time.sleep(random.uniform(0.5, 1.5))
-            
-            # Check if we've left Yandex (redirect completed)
-            try:
-                current_url = driver.current_url.lower()
-            except Exception:
-                current_url = ''
-            logger.info(f"   Current URL after click: {driver.current_url[:150] if current_url else 'unknown'}")
-            
-            # Wait a bit more if still on Yandex redirect
-            if 'yandex.ru/clck' in current_url or 'ya.ru/clck' in current_url:
-                logger.info(f"   Still on Yandex redirect, waiting...")
-                time.sleep(random.uniform(2.0, 4.0))
+                
+                # Re-apply CDP network blocks on new tab context
                 try:
-                    current_url = driver.current_url.lower()
+                    driver.execute_cdp_cmd('Network.enable', {})
+                    driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
+                    logger.info("   🛡️ CDP analytics blocks applied to new tab")
                 except Exception:
                     pass
+                
+                # Immediately stop loading in new tab
+                try:
+                    driver.execute_script("window.stop();")
+                    logger.info("   🛑 window.stop() in new tab")
+                except Exception:
+                    pass
+                time.sleep(random.uniform(0.2, 0.5))
             
-            # NOW block analytics and abort page load on target site
-            _block_analytics_on_target(driver)
-            _abort_page_load_fast(driver, wait_before_abort=random.uniform(0.3, 1.0))
+            # Check if we left Yandex
+            try:
+                current_url = driver.current_url.lower()
+            except TimeoutException:
+                current_url = ''
+                logger.info("   ⏳ current_url timed out (page loading, analytics pre-blocked)")
+            except Exception:
+                current_url = ''
+            if current_url:
+                logger.info(f"   Current URL after click: {current_url[:150]}")
             
-            # Verify click success
+            # If still on Yandex redirect, wait briefly
+            if current_url and ('yandex.ru/clck' in current_url or 'ya.ru/clck' in current_url):
+                logger.info(f"   Still on Yandex redirect, waiting...")
+                time.sleep(random.uniform(1.5, 3.0))
+                try:
+                    current_url = driver.current_url.lower()
+                except TimeoutException:
+                    current_url = ''
+                except Exception:
+                    current_url = ''
+            
+            # === Smart navigation wait with aggressive abort ===
+            def _is_on_yandex(url):
+                host = urlparse(url).netloc.lower().replace('www.', '')
+                return 'ya.ru' in host or 'yandex.ru' in host
+            
+            still_on_yandex = _is_on_yandex(current_url) if current_url else True
+            
+            if still_on_yandex:
+                # Poll URL — once off Yandex, immediately abort page load
+                max_nav_checks = 10
+                nav_wait_each = random.uniform(0.8, 1.3)
+                for nav_i in range(max_nav_checks):
+                    time.sleep(nav_wait_each)
+                    try:
+                        current_url = driver.current_url.lower()
+                    except TimeoutException:
+                        # Page is loading off Yandex — abort immediately
+                        logger.info(f"   ⏳ URL timed out at poll {nav_i+1} — page loading, aborting...")
+                        try:
+                            driver.execute_script("window.stop();")
+                        except Exception:
+                            pass
+                        try:
+                            driver.execute_script(_ANALYTICS_KILL_JS)
+                        except Exception:
+                            pass
+                        try:
+                            current_url = driver.current_url.lower()
+                        except Exception:
+                            current_url = ''
+                        break
+                    except Exception:
+                        current_url = ''
+                        break
+                    if not _is_on_yandex(current_url):
+                        logger.info(f"   ✅ Left Yandex after {(nav_i+1)*nav_wait_each:.1f}s: {current_url[:120]}")
+                        # IMMEDIATELY abort page load — kill Metrika
+                        try:
+                            driver.execute_script("window.stop();")
+                            logger.info("   🛑 window.stop() — page load aborted")
+                        except Exception:
+                            pass
+                        # Re-inject kill JS as safety net
+                        try:
+                            driver.execute_script(_ANALYTICS_KILL_JS)
+                        except Exception:
+                            pass
+                        break
+                    if 'clck' in current_url:
+                        logger.info(f"   ⏳ Still on /clck (check {nav_i+1}/{max_nav_checks})...")
+                        continue
+                    # Still on SERP — retry JS click
+                    if nav_i in (1, 3, 5):
+                        logger.info(f"   🔄 Still on SERP, retrying JS click...")
+                        try:
+                            driver.execute_script("arguments[0].click();", click_element)
+                        except Exception:
+                            pass
+                else:
+                    logger.warning(f"   ⏰ Navigation did not happen after {max_nav_checks} checks")
+            else:
+                # Already on target site — block analytics & abort immediately
+                _block_analytics_on_target(driver)
+                _abort_page_load_fast(driver, wait_before_abort=random.uniform(0.1, 0.4))
+            
+            # Restore normal page_load_timeout
+            try:
+                driver.set_page_load_timeout(60)
+            except Exception:
+                pass
+            
+            # Final verification
             try:
                 final_url = driver.current_url.lower()
                 final_host = urlparse(final_url).netloc.lower().replace('www.', '')
@@ -971,14 +1240,11 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
                 final_url = ''
                 final_host = ''
             
-            on_yandex = ('ya.ru' in final_host or 'yandex.ru' in final_host)
+            on_yandex = _is_on_yandex(final_url) if final_url else True
             clicked = (not on_yandex) and (domain_clean in final_host or domain_clean in final_url)
             
-            # If still on Yandex, the redirect might not have worked
             if on_yandex and not clicked:
                 logger.warning(f"   Still on Yandex after click: {final_url[:100]}")
-                # Don't do direct navigation — that defeats the purpose of organic click
-                # Just report as click_failed
             
             logger.info(f"   Final result: clicked={clicked}, host={final_host}")
             
