@@ -127,6 +127,72 @@
     </div>
 </div>
 
+<!-- AI Persona Settings Card -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card border-info">
+            <div class="card-header bg-info text-white d-flex justify-content-between align-items-center">
+                <h6 class="mb-0"><i class="bi bi-robot"></i> AI Персоны (Gemini)</h6>
+                <div>
+                    <button class="btn btn-sm btn-light me-1" onclick="previewPersona()">
+                        <i class="bi bi-eye"></i> Превью
+                    </button>
+                    <button class="btn btn-sm btn-warning me-1" onclick="generateForExisting()">
+                        <i class="bi bi-magic"></i> Назначить персоны
+                    </button>
+                    <button class="btn btn-sm btn-success" onclick="generateWarmupSites()">
+                        <i class="bi bi-globe2"></i> Генерировать сайты нагула
+                    </button>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="row align-items-end">
+                    <div class="col-md-2">
+                        <label class="form-label">Статус</label>
+                        <div>
+                            <span class="badge bg-success" id="personaStatusBadge">Загрузка…</span>
+                        </div>
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label">С персоной</label>
+                        <div class="h5 mb-0" id="personaWithCount">—</div>
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label">Без персоны</label>
+                        <div class="h5 mb-0" id="personaWithoutCount">—</div>
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label">Сайты нагула</label>
+                        <div class="h5 mb-0" id="warmupSitesCount">—</div>
+                    </div>
+                    <div class="col-md-2">
+                        <label for="personaEnabled" class="form-label">AI персоны</label>
+                        <select class="form-select form-select-sm" id="personaEnabled">
+                            <option value="true">Включены (для новых)</option>
+                            <option value="false">Выключены</option>
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <label for="geminiModel" class="form-label">Модель Gemini</label>
+                        <div class="input-group input-group-sm">
+                            <input type="text" class="form-control" id="geminiModel" value="gemini-2.0-flash">
+                            <button class="btn btn-outline-primary" onclick="savePersonaSettings()">
+                                <i class="bi bi-check"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <!-- Persona Preview Area (hidden by default) -->
+                <div class="mt-3 d-none" id="personaPreviewArea">
+                    <hr>
+                    <h6><i class="bi bi-person-lines-fill"></i> Превью сгенерированной персоны:</h6>
+                    <pre class="bg-dark text-light p-3 rounded" style="max-height: 300px; overflow-y: auto;" id="personaPreviewJson"></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Filters and Search -->
 <div class="card mb-4">
     <div class="card-header">
@@ -438,6 +504,7 @@ let currentFilters = {};
 // Load profiles on page load
 document.addEventListener('DOMContentLoaded', function() {
     loadProfiles();
+    loadPersonaSettings();
 
     // Auto-refresh every 60 seconds
     setInterval(loadProfiles, 60000);
@@ -1225,7 +1292,14 @@ function bulkCreateProfiles() {
             document.getElementById('profileNamePrefix').value = 'Profile-';
             document.getElementById('randomizeAll').checked = true;
 
-            alert(`Successfully created ${result.created_count.toLocaleString()} profiles (IDs ${result.first_id}–${result.last_id})${result.warmup_started ? '\nWarmup started automatically.' : ''}`);
+            let msg = `Создано ${result.created_count.toLocaleString()} профилей (ID ${result.first_id}–${result.last_id})`;
+            if (result.warmup_sites_task_id) {
+                msg += '\n🌐 Генерация сайтов нагула (50 шт/профиль) запущена в фоне.';
+            }
+            if (result.warmup_started) {
+                msg += '\n🔥 Нагул запущен автоматически.';
+            }
+            alert(msg);
         }, 600);
     })
     .catch(error => {
@@ -1432,6 +1506,129 @@ function performClearAllProfiles(totalProfiles) {
         // Restore button state
         clearBtn.innerHTML = originalText;
         clearBtn.disabled = false;
+    });
+}
+
+// ── AI Persona Functions ──────────────────────────────────────────────────
+function loadPersonaSettings() {
+    fetch('/api/ai-persona-settings')
+    .then(r => r.json())
+    .then(data => {
+        document.getElementById('personaEnabled').value = String(data.ai_persona_enabled ?? true);
+        document.getElementById('geminiModel').value = data.gemini_model || 'gemini-2.0-flash';
+        document.getElementById('personaWithCount').textContent = data.profiles_with_persona ?? '—';
+        document.getElementById('personaWithoutCount').textContent = data.profiles_without_persona ?? '—';
+
+        // Warmup sites count
+        const wsEl = document.getElementById('warmupSitesCount');
+        if (wsEl) {
+            const ws = data.profiles_with_warmup_sites;
+            const noWs = data.profiles_without_warmup_sites;
+            wsEl.innerHTML = `<span class="text-success">${ws ?? '?'}</span> / <small class="text-muted">${noWs ?? '?'} без</small>`;
+        }
+
+        const badge = document.getElementById('personaStatusBadge');
+        if (data.ai_persona_enabled) {
+            badge.textContent = 'Включено';
+            badge.className = 'badge bg-success';
+        } else {
+            badge.textContent = 'Выключено';
+            badge.className = 'badge bg-secondary';
+        }
+    })
+    .catch(err => {
+        console.error('Error loading persona settings:', err);
+        document.getElementById('personaStatusBadge').textContent = 'Ошибка';
+        document.getElementById('personaStatusBadge').className = 'badge bg-danger';
+    });
+}
+
+function savePersonaSettings() {
+    const payload = {
+        ai_persona_enabled: document.getElementById('personaEnabled').value === 'true',
+        gemini_model: document.getElementById('geminiModel').value
+    };
+    fetch('/api/ai-persona-settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    })
+    .then(r => r.json())
+    .then(() => {
+        alert('Настройки AI персон сохранены!');
+        loadPersonaSettings();
+    })
+    .catch(err => alert('Ошибка сохранения: ' + err));
+}
+
+function previewPersona() {
+    const btn = event.target.closest('button');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Генерация…';
+
+    fetch('/api/ai-persona/preview')
+    .then(r => r.json())
+    .then(data => {
+        const area = document.getElementById('personaPreviewArea');
+        area.classList.remove('d-none');
+        document.getElementById('personaPreviewJson').textContent = JSON.stringify(data, null, 2);
+    })
+    .catch(err => alert('Ошибка: ' + err))
+    .finally(() => {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-eye"></i> Превью';
+    });
+}
+
+function generateForExisting() {
+    const count = prompt('Сколько профилей обработать? (без персоны)', '50');
+    if (!count) return;
+
+    const btn = event.target.closest('button');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Генерация…';
+
+    fetch('/api/ai-persona/generate-for-existing', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({limit: parseInt(count), overwrite: false})
+    })
+    .then(r => r.json())
+    .then(data => {
+        alert(data.message || `Готово: ${data.count} персон назначено`);
+        loadPersonaSettings();
+    })
+    .catch(err => alert('Ошибка: ' + err))
+    .finally(() => {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-magic"></i> Назначить персоны';
+    });
+}
+
+function generateWarmupSites() {
+    const count = prompt('Сколько профилей обработать? (макс)', '50');
+    if (!count) return;
+
+    const overwrite = confirm('Перезаписать существующие сайты нагула? (OK = да, Отмена = только для профилей без сайтов)');
+
+    const btn = event.target.closest('button');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Генерация сайтов…';
+
+    fetch('/api/ai-persona/generate-warmup-sites', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({limit: parseInt(count), overwrite: overwrite})
+    })
+    .then(r => r.json())
+    .then(data => {
+        alert(data.message || `Готово: ${data.count} профилей обновлено`);
+        loadPersonaSettings();
+    })
+    .catch(err => alert('Ошибка: ' + err))
+    .finally(() => {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-globe2"></i> Генерировать сайты нагула';
     });
 }
 </script>

@@ -71,6 +71,37 @@
     </div>
 </div>
 
+<!-- Referrer Settings -->
+<div class="card shadow-sm mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-link-45deg"></i> Настройка реферера</h5>
+        <span class="badge bg-info" id="referrerStatus">Загрузка...</span>
+    </div>
+    <div class="card-body">
+        <div class="row align-items-end">
+            <div class="col-md-3 mb-2">
+                <label class="form-label">Процент переходов через реферер</label>
+                <div class="input-group">
+                    <input type="number" class="form-control" id="referrerPercent" min="0" max="100" value="50">
+                    <span class="input-group-text">%</span>
+                </div>
+                <small class="text-muted">0% = всегда напрямую, 100% = всегда через реферер</small>
+            </div>
+            <div class="col-md-5 mb-2">
+                <label class="form-label">Сайт-реферер</label>
+                <input type="text" class="form-control" id="referrerSite" value="https://mail.ru" placeholder="https://mail.ru">
+                <small class="text-muted">Браузер сначала откроет этот сайт, потом перейдёт на ya.ru</small>
+            </div>
+            <div class="col-md-4 mb-2">
+                <button class="btn btn-success" onclick="saveReferrerSettings()">
+                    <i class="bi bi-check-lg"></i> Сохранить
+                </button>
+                <span class="ms-2 text-muted small" id="referrerSaveStatus"></span>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Targets Table -->
 <div class="card shadow-sm mb-4">
     <div class="card-body p-0">
@@ -767,5 +798,50 @@ async function enableAllKeywords() {
         alert('Ошибка: ' + (err.message || err));
     }
 }
+
+// === Referrer Settings ===
+async function loadReferrerSettings() {
+    try {
+        const data = await apiCall('/search-referrer-settings', 'GET');
+        document.getElementById('referrerPercent').value = data.search_referrer_percent ?? 50;
+        document.getElementById('referrerSite').value = data.search_referrer_site || 'https://mail.ru';
+        const pct = data.search_referrer_percent ?? 50;
+        const badge = document.getElementById('referrerStatus');
+        if (pct === 0) {
+            badge.className = 'badge bg-secondary';
+            badge.textContent = 'Выключен';
+        } else if (pct === 100) {
+            badge.className = 'badge bg-success';
+            badge.textContent = '100% через реферер';
+        } else {
+            badge.className = 'badge bg-info';
+            badge.textContent = `${pct}% через реферер`;
+        }
+    } catch (err) {
+        document.getElementById('referrerStatus').textContent = 'Ошибка';
+        document.getElementById('referrerStatus').className = 'badge bg-danger';
+    }
+}
+
+async function saveReferrerSettings() {
+    const pct = parseInt(document.getElementById('referrerPercent').value) || 0;
+    const site = document.getElementById('referrerSite').value.trim() || 'https://mail.ru';
+    if (pct < 0 || pct > 100) { alert('Процент должен быть от 0 до 100'); return; }
+    try {
+        await apiCall('/search-referrer-settings', 'POST', {
+            search_referrer_percent: pct,
+            search_referrer_site: site
+        });
+        document.getElementById('referrerSaveStatus').textContent = '✅ Сохранено!';
+        setTimeout(() => { document.getElementById('referrerSaveStatus').textContent = ''; }, 3000);
+        loadReferrerSettings();
+    } catch (err) {
+        document.getElementById('referrerSaveStatus').textContent = '❌ Ошибка';
+        alert('Ошибка сохранения: ' + (err.message || err));
+    }
+}
+
+// Load referrer settings on page load
+loadReferrerSettings();
 </script>
 {% endblock %}

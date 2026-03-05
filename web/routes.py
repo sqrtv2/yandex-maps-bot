@@ -719,6 +719,314 @@ async def test_proxy(proxy_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Failed to test proxy: {str(e)}")
 
 
+@router.get("/api/search-referrer-settings")
+async def get_search_referrer_settings(db: Session = Depends(get_db)):
+    """Get search referrer settings."""
+    try:
+        result = {'search_referrer_percent': 50, 'search_referrer_site': 'https://mail.ru'}
+        for key in result:
+            setting = db.query(UserSettings).filter(UserSettings.setting_key == key).first()
+            if setting:
+                result[key] = setting.get_typed_value()
+        return result
+    except Exception as e:
+        logger.error(f"Error getting referrer settings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/search-referrer-settings")
+async def save_search_referrer_settings(data: Dict[str, Any], db: Session = Depends(get_db)):
+    """Save search referrer settings."""
+    try:
+        settings_map = {
+            'search_referrer_percent': {'type': 'int', 'desc': 'Процент переходов через реферер (0-100)', 'category': 'yandex_search'},
+            'search_referrer_site': {'type': 'string', 'desc': 'URL сайта-реферера (напр. https://mail.ru)', 'category': 'yandex_search'},
+        }
+        for key, meta in settings_map.items():
+            if key in data:
+                val = data[key]
+                setting = db.query(UserSettings).filter(UserSettings.setting_key == key).first()
+                if setting:
+                    setting.setting_value = str(val)
+                    setting.setting_type = meta['type']
+                else:
+                    new_s = UserSettings(
+                        setting_key=key,
+                        setting_value=str(val),
+                        setting_type=meta['type'],
+                        description=meta['desc'],
+                        category=meta['category']
+                    )
+                    db.add(new_s)
+        db.commit()
+        return {'status': 'ok'}
+    except Exception as e:
+        logger.error(f"Error saving referrer settings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── AI Persona Settings ─────────────────────────────────────────────────────
+@router.get("/api/ai-persona-settings")
+async def get_ai_persona_settings(db: Session = Depends(get_db)):
+    """Get AI persona generation settings."""
+    try:
+        defaults = {
+            'ai_persona_enabled': True,
+            'gemini_model': 'gemini-2.0-flash',
+        }
+        result = {}
+        for key, default_val in defaults.items():
+            setting = db.query(UserSettings).filter(UserSettings.setting_key == key).first()
+            result[key] = setting.get_typed_value() if setting else default_val
+
+        # Count profiles with/without personas
+        total = db.query(BrowserProfile).count()
+        with_persona = db.query(BrowserProfile).filter(BrowserProfile.persona_data.isnot(None)).count()
+        result['profiles_total'] = total
+        result['profiles_with_persona'] = with_persona
+        result['profiles_without_persona'] = total - with_persona
+
+        # Count profiles with warmup sites
+        # We need to check for warmup_sites key inside persona_data JSON
+        try:
+            from sqlalchemy import text
+            ws_count = db.execute(text(
+                "SELECT COUNT(*) FROM browser_profiles "
+                "WHERE persona_data IS NOT NULL "
+                "AND persona_data::text LIKE '%warmup_sites%' "
+                "AND jsonb_array_length(persona_data->'warmup_sites') >= 20"
+            )).scalar() or 0
+            result['profiles_with_warmup_sites'] = ws_count
+            result['profiles_without_warmup_sites'] = with_persona - ws_count
+        except Exception:
+            result['profiles_with_warmup_sites'] = '?'
+            result['profiles_without_warmup_sites'] = '?'
+
+        return result
+    except Exception as e:
+        logger.error(f"Error getting AI persona settings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/ai-persona-settings")
+async def save_ai_persona_settings(data: Dict[str, Any], db: Session = Depends(get_db)):
+    """Save AI persona generation settings."""
+    try:
+        settings_map = {
+            'ai_persona_enabled': {'type': 'bool', 'desc': 'Включить AI-генерацию персон для новых профилей', 'category': 'ai'},
+            'gemini_model': {'type': 'string', 'desc': 'Модель Gemini (gemini-2.0-flash)', 'category': 'ai'},
+        }
+        for key, meta in settings_map.items():
+            if key in data:
+                val = data[key]
+                setting = db.query(UserSettings).filter(UserSettings.setting_key == key).first()
+                if setting:
+                    setting.setting_value = str(val)
+                    setting.setting_type = meta['type']
+                else:
+                    new_s = UserSettings(
+                        setting_key=key,
+                        setting_value=str(val),
+                        setting_type=meta['type'],
+                        description=meta['desc'],
+                        category=meta['category']
+                    )
+                    db.add(new_s)
+        db.commit()
+        return {'status': 'ok'}
+    except Exception as e:
+        logger.error(f"Error saving AI persona settings: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/ai-persona/generate-for-existing")
+async def generate_personas_for_existing(data: Dict[str, Any], db: Session = Depends(get_db)):
+    """Generate AI personas for profiles that don't have one yet."""
+    try:
+        limit = data.get("limit", 50)  # max profiles to process
+        overwrite = data.get("overwrite", False)
+
+        query = db.query(BrowserProfile).filter(BrowserProfile.is_active == True)
+        if not overwrite:
+            query = query.filter(
+                (BrowserProfile.persona_data == None) | (BrowserProfile.persona_data == {})
+            )
+        profiles = query.order_by(BrowserProfile.id).limit(limit).all()
+
+        if not profiles:
+            return {"status": "ok", "message": "No profiles need personas", "count": 0}
+
+        from core.ai_persona_generator import generate_personas as _gen_personas, generate_warmup_sites as _gen_warmup
+
+        # Generate personas in batches of 10
+        personas_pool = []
+        while len(personas_pool) < len(profiles):
+            batch = _gen_personas(count=min(10, len(profiles) - len(personas_pool)))
+            personas_pool.extend(batch)
+
+        updated = 0
+        warmup_sites_generated = 0
+        for i, profile in enumerate(profiles):
+            if i < len(personas_pool):
+                persona = personas_pool[i]
+                persona["assigned_profile"] = profile.name
+                # Also generate warmup sites for each persona
+                try:
+                    ws_data = _gen_warmup(persona)
+                    persona["warmup_sites"] = ws_data.get("warmup_sites", [])
+                    persona["extra_search_queries"] = ws_data.get("extra_search_queries", [])
+                    warmup_sites_generated += 1
+                except Exception:
+                    pass
+                profile.persona_data = persona
+                # Sync timezone
+                if persona.get("timezone"):
+                    profile.timezone = persona["timezone"]
+                updated += 1
+
+        db.commit()
+        logger.info(f"Assigned AI personas to {updated} existing profiles ({warmup_sites_generated} with warmup sites)")
+
+        return {
+            "status": "ok",
+            "count": updated,
+            "warmup_sites_generated": warmup_sites_generated,
+            "message": f"Персоны назначены для {updated} профилей (сайты нагула: {warmup_sites_generated})"
+        }
+
+    except Exception as e:
+        logger.error(f"Error generating personas for existing profiles: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/ai-persona/preview")
+async def preview_persona():
+    """Generate a preview persona (without saving)."""
+    try:
+        from core.ai_persona_generator import generate_personas as _gen_personas
+        personas = _gen_personas(count=1)
+        return personas[0] if personas else {"error": "Failed to generate persona"}
+    except Exception as e:
+        logger.error(f"Error previewing persona: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/profiles/{profile_id}/persona")
+async def get_profile_persona(profile_id: int, db: Session = Depends(get_db)):
+    """Get persona data for a specific profile."""
+    try:
+        profile = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+        if not profile:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        return {
+            "profile_id": profile.id,
+            "profile_name": profile.name,
+            "persona_data": profile.persona_data
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting persona for profile {profile_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/ai-persona/generate-warmup-sites")
+async def generate_warmup_sites_for_profiles(data: Dict[str, Any], db: Session = Depends(get_db)):
+    """Generate AI warmup sites (50 URLs) for profiles that have personas but no warmup_sites yet."""
+    try:
+        limit = data.get("limit", 50)
+        overwrite = data.get("overwrite", False)
+
+        # Find profiles with persona_data but without warmup_sites
+        profiles = db.query(BrowserProfile).filter(
+            BrowserProfile.is_active == True,
+            BrowserProfile.persona_data != None,
+        ).order_by(BrowserProfile.id).limit(limit).all()
+
+        if not profiles:
+            return {"status": "ok", "message": "Нет профилей с персонами", "count": 0}
+
+        from core.ai_persona_generator import generate_warmup_sites as _gen_warmup
+
+        updated = 0
+        skipped = 0
+        errors = 0
+
+        for profile in profiles:
+            persona = profile.persona_data
+            if not isinstance(persona, dict):
+                continue
+
+            # Skip if already has warmup sites (unless overwrite)
+            existing_sites = persona.get("warmup_sites", [])
+            if isinstance(existing_sites, list) and len(existing_sites) >= 20 and not overwrite:
+                skipped += 1
+                continue
+
+            try:
+                ws_data = _gen_warmup(persona)
+                persona["warmup_sites"] = ws_data.get("warmup_sites", [])
+                persona["extra_search_queries"] = ws_data.get("extra_search_queries", [])
+                profile.persona_data = persona
+                # Force SQLAlchemy to detect the change
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(profile, "persona_data")
+                updated += 1
+            except Exception as e:
+                logger.error(f"Error generating warmup sites for profile {profile.id}: {e}")
+                errors += 1
+
+        db.commit()
+        logger.info(f"Generated warmup sites: {updated} updated, {skipped} skipped, {errors} errors")
+
+        return {
+            "status": "ok",
+            "count": updated,
+            "skipped": skipped,
+            "errors": errors,
+            "message": f"Сгенерированы сайты нагула для {updated} профилей (пропущено: {skipped})"
+        }
+    except Exception as e:
+        logger.error(f"Error generating warmup sites: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/profiles/{profile_id}/regenerate-warmup-sites")
+async def regenerate_warmup_sites_for_profile(profile_id: int, db: Session = Depends(get_db)):
+    """Regenerate warmup sites for a specific profile."""
+    try:
+        profile = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+        if not profile:
+            raise HTTPException(status_code=404, detail="Profile not found")
+
+        persona = profile.persona_data
+        if not isinstance(persona, dict) or not persona.get("name"):
+            raise HTTPException(status_code=400, detail="Profile has no AI persona")
+
+        from core.ai_persona_generator import generate_warmup_sites as _gen_warmup
+
+        ws_data = _gen_warmup(persona)
+        persona["warmup_sites"] = ws_data.get("warmup_sites", [])
+        persona["extra_search_queries"] = ws_data.get("extra_search_queries", [])
+        profile.persona_data = persona
+
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(profile, "persona_data")
+        db.commit()
+
+        return {
+            "status": "ok",
+            "warmup_sites_count": len(persona.get("warmup_sites", [])),
+            "extra_queries_count": len(persona.get("extra_search_queries", [])),
+            "message": f"Сгенерировано {len(persona.get('warmup_sites', []))} сайтов нагула"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error regenerating warmup sites for profile {profile_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/settings/categories")
 async def get_setting_categories(db: Session = Depends(get_db)):
     """Get all setting categories."""

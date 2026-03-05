@@ -586,9 +586,34 @@ async def create_profile(profile_data: Dict[str, Any], db: Session = Depends(get
             timezone=profile_data.get("timezone", "Europe/Moscow"),
             language=profile_data.get("language", "ru-RU")
         )
+
+        # Generate AI persona if enabled
+        try:
+            from app.database import get_setting as _gs
+            ai_enabled = _gs("ai_persona_enabled", True)
+            if ai_enabled:
+                from core.ai_persona_generator import generate_persona_for_profile
+                persona = generate_persona_for_profile(profile.name, is_mobile=False)
+                profile.persona_data = persona
+                # Use persona timezone for consistency
+                if persona.get("timezone"):
+                    profile.timezone = persona["timezone"]
+                logger.info(f"AI persona assigned to profile {profile.name}: {persona.get('name')}")
+        except Exception as persona_err:
+            logger.warning(f"AI persona generation skipped: {persona_err}")
+
         db.add(profile)
         db.commit()
         db.refresh(profile)
+
+        # Generate warmup sites asynchronously via Celery
+        if profile.persona_data and CELERY_AVAILABLE:
+            try:
+                from tasks.warmup import generate_warmup_sites_task
+                generate_warmup_sites_task.delay([profile.id])
+                logger.info(f"🌐 Triggered warmup sites generation for profile {profile.id}")
+            except Exception as ws_err:
+                logger.warning(f"Warmup sites task trigger failed: {ws_err}")
 
         # Auto-start warmup if requested
         warmup_started = False
@@ -816,6 +841,23 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
         first_id = None
         last_id = None
 
+        # Pre-generate AI personas if enabled
+        personas_pool = []
+        try:
+            from app.database import get_setting as _gs
+            ai_enabled = _gs("ai_persona_enabled", True)
+            if ai_enabled:
+                from core.ai_persona_generator import generate_personas as _gen_personas
+                # Generate personas in batches of 10 (Gemini returns them fast)
+                personas_needed = count
+                while len(personas_pool) < personas_needed:
+                    batch = _gen_personas(count=min(10, personas_needed - len(personas_pool)))
+                    personas_pool.extend(batch)
+                logger.info(f"Pre-generated {len(personas_pool)} AI personas for bulk creation")
+                # Warmup sites will be generated asynchronously via Celery after profiles are created
+        except Exception as persona_err:
+            logger.warning(f"AI persona pre-generation skipped: {persona_err}")
+
         # Find the current max profile number for this prefix to avoid collisions
         existing_max = (
             db.query(func.max(BrowserProfile.id)).scalar() or 0
@@ -843,6 +885,16 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
 
                 ua_str = random.choice(ua_pool)
 
+                # Assign AI persona if available
+                persona = None
+                persona_idx = batch_start + i - 1  # 0-based index
+                if persona_idx < len(personas_pool):
+                    persona = personas_pool[persona_idx]
+                    # Override timezone from persona for consistency
+                    if persona.get("timezone"):
+                        tz = persona["timezone"]
+                    persona["assigned_profile"] = profile_name
+
                 rows.append({
                     "name": profile_name,
                     "user_agent": ua_str,
@@ -862,6 +914,7 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
                     "webrtc_leak_protect": True,
                     "geolocation_enabled": False,
                     "notifications_enabled": False,
+                    "persona_data": persona,
                 })
 
             # Bulk insert this batch
@@ -890,6 +943,23 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
 
         logger.info(f"Bulk created {total_created} profiles (ids {first_id_row}-{last_id_row})")
         await manager.broadcast(f"Bulk created {total_created} profiles")
+
+        # Trigger async warmup sites generation for profiles with personas
+        warmup_sites_task_id = None
+        if personas_pool and total_created > 0 and first_id_row:
+            try:
+                if CELERY_AVAILABLE:
+                    from tasks.warmup import generate_warmup_sites_task
+                    new_profile_ids = list(range(first_id_row, last_id_row + 1))
+                    task_res = generate_warmup_sites_task.delay(new_profile_ids)
+                    warmup_sites_task_id = task_res.id
+                    logger.info(f"🌐 Triggered warmup sites generation for {len(new_profile_ids)} profiles (task {warmup_sites_task_id})")
+                    await manager.broadcast(json.dumps({
+                        "type": "info",
+                        "message": f"Генерация сайтов нагула для {total_created} профилей запущена в фоне..."
+                    }))
+            except Exception as ws_err:
+                logger.warning(f"Failed to trigger warmup sites generation: {ws_err}")
 
         # Auto-start warmup for all created profiles if requested
         warmup_started = False
@@ -938,6 +1008,7 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
             "last_id": last_id_row,
             "warmup_started": warmup_started,
             "warmup_task_ids": warmup_task_ids,
+            "warmup_sites_task_id": warmup_sites_task_id,
             "auto_start_warmup": auto_start_warmup
         }
 

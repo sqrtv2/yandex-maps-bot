@@ -114,9 +114,9 @@ class YandexSearchTarget(Base):
         return {k.strip().lower() for k in self.disabled_keywords.strip().split('\n') if k.strip()}
 
     def get_active_keywords_list(self):
-        """Get only active (non-disabled) keywords."""
-        disabled = self.get_disabled_keywords_set()
-        return [k for k in self.get_keywords_list() if k.strip().lower() not in disabled]
+        """Get all keywords (disabled_keywords filtering is turned off)."""
+        # Previously filtered out disabled keywords — now returns ALL keywords
+        return self.get_keywords_list()
 
     def disable_keyword(self, keyword: str):
         """Add a keyword to the disabled list."""

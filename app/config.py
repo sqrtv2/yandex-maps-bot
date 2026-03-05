@@ -162,6 +162,30 @@ class Settings(BaseSettings):
     )
     capsola_enabled: bool = Field(default=True, description="Enable Capsola captcha solver")
 
+    # Referrer settings for Yandex Search
+    search_referrer_percent: int = Field(
+        default=50,
+        description="Percentage of search tasks that visit a referrer site (e.g. mail.ru) before ya.ru (0-100)"
+    )
+    search_referrer_site: str = Field(
+        default="https://mail.ru",
+        description="Referrer site URL to visit before ya.ru"
+    )
+
+    # AI Persona Generator (Gemini / Vertex AI)
+    gemini_api_key: str = Field(
+        default="",
+        description="Google Gemini API key (if not using Vertex AI service account)"
+    )
+    gemini_model: str = Field(
+        default="gemini-2.0-flash",
+        description="Gemini model name to use for persona generation"
+    )
+    ai_persona_enabled: bool = Field(
+        default=True,
+        description="Enable AI persona generation for new profiles"
+    )
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

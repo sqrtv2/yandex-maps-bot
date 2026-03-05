@@ -159,15 +159,113 @@ MIN_WARMUP_HOURS_SPREAD = 2
 WARMUP_SESSION_INTERVAL_HOURS = 1
 
 
-def _build_warmup_site_list(profile_id: int, count: int = 20, stage: int = 1) -> List[str]:
+@shared_task(bind=True, max_retries=2, default_retry_delay=30, time_limit=600, soft_time_limit=540)
+def generate_warmup_sites_task(self, profile_ids: List[int]):
+    """
+    Background task: generate AI warmup sites (50 URLs + 20 queries)
+    for profiles that have personas but no warmup_sites yet.
+    Called after bulk profile creation.
+    """
+    from core.ai_persona_generator import generate_warmup_sites
+    from sqlalchemy.orm.attributes import flag_modified
+
+    generated = 0
+    errors = 0
+
+    for pid in profile_ids:
+        try:
+            with get_db_session() as db:
+                profile = db.query(BrowserProfile).filter(BrowserProfile.id == pid).first()
+                if not profile:
+                    continue
+
+                persona = profile.persona_data
+                if not isinstance(persona, dict) or not persona.get("name"):
+                    continue
+
+                # Skip if already has warmup sites
+                existing = persona.get("warmup_sites", [])
+                if isinstance(existing, list) and len(existing) >= 20:
+                    continue
+
+                ws_data = generate_warmup_sites(persona)
+                persona["warmup_sites"] = ws_data.get("warmup_sites", [])
+                persona["extra_search_queries"] = ws_data.get("extra_search_queries", [])
+                profile.persona_data = persona
+                flag_modified(profile, "persona_data")
+                db.commit()
+
+                generated += 1
+                logger.info(f"🌐 Generated {len(persona['warmup_sites'])} warmup sites for profile {pid}")
+
+        except Exception as e:
+            errors += 1
+            logger.error(f"Error generating warmup sites for profile {pid}: {e}")
+
+    logger.info(f"✅ Warmup sites generation complete: {generated} generated, {errors} errors (out of {len(profile_ids)} profiles)")
+    return {"generated": generated, "errors": errors, "total": len(profile_ids)}
+
+
+def _build_warmup_site_list(profile_id: int, count: int = 20, stage: int = 1, persona_data: dict = None) -> List[str]:
     """Build a diverse site list based on warmup stage.
     
+    If persona_data contains 'warmup_sites' (AI-generated 50 sites),
+    uses those as the PRIMARY pool — each session picks a different subset,
+    ensuring Yandex ecosystem coverage on every visit.
+
+    If no warmup_sites, falls back to selecting from hardcoded lists.
+
     Stage 1: General browsing + Yandex ecosystem (build cookies)
     Stage 2: More Yandex + first Yandex Maps exploration
     Stage 3: Yandex heavy + Yandex Maps organization searches
     Stage 4+: Reinforcement/maintenance
     """
     sites = []
+
+    # ------------------------------------------------------------------
+    # AI warmup sites pool: pick subset from pre-generated 50 sites
+    # ------------------------------------------------------------------
+    ai_warmup_sites = []
+    if persona_data and isinstance(persona_data, dict):
+        ai_warmup_sites = persona_data.get("warmup_sites", [])
+        if isinstance(ai_warmup_sites, list) and len(ai_warmup_sites) >= 20:
+            # We have AI-generated warmup sites — use them as the main pool
+            logger.debug(f"Using {len(ai_warmup_sites)} AI warmup sites for profile {profile_id}")
+
+            # Always include Yandex ecosystem essentials based on stage
+            yandex_essential = ["https://ya.ru", "https://dzen.ru"]
+            if stage >= 2:
+                yandex_essential.extend(["https://market.yandex.ru", "https://yandex.ru/maps"])
+                if stage >= 3:
+                    yandex_essential.extend([
+                        "https://pogoda.yandex.ru", "https://news.yandex.ru",
+                        "https://music.yandex.ru",
+                    ])
+
+            for url in yandex_essential:
+                if url not in sites:
+                    sites.append(url)
+
+            # Pick remaining from AI pool (exclude already added)
+            pool = [s for s in ai_warmup_sites if s not in sites]
+            random.shuffle(pool)
+
+            # How many more to add
+            remaining = count - len(sites)
+            if remaining > 0:
+                sites.extend(pool[:remaining])
+
+            # Final shuffle
+            random.shuffle(sites)
+            return sites
+
+    # ------------------------------------------------------------------
+    # Fallback: legacy behaviour with hardcoded lists
+    # ------------------------------------------------------------------
+    # Persona typical_sites (old-style, up to 5)
+    persona_sites = []
+    if persona_data and isinstance(persona_data, dict):
+        persona_sites = [s for s in persona_data.get("typical_sites", []) if isinstance(s, str)]
 
     if stage == 1:
         # Stage 1: Foundation — Yandex cookies + general browsing
@@ -223,6 +321,14 @@ def _build_warmup_site_list(profile_id: int, count: int = 20, stage: int = 1) ->
                     sites.append(url)
     except:
         pass
+
+    # Inject persona-specific sites (replace some generic ones)
+    if persona_sites:
+        # Add up to 5 persona sites that aren't already in the list
+        persona_extra = [s for s in persona_sites if s not in sites]
+        random.shuffle(persona_extra)
+        sites.extend(persona_extra[:5])
+        logger.debug(f"Added {min(5, len(persona_extra))} persona sites for profile {profile_id}")
 
     # Trim to requested count, shuffle
     if len(sites) > count:
@@ -692,18 +798,40 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
             current_stage = profile_obj.get_next_warmup_stage()
             is_rewarmup = profile_obj.warmup_completed  # re-warming already warmed profile
 
+            # Load AI persona data (if assigned)
+            profile_persona_data = profile_obj.persona_data
+
             profile_obj.status = "warming_up"
             db.commit()
 
         logger.info(f"🔥 Warmup profile {profile_id} — STAGE {current_stage} {'(re-warmup)' if is_rewarmup else ''}")
+        if profile_persona_data:
+            logger.info(f"   Persona: {profile_persona_data.get('name', '?')} ({profile_persona_data.get('profession', '?')})")
+
+        # Check if profile has AI warmup sites (50 sites)
+        has_ai_warmup_sites = (
+            profile_persona_data
+            and isinstance(profile_persona_data, dict)
+            and isinstance(profile_persona_data.get("warmup_sites"), list)
+            and len(profile_persona_data.get("warmup_sites", [])) >= 20
+        )
 
         # Build stage-appropriate site list
-        if FAST_MODE:
-            sites_count = random.randint(8, 12) if current_stage >= 2 else random.randint(8, 14)
+        # With AI warmup sites: visit 15-20 different sites per session (from pool of 50)
+        # Without: legacy 8-22 range
+        if has_ai_warmup_sites:
+            if FAST_MODE:
+                sites_count = random.randint(12, 16)
+            else:
+                sites_count = random.randint(16, 22)
+            logger.info(f"   AI warmup pool: {len(profile_persona_data['warmup_sites'])} sites, picking {sites_count}")
         else:
-            sites_count = random.randint(12, 18) if current_stage >= 2 else random.randint(15, 22)
+            if FAST_MODE:
+                sites_count = random.randint(8, 12) if current_stage >= 2 else random.randint(8, 14)
+            else:
+                sites_count = random.randint(12, 18) if current_stage >= 2 else random.randint(15, 22)
         if not sites_list:
-            sites_list = _build_warmup_site_list(profile_id, count=sites_count, stage=current_stage)
+            sites_list = _build_warmup_site_list(profile_id, count=sites_count, stage=current_stage, persona_data=profile_persona_data)
 
         # Initialize managers
         browser_manager = BrowserManager()
@@ -776,11 +904,22 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
         searches_done = 0
         maps_browsed = 0
 
+        # Build search query pool: persona queries + extra AI queries + default queries
+        search_queries_pool = list(YANDEX_SEARCH_QUERIES)
+        if profile_persona_data and isinstance(profile_persona_data, dict):
+            persona_queries = profile_persona_data.get("search_queries", [])
+            extra_queries = profile_persona_data.get("extra_search_queries", [])
+            all_persona_queries = list(persona_queries) + list(extra_queries)
+            if all_persona_queries:
+                # Put persona queries first so they're more likely to be picked
+                search_queries_pool = all_persona_queries + search_queries_pool
+                logger.debug(f"Added {len(all_persona_queries)} persona+AI search queries for profile {profile_id}")
+
         # --- Stage-specific pre-browsing ---
         if current_stage == 1:
             # Stage 1: Start with Yandex search to get cookies
             if random.random() < 0.9:
-                query = random.choice(YANDEX_SEARCH_QUERIES)
+                query = random.choice(search_queries_pool)
                 if _perform_yandex_search(driver, query):
                     searches_done += 1
                     total_time_spent += 15
@@ -788,7 +927,7 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
 
         elif current_stage == 2:
             # Stage 2: Yandex search + first Maps visit
-            query = random.choice(YANDEX_SEARCH_QUERIES)
+            query = random.choice(search_queries_pool)
             if _perform_yandex_search(driver, query):
                 searches_done += 1
                 total_time_spent += 15
@@ -802,7 +941,7 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
 
         elif current_stage >= 3:
             # Stage 3+: Yandex search + Maps with organization search
-            query = random.choice(YANDEX_SEARCH_QUERIES)
+            query = random.choice(search_queries_pool)
             if _perform_yandex_search(driver, query):
                 searches_done += 1
                 total_time_spent += 15
@@ -869,7 +1008,7 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
 
         # --- End-of-session Yandex search reinforcement (20% in fast, 35% normal) ---
         if random.random() < (0.2 if FAST_MODE else 0.35) and searches_done < 3:
-            query = random.choice(YANDEX_SEARCH_QUERIES)
+            query = random.choice(search_queries_pool)
             if _perform_yandex_search(driver, query):
                 searches_done += 1
             _fast_sleep(1, 3)
