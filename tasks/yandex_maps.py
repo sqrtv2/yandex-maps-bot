@@ -2001,21 +2001,71 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
             # Fallback to full screenshot approach
             return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
         
-        # ШАГ 2: Send to Capsola SmartCaptcha API (NOT PazlCaptcha!)
-        # For SmartCaptcha: click = main image (silhouette), task = task description icons
-        logger.info(f"🔄 Sending Silhouette as SmartCaptcha to Capsola (click={len(click_image_data)}b, task={len(task_image_data)}b)...")
-        result = capsola.solve_smart_captcha(click_image_data, task_image_data, max_wait=120)
+        # ШАГ 2: Solve with retries (up to 3 attempts)
+        for solve_attempt in range(1, 4):
+            # For SmartCaptcha: click = main image (silhouette), task = task description icons
+            logger.info(f"🔄 [{solve_attempt}/3] Sending Silhouette as SmartCaptcha to Capsola (click={len(click_image_data)}b, task={len(task_image_data)}b)...")
+            result = capsola.solve_smart_captcha(click_image_data, task_image_data, max_wait=120)
+            
+            if not result or result.get('status') != 1:
+                logger.warning(f"⚠️ [{solve_attempt}/3] SmartCaptcha failed for silhouette: {result}")
+                if solve_attempt < 3:
+                    time.sleep(2)
+                    continue
+                # Final attempt failed → fallback to full screenshot
+                return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
+            
+            answer = result.get('response', '')
+            logger.info(f"✅ [{solve_attempt}/3] SmartCaptcha silhouette answer: {answer}")
+            
+            # ШАГ 3: Apply coordinate-based answer
+            solved = _apply_silhouette_answer(driver, answer, click_image_data)
+            if solved:
+                return True
+            
+            if solve_attempt < 3:
+                logger.info(f"🔄 [{solve_attempt}/3] Silhouette answer didn't work, retrying...")
+                # Re-extract images for next attempt (captcha may have refreshed)
+                time.sleep(2)
+                try:
+                    for sel in ["[data-testid='silhouette-container'] img", ".AdvancedCaptcha-ImageWrapper img"]:
+                        try:
+                            el = driver.find_element(By.CSS_SELECTOR, sel)
+                            if el.is_displayed():
+                                new_src = el.get_attribute('src')
+                                if new_src and new_src.startswith('http'):
+                                    cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+                                    resp = req.get(new_src, cookies=cookies, timeout=15, headers={
+                                        'User-Agent': driver.execute_script("return navigator.userAgent"),
+                                        'Referer': driver.current_url
+                                    })
+                                    if resp.status_code == 200 and len(resp.content) > 100:
+                                        click_image_data = resp.content
+                                        logger.info(f"📥 Re-downloaded silhouette image: {len(click_image_data)} bytes")
+                                break
+                        except:
+                            continue
+                    for sel in [".AdvancedCaptcha-SilhouetteTask img.TaskImage", ".AdvancedCaptcha-SilhouetteTask img"]:
+                        try:
+                            el = driver.find_element(By.CSS_SELECTOR, sel)
+                            if el.is_displayed():
+                                new_src = el.get_attribute('src')
+                                if new_src and new_src.startswith('http'):
+                                    cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+                                    resp = req.get(new_src, cookies=cookies, timeout=15, headers={
+                                        'User-Agent': driver.execute_script("return navigator.userAgent"),
+                                        'Referer': driver.current_url
+                                    })
+                                    if resp.status_code == 200 and len(resp.content) > 100:
+                                        task_image_data = resp.content
+                                        logger.info(f"📥 Re-downloaded task image: {len(task_image_data)} bytes")
+                                break
+                        except:
+                            continue
+                except Exception as re_err:
+                    logger.warning(f"⚠️ Could not re-extract images: {re_err}")
         
-        if not result or result.get('status') != 1:
-            logger.warning(f"⚠️ SmartCaptcha failed for silhouette: {result}")
-            # Fallback to full screenshot
-            return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
-        
-        answer = result.get('response', '')
-        logger.info(f"✅ SmartCaptcha silhouette answer: {answer}")
-        
-        # ШАГ 3: Apply coordinate-based answer
-        return _apply_silhouette_answer(driver, answer)
+        return False
         
     except Exception as e:
         logger.error(f"❌ Error solving Silhouette captcha: {e}")
@@ -2104,8 +2154,12 @@ def _try_pazl_captcha_v2(driver, capsola) -> Optional[Dict]:
         return None
 
 
-def _apply_silhouette_answer(driver, answer) -> bool:
+def _apply_silhouette_answer(driver, answer, source_image_data=None) -> bool:
     """Apply the PazlCaptcha answer by clicking at the returned coordinates on the captcha image.
+    
+    Capsola returns coordinates relative to the SOURCE image dimensions (natural size).
+    The displayed <img> element may be CSS-scaled to a different size.
+    We must compute scale_x/scale_y to convert source coords → displayed coords.
     
     The answer can be:
     - Coordinates string: "coordinates:x=34.7,y=108.0;x=234.3,y=72.3" 
@@ -2156,19 +2210,48 @@ def _apply_silhouette_answer(driver, answer) -> bool:
             if coord_pairs:
                 logger.info(f"📍 Found {len(coord_pairs)} coordinate pairs to click")
                 
-                # Selenium 4 uses center-based offset, Capsola returns top-left coords
+                # Displayed element size
                 img_size = image_element.size
-                cx = img_size['width'] / 2
-                cy = img_size['height'] / 2
-                logger.info(f"📐 Image size: {img_size['width']}x{img_size['height']}, center: ({cx:.0f}, {cy:.0f})")
+                displayed_w = img_size['width']
+                displayed_h = img_size['height']
+                
+                # Get natural (source) image dimensions for coordinate scaling
+                # Capsola returns coords relative to the source image size
+                natural_w, natural_h = displayed_w, displayed_h  # default: no scaling
+                
+                if source_image_data:
+                    try:
+                        from PIL import Image
+                        from io import BytesIO
+                        src_img = Image.open(BytesIO(source_image_data))
+                        natural_w, natural_h = src_img.size
+                        logger.info(f"📐 Source image: {natural_w}x{natural_h}, displayed: {displayed_w}x{displayed_h}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not get source image size: {e}")
+                else:
+                    # Try getting naturalWidth/naturalHeight via JS
+                    try:
+                        natural_w = driver.execute_script("return arguments[0].naturalWidth", image_element) or displayed_w
+                        natural_h = driver.execute_script("return arguments[0].naturalHeight", image_element) or displayed_h
+                        logger.info(f"📐 Natural (JS): {natural_w}x{natural_h}, displayed: {displayed_w}x{displayed_h}")
+                    except:
+                        pass
+                
+                scale_x = displayed_w / natural_w if natural_w else 1.0
+                scale_y = displayed_h / natural_h if natural_h else 1.0
+                cx = displayed_w / 2
+                cy = displayed_h / 2
+                logger.info(f"📐 Scale: x={scale_x:.3f}, y={scale_y:.3f}, center: ({cx:.0f}, {cy:.0f})")
                 
                 for i, (x_str, y_str) in enumerate(coord_pairs):
                     try:
                         x, y = float(x_str), float(y_str)
                         
-                        # Convert top-left based coords to center-based for Selenium 4
-                        offset_x = int(x - cx) + random.randint(-1, 1)
-                        offset_y = int(y - cy) + random.randint(-1, 1)
+                        # Scale source coords to displayed coords, then convert to center-based offset
+                        scaled_x = x * scale_x
+                        scaled_y = y * scale_y
+                        offset_x = int(scaled_x - cx) + random.randint(-1, 1)
+                        offset_y = int(scaled_y - cy) + random.randint(-1, 1)
                         
                         ActionChains(driver)\
                             .move_to_element_with_offset(image_element, offset_x, offset_y)\
@@ -2176,7 +2259,7 @@ def _apply_silhouette_answer(driver, answer) -> bool:
                             .click()\
                             .perform()
                         
-                        logger.info(f"✅ Silhouette click {i+1}: raw=({x:.1f}, {y:.1f}), offset=({offset_x}, {offset_y})")
+                        logger.info(f"✅ Silhouette click {i+1}: raw=({x:.1f}, {y:.1f}), scaled=({scaled_x:.1f}, {scaled_y:.1f}), offset=({offset_x}, {offset_y})")
                         time.sleep(random.uniform(0.3, 0.8))
                     except Exception as e:
                         logger.warning(f"Click error at ({x_str}, {y_str}): {e}")
@@ -2185,15 +2268,34 @@ def _apply_silhouette_answer(driver, answer) -> bool:
                 parts = coords_str.replace(';', ',').split(',')
                 if len(parts) >= 2 and len(parts) % 2 == 0:
                     img_size = image_element.size
-                    cx = img_size['width'] / 2
-                    cy = img_size['height'] / 2
+                    displayed_w2 = img_size['width']
+                    displayed_h2 = img_size['height']
+                    nat_w2, nat_h2 = displayed_w2, displayed_h2
+                    if source_image_data:
+                        try:
+                            from PIL import Image
+                            from io import BytesIO
+                            src_img2 = Image.open(BytesIO(source_image_data))
+                            nat_w2, nat_h2 = src_img2.size
+                        except:
+                            pass
+                    else:
+                        try:
+                            nat_w2 = driver.execute_script("return arguments[0].naturalWidth", image_element) or displayed_w2
+                            nat_h2 = driver.execute_script("return arguments[0].naturalHeight", image_element) or displayed_h2
+                        except:
+                            pass
+                    s_x2 = displayed_w2 / nat_w2 if nat_w2 else 1.0
+                    s_y2 = displayed_h2 / nat_h2 if nat_h2 else 1.0
+                    cx = displayed_w2 / 2
+                    cy = displayed_h2 / 2
                     for i in range(0, len(parts), 2):
                         try:
                             x = float(parts[i].strip())
                             y = float(parts[i+1].strip())
                             
-                            offset_x = int(x - cx)
-                            offset_y = int(y - cy)
+                            offset_x = int(x * s_x2 - cx)
+                            offset_y = int(y * s_y2 - cy)
                             
                             ActionChains(driver)\
                                 .move_to_element_with_offset(image_element, offset_x, offset_y)\
