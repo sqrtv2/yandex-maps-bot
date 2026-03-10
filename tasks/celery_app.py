@@ -191,8 +191,8 @@ def _cleanup_chrome_on_worker_shutdown(**kwargs):
 
 @signals.task_postrun.connect
 def _reap_zombies_after_task(**kwargs):
-    """Reap zombie children and kill stale Chrome after every task."""
-    import os, subprocess
+    """Reap zombie children after every task completes."""
+    import os
     try:
         while True:
             pid, _ = os.waitpid(-1, os.WNOHANG)
@@ -200,26 +200,6 @@ def _reap_zombies_after_task(**kwargs):
                 break
     except ChildProcessError:
         pass
-    except Exception:
-        pass
-
-    # Kill Chrome/chromedriver processes older than 10 minutes (certainly orphaned)
-    try:
-        result = subprocess.run(
-            ['sh', '-c',
-             "ps -eo pid,etimes,comm | grep -E 'chrome|chromedriver' | awk '$2 > 600 {print $1}'"],
-            capture_output=True, text=True, timeout=5
-        )
-        stale_pids = [p.strip() for p in result.stdout.strip().split('\n') if p.strip().isdigit()]
-        killed = 0
-        for pid_str in stale_pids:
-            try:
-                os.kill(int(pid_str), 9)
-                killed += 1
-            except (ProcessLookupError, PermissionError):
-                pass
-        if killed:
-            logger.info(f"🧹 Post-task cleanup: killed {killed} stale Chrome processes (>10min old)")
     except Exception:
         pass
 

@@ -242,15 +242,9 @@ def schedule_yandex_visits():
                         db.flush()  # get task_record.id
                         
                         # Schedule the visit task with task_id for log tracking
-                        task_kwargs = {'task_id': task_record.id}
-                        # Pass search_query for search-based navigation if configured
-                        if hasattr(target, 'search_query') and target.search_query:
-                            task_kwargs['search_query'] = target.search_query
-                            logger.info(f"   🔍 Search-based navigation: '{target.search_query}'")
-                        
                         visit_yandex_maps_profile_task.apply_async(
                             args=[profile.id, target.url, visit_params],
-                            kwargs=task_kwargs,
+                            kwargs={'task_id': task_record.id},
                             countdown=delay_seconds,
                             queue='yandex_maps'
                         )
@@ -352,13 +346,8 @@ def force_visit_target(target_id: int, profile_id: Optional[int] = None):
                 visit_params['actions'].append('view_map')
             
             # Schedule immediate visit
-            task_kwargs = {}
-            if hasattr(target, 'search_query') and target.search_query:
-                task_kwargs['search_query'] = target.search_query
-            
             result = visit_yandex_maps_profile_task.apply_async(
                 args=[profile.id, target.url, visit_params],
-                kwargs=task_kwargs,
                 queue='yandex_maps'
             )
             
@@ -688,13 +677,11 @@ def queue_watchdog():
                     t.add_log(f'🐕 Watchdog: задача зависла в in_progress')
                     total_fixed += 1
 
-                # Stale pending — but SKIP tasks that have already started executing
-                # (worker picked them up after they were stuck in pending)
+                # Stale pending
                 stale_pending = db.query(Task).filter(
                     Task.task_type == task_type,
                     Task.status == 'pending',
-                    Task.created_at < (now - timedelta(minutes=PENDING_MAX_MINUTES)),
-                    Task.started_at.is_(None)  # Only kill truly stuck tasks, not ones already running
+                    Task.created_at < (now - timedelta(minutes=PENDING_MAX_MINUTES))
                 ).all()
 
                 for t in stale_pending:

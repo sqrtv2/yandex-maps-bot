@@ -610,34 +610,8 @@ class BrowserManager:
                 raise chrome_exc
             logger.info("✅ Browser created successfully")
 
-            # Wait for Chrome to fully initialize before sending CDP commands.
-            # Chrome 145+ in headless mode can report "Browser window not found"
-            # if CDP commands arrive before the window target is ready.
-            for _wait_attempt in range(5):
-                try:
-                    time.sleep(0.5)
-                    _ = driver.current_url  # lightweight CDP health-check
-                    break
-                except Exception:
-                    if _wait_attempt == 4:
-                        logger.warning("⚠️ Browser still not responsive after 2.5s init wait")
-                    continue
-
-            # Apply profile settings (with one retry on transient crash)
-            try:
-                self._apply_profile_settings(driver, profile_data)
-            except WebDriverException as ps_err:
-                err_msg = str(ps_err).lower()
-                if 'browser window not found' in err_msg or 'not reachable' in err_msg:
-                    logger.warning("⚠️ Profile settings failed on first attempt, retrying after 1s...")
-                    time.sleep(1)
-                    try:
-                        _ = driver.current_url
-                    except Exception:
-                        raise ps_err  # browser truly dead
-                    self._apply_profile_settings(driver, profile_data)
-                else:
-                    raise
+            # Apply profile settings
+            self._apply_profile_settings(driver, profile_data)
 
             # Verify browser is still alive after applying profile settings
             try:
@@ -807,30 +781,20 @@ class BrowserManager:
         try:
             is_mobile = profile_data.get('is_mobile', False)
             
-            # Inject fingerprinting scripts first (uses CDP which is more
-            # reliable than set_window_size in headless Chrome 145+)
-            self._inject_fingerprint_scripts(driver, profile_data)
-
-            # Set viewport size — wrapped in try/except because
-            # set_window_size uses Browser.setWindowBounds which can fail
-            # with "Browser window not found" in headless Chrome 145+.
-            # The window size is already set via --window-size Chrome arg,
-            # so this is a best-effort refinement.
+            # Set viewport size
             viewport = profile_data.get("viewport", {})
             if viewport:
-                try:
-                    if is_mobile:
-                        driver.set_window_size(
-                            viewport.get("width", 412) + 100,
-                            viewport.get("height", 915) + 200
-                        )
-                    else:
-                        driver.set_window_size(viewport.get("width", 1366), viewport.get("height", 768))
-                except WebDriverException as win_err:
-                    if 'browser window not found' in str(win_err).lower():
-                        logger.warning(f"⚠️ set_window_size failed (headless race), using --window-size fallback")
-                    else:
-                        raise
+                if is_mobile:
+                    # For mobile: set a larger window so CDP emulation controls viewport
+                    driver.set_window_size(
+                        viewport.get("width", 412) + 100,
+                        viewport.get("height", 915) + 200
+                    )
+                else:
+                    driver.set_window_size(viewport.get("width", 1366), viewport.get("height", 768))
+
+            # Inject fingerprinting scripts
+            self._inject_fingerprint_scripts(driver, profile_data)
 
             # Set timezone via CDP if available
             if hasattr(driver, 'execute_cdp_cmd'):
