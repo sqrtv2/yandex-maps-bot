@@ -1,12 +1,13 @@
 """
 Yandex Maps Parser — collects company data from Yandex Maps search results.
+Uses click-based navigation: clicks on search snippets, parses the side panel card,
+then uses browser back to return to search results. Never uses driver.get() for org pages.
 """
 import time
 import random
 import re
 import logging
 from typing import Dict, List, Optional
-from datetime import datetime
 from urllib.parse import quote, unquote
 
 from selenium.webdriver.common.by import By
@@ -23,58 +24,59 @@ logger = logging.getLogger(__name__)
 def parse_yandex_maps_search(driver, search_url: str, max_items: int = 100,
                               on_progress=None) -> List[Dict]:
     """
-    Open Yandex Maps search results and collect company data.
+    Open Yandex Maps search results and collect company data via snippet clicks.
     """
     companies = []
     seen_ids = set()
 
     logger.info(f"🔍 Opening Yandex Maps search: {search_url[:100]}...")
     driver.get(search_url)
-    time.sleep(4 + random.uniform(1, 3))
+    time.sleep(5 + random.uniform(1, 3))
 
-    # Remember the search URL (may redirect to yandex.com)
-    actual_search_url = driver.current_url
-
-    # Wait for search results to load
+    # Wait for search results
     if not _wait_for_search_results(driver):
         logger.warning("⚠️ Could not find search results on page")
         return companies
 
     logger.info("✅ Search results loaded")
 
-    page_num = 0
-    max_scroll_attempts = 50
-    no_new_items_count = 0
+    scroll_round = 0
+    max_rounds = 50
+    no_new_count = 0
 
-    while len(companies) < max_items and page_num < max_scroll_attempts:
-        page_num += 1
+    while len(companies) < max_items and scroll_round < max_rounds:
+        scroll_round += 1
 
-        # Collect visible company links (only base org links, no /reviews/ etc.)
-        links = _collect_company_links(driver)
-        new_links = [(url, oid) for url, oid in links if oid not in seen_ids]
+        # Get all visible snippets
+        snippets = driver.find_elements(By.CSS_SELECTOR, ".search-business-snippet-view")
+        if not snippets:
+            snippets = driver.find_elements(By.CSS_SELECTOR, ".search-snippet-view")
 
-        if not new_links:
-            no_new_items_count += 1
-            if no_new_items_count >= 3:
+        # Find snippets with org IDs we haven't processed yet
+        new_snippets = []
+        for snip in snippets:
+            org_id = _get_snippet_org_id(snip)
+            if org_id and org_id not in seen_ids:
+                new_snippets.append((snip, org_id))
+
+        if not new_snippets:
+            no_new_count += 1
+            if no_new_count >= 3:
                 logger.info(f"📋 No more new results after {len(companies)} companies")
                 break
-            # Scroll and retry
             _scroll_results(driver)
             time.sleep(2 + random.uniform(0.5, 1.5))
             continue
-        else:
-            no_new_items_count = 0
 
-        # Parse each new company card
-        for link_url, org_id in new_links:
+        no_new_count = 0
+
+        for snip, org_id in new_snippets:
             if len(companies) >= max_items:
                 break
-            if org_id in seen_ids:
-                continue
             seen_ids.add(org_id)
 
             try:
-                company = _parse_company_card(driver, link_url, org_id)
+                company = _click_and_parse_card(driver, snip, org_id)
                 if company and company.get('name'):
                     companies.append(company)
                     logger.info(f"  ✅ [{len(companies)}/{max_items}] {company['name']}")
@@ -85,39 +87,23 @@ def parse_yandex_maps_search(driver, search_url: str, max_items: int = 100,
             except Exception as e:
                 logger.warning(f"  ⚠️ Error parsing {org_id}: {e}")
 
-            time.sleep(1 + random.uniform(0.5, 1.5))
+            time.sleep(0.5 + random.uniform(0.3, 1))
 
-        # Navigate back to search results for next batch
+        # Scroll to load more results
         if len(companies) < max_items:
-            logger.info(f"🔄 Returning to search results (page {page_num})...")
-            driver.get(actual_search_url)
-            time.sleep(3 + random.uniform(1, 2))
-
-            if not _wait_for_search_results(driver):
-                logger.warning("⚠️ Could not reload search results, stopping")
-                break
-
-            # Scroll down to load items beyond what we already parsed
-            for _ in range(page_num):
-                _scroll_results(driver)
-                time.sleep(0.5)
-            time.sleep(1.5 + random.uniform(0.5, 1))
+            _scroll_results(driver)
+            time.sleep(1.5 + random.uniform(0.5, 1.5))
 
     logger.info(f"🏁 Parsing complete: {len(companies)} companies collected")
     return companies
 
 
 def _wait_for_search_results(driver, timeout: int = 20) -> bool:
-    """Wait for search results to appear on the page."""
-    selectors = (
-        'div.search-snippet-view, '
-        'div.search-business-snippet-view, '
-        '[class*="search-snippet-view"], '
-        '[class*="search-list-view__list"]'
-    )
+    """Wait for search snippets to appear."""
     try:
         WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, selectors))
+            EC.presence_of_element_located((By.CSS_SELECTOR,
+                '.search-business-snippet-view, .search-snippet-view'))
         )
         return True
     except TimeoutException:
@@ -136,106 +122,97 @@ def _scroll_results(driver):
         driver.execute_script("window.scrollBy(0, 800)")
 
 
-def _collect_company_links(driver) -> List[tuple]:
-    """Collect company links from search results. Returns list of (url, org_id)."""
-    links = []
-    seen_oids = set()
-
+def _get_snippet_org_id(snippet) -> Optional[str]:
+    """Extract org ID from a search snippet element."""
     try:
-        elements = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/org/"]')
-
-        for el in elements:
-            try:
-                href = el.get_attribute('href')
-                if not href:
-                    continue
-
-                # Skip sub-pages like /reviews/, /gallery/, /prices/
-                org_id = _extract_org_id(href)
-                if not org_id or org_id in seen_oids:
-                    continue
-
-                # Only take the base org URL (/org/name/ID/ without extra path)
-                match = re.search(r'(/org/[^/]+/\d+/?)', href)
-                if not match:
-                    continue
-
-                # Reconstruct clean URL
-                base = href.split('/org/')[0]
-                clean_url = base + match.group(1)
-                if not clean_url.endswith('/'):
-                    clean_url += '/'
-
-                seen_oids.add(org_id)
-                links.append((clean_url, org_id))
-            except StaleElementReferenceException:
-                continue
-    except Exception as e:
-        logger.warning(f"Error collecting links: {e}")
-
-    return links
-
-
-def _extract_org_id(url: str) -> Optional[str]:
-    """Extract organization ID from Yandex Maps URL."""
-    match = re.search(r'/org/[^/]+/(\d+)', url)
-    if match:
-        return match.group(1)
-    match = re.search(r'oid=(\d+)', url)
-    if match:
-        return match.group(1)
+        links = snippet.find_elements(By.CSS_SELECTOR, "a[href*='/org/']")
+        for link in links:
+            href = link.get_attribute("href") or ""
+            match = re.search(r'/org/[^/]+/(\d+)', href)
+            if match:
+                return match.group(1)
+    except (StaleElementReferenceException, Exception):
+        pass
     return None
 
 
-def _parse_company_card(driver, card_url: str, org_id: str) -> Optional[Dict]:
-    """Open a company card and extract all available data."""
-    driver.get(card_url)
-    time.sleep(2.5 + random.uniform(1, 2))
-
-    # Wait for card to load — use verified selectors
+def _click_and_parse_card(driver, snippet, org_id: str) -> Optional[Dict]:
+    """Click on a search snippet, parse the card panel, then go back."""
+    # Click the snippet title
     try:
-        WebDriverWait(driver, 15).until(
+        title_el = snippet.find_element(By.CSS_SELECTOR, ".search-business-snippet-view__title")
+    except NoSuchElementException:
+        try:
+            title_el = snippet.find_element(By.CSS_SELECTOR, "a[href*='/org/']")
+        except NoSuchElementException:
+            title_el = snippet
+
+    try:
+        title_el.click()
+    except Exception:
+        driver.execute_script("arguments[0].click()", title_el)
+
+    time.sleep(3 + random.uniform(1, 2))
+
+    # Wait for card to appear
+    try:
+        WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR,
-                'h1.orgpage-header-view__header, '
-                'div.business-card-view, '
-                'div[class*="orgpage-header-view"]'))
+                '.business-card-view, h1.card-title-view__title, '
+                'h1.orgpage-header-view__header'))
         )
     except TimeoutException:
-        logger.warning(f"Card did not load for org {org_id}")
+        logger.warning(f"Card panel did not appear for org {org_id}")
+        driver.back()
+        time.sleep(2)
+        _wait_for_search_results(driver, 10)
         return None
 
-    time.sleep(1)
+    time.sleep(0.5)
 
+    # Parse the card
+    company = _parse_card_panel(driver, org_id)
+
+    # Go back to search results
+    driver.back()
+    time.sleep(1.5 + random.uniform(0.5, 1))
+    _wait_for_search_results(driver, 10)
+
+    return company
+
+
+def _parse_card_panel(driver, org_id: str) -> Dict:
+    """Parse company data from the side card panel."""
     company = {
         'yandex_maps_id': org_id,
         'yandex_maps_url': driver.current_url,
     }
 
-    # Extract name
+    # Name
     company['name'] = _extract_text(driver, [
+        'h1.card-title-view__title',
         'h1.orgpage-header-view__header',
-        'h1[class*="orgpage-header"]',
-        'h1',
+        '.business-card-view h1',
     ])
 
-    # Extract category
-    company['category'] = _extract_text(driver, [
-        'a.orgpage-categories-info-view__link',
-        '.orgpage-categories-info-view__item',
-        '[class*="orgpage-categories"] a',
+    # Category
+    category_text = _extract_text(driver, [
+        '.business-card-title-view__categories',
+        '.card-title-view__subtitle',
     ])
+    if category_text:
+        # Take first line only (categories can be multiline)
+        company['category'] = category_text.split('\n')[0].strip()
 
-    # Extract address
+    # Address — from the card contacts section
     company['address'] = _extract_text(driver, [
-        'a.orgpage-header-view__address',
         '.business-contacts-view__address',
-        '[class*="orgpage-header-view__address"]',
+        '.orgpage-header-view__address',
     ])
 
-    # Extract rating
+    # Rating
     rating_text = _extract_text(driver, [
-        'span.business-rating-badge-view__rating-text',
-        '.business-summary-rating-badge-view__rating-text',
+        '.business-rating-badge-view__rating-text',
         '[class*="rating-badge-view__rating-text"]',
     ])
     if rating_text:
@@ -244,38 +221,40 @@ def _parse_company_card(driver, card_url: str, org_id: str) -> Optional[Dict]:
         except ValueError:
             pass
 
-    # Extract reviews count
+    # Reviews count
     reviews_text = _extract_text(driver, [
-        '.business-summary-rating-badge-view__rating-count',
         '.business-rating-amount-view',
-        '[class*="rating-count"]',
+        '.business-card-title-view__header-rating',
     ])
     if reviews_text:
-        nums = re.findall(r'\d+', reviews_text.replace('\xa0', ''))
+        nums = re.findall(r'\d+', reviews_text.replace('\xa0', '').replace(' ', ''))
         if nums:
             company['reviews_count'] = int(nums[0])
 
-    # Extract phone numbers (may need to click expand button)
+    # Phone — text-based extraction (no tel: links in side panel)
     phones = _extract_phones(driver)
     if phones:
         company['phone'] = phones[0]
         if len(phones) > 1:
             company['phone2'] = phones[1]
 
-    # Extract website
+    # Website
     company['website'] = _extract_website(driver)
 
-    # Extract social links
+    # Socials
     socials = _extract_socials(driver)
     company.update(socials)
 
-    # Extract email
+    # Email
     company['email'] = _extract_email(driver)
 
-    # Extract working hours
-    company['working_hours'] = _extract_working_hours(driver)
+    # Working hours
+    company['working_hours'] = _extract_text(driver, [
+        '.business-card-working-status-view__text',
+        '.business-working-status-view',
+    ])
 
-    # Extract coordinates from URL
+    # Coordinates
     coords = _extract_coordinates(driver.current_url)
     if coords:
         company['latitude'] = coords[0]
@@ -284,8 +263,8 @@ def _parse_company_card(driver, card_url: str, org_id: str) -> Optional[Dict]:
     return company
 
 
-def _extract_text(driver, selectors: List[str]) -> Optional[str]:
-    """Try multiple CSS selectors and return first matching text."""
+def _extract_text(driver, selectors: list) -> Optional[str]:
+    """Try CSS selectors and return first matching text."""
     for sel in selectors:
         try:
             el = driver.find_element(By.CSS_SELECTOR, sel)
@@ -297,19 +276,14 @@ def _extract_text(driver, selectors: List[str]) -> Optional[str]:
     return None
 
 
-def _extract_phones(driver) -> List[str]:
-    """Extract phone numbers from the company card."""
+def _extract_phones(driver) -> list:
+    """Extract phone numbers from the card panel."""
     phones = []
 
-    # Try to expand phone list first (click "show phones" button)
-    for expand_sel in [
-        '.orgpage-phones-view__more',
-        '.card-phones-view__more',
-        '[class*="phones-view__more"]',
-        '[class*="phones-view__control"]',
-    ]:
+    # Try clicking "Показать телефон" expand button
+    for sel in ['.card-phones-view__more', '.orgpage-phones-view__more']:
         try:
-            btn = driver.find_element(By.CSS_SELECTOR, expand_sel)
+            btn = driver.find_element(By.CSS_SELECTOR, sel)
             if btn.is_displayed():
                 btn.click()
                 time.sleep(1)
@@ -317,48 +291,34 @@ def _extract_phones(driver) -> List[str]:
         except (NoSuchElementException, Exception):
             continue
 
-    # Now collect phone links
+    # Get phone text from card-phones-view__number elements
     for sel in [
-        '.card-phones-view__phone-number a[href^="tel:"]',
-        '.orgpage-phones-view__phone-number a[href^="tel:"]',
-        'a[href^="tel:"]',
+        '.card-phones-view__phone-number',
+        '.orgpage-phones-view__phone-number',
     ]:
         try:
             elements = driver.find_elements(By.CSS_SELECTOR, sel)
             for el in elements:
-                href = el.get_attribute('href') or ''
-                phone = href.replace('tel:', '').strip()
-                if phone and phone not in phones:
-                    phones.append(phone)
+                text = el.text.strip()
+                # Extract phone number from text like "+7 (495) 127-60-55\nПоказать телефон"
+                for line in text.split('\n'):
+                    line = line.strip()
+                    if re.search(r'[+\d][\d\s\-()]{8,}', line):
+                        if line not in phones:
+                            phones.append(line)
             if phones:
                 break
         except (NoSuchElementException, StaleElementReferenceException):
             continue
 
-    # Fallback: extract phone numbers from visible card-phones text
-    if not phones:
-        for sel in [
-            '.card-phones-view__phone-number',
-            '.orgpage-phones-view__phone-number',
-        ]:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, sel)
-                for el in elements:
-                    text = el.text.strip()
-                    if text and re.search(r'\d{3}', text):
-                        phones.append(text)
-            except (NoSuchElementException, StaleElementReferenceException):
-                continue
-            if phones:
-                break
-
-    # Last resort: regex from page body
+    # Also try tel: links (present on full org pages)
     if not phones:
         try:
-            page_text = driver.find_element(By.TAG_NAME, 'body').text
-            found = re.findall(r'[+7|8][\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}', page_text)
-            for p in found[:2]:
-                phones.append(p.strip())
+            tel_links = driver.find_elements(By.CSS_SELECTOR, 'a[href^="tel:"]')
+            for el in tel_links:
+                phone = (el.get_attribute('href') or '').replace('tel:', '').strip()
+                if phone and phone not in phones:
+                    phones.append(phone)
         except Exception:
             pass
 
@@ -366,7 +326,7 @@ def _extract_phones(driver) -> List[str]:
 
 
 def _extract_website(driver) -> Optional[str]:
-    """Extract website URL from the company card."""
+    """Extract website URL from the card."""
     for sel in [
         'a.business-urls-view__link',
         '.business-urls-view__url a',
@@ -386,111 +346,77 @@ def _extract_website(driver) -> Optional[str]:
     return None
 
 
-def _extract_socials(driver) -> Dict:
-    """Extract social media links (Telegram, WhatsApp, VK, Instagram)."""
+def _extract_socials(driver) -> dict:
+    """Extract social media links."""
     result = {}
 
-    # First try dedicated social links section
+    # Check dedicated social links section first
     try:
-        social_links = driver.find_elements(By.CSS_SELECTOR, 
-            '.card-social-links-view__link, .card-footer-view__social-links a')
+        social_links = driver.find_elements(By.CSS_SELECTOR,
+            '.business-contacts-view__social-button a, '
+            '.card-social-links-view__link, '
+            '.business-contacts-view__social-links a')
         for link in social_links:
-            try:
-                href = (link.get_attribute('href') or '').lower()
-                _classify_social(href, link, result)
-            except StaleElementReferenceException:
-                continue
+            href = (link.get_attribute('href') or '').lower()
+            _classify_social(href, link, result)
     except Exception:
         pass
 
-    # Also scan all links on the page
-    if not result:
+    # Scan all page links
+    if len(result) < 2:
         try:
             all_links = driver.find_elements(By.CSS_SELECTOR, 'a[href]')
             for link in all_links:
-                try:
-                    href = (link.get_attribute('href') or '').lower()
+                href = (link.get_attribute('href') or '').lower()
+                if any(k in href for k in ['t.me/', 'wa.me/', 'whatsapp', 'vk.com/', 'instagram.com/']):
                     _classify_social(href, link, result)
-                except StaleElementReferenceException:
-                    continue
         except Exception:
             pass
+
+    # Filter out Yandex's own social links
+    for key in list(result.keys()):
+        val = result[key].lower()
+        if 'yandex' in val or 'mapsyandex' in val or 'yandex.maps' in val:
+            del result[key]
 
     return result
 
 
-def _classify_social(href: str, link, result: Dict):
+def _classify_social(href: str, link, result: dict):
     """Classify a link as a social network."""
-    if 't.me/' in href or 'telegram' in href:
-        if 'telegram' not in result:
-            result['telegram'] = link.get_attribute('href')
-    elif 'wa.me/' in href or 'whatsapp' in href or 'api.whatsapp' in href:
-        if 'whatsapp' not in result:
-            result['whatsapp'] = link.get_attribute('href')
-    elif 'vk.com/' in href:
-        if 'vk' not in result:
-            result['vk'] = link.get_attribute('href')
-    elif 'instagram.com/' in href:
-        if 'instagram' not in result:
-            result['instagram'] = link.get_attribute('href')
+    original_href = link.get_attribute('href') or ''
+    if 't.me/' in href and 'telegram' not in result:
+        result['telegram'] = original_href
+    elif ('wa.me/' in href or 'whatsapp' in href) and 'whatsapp' not in result:
+        result['whatsapp'] = original_href
+    elif 'vk.com/' in href and 'vk' not in result:
+        result['vk'] = original_href
+    elif 'instagram.com/' in href and 'instagram' not in result:
+        result['instagram'] = original_href
 
 
 def _extract_email(driver) -> Optional[str]:
-    """Extract email from the company card."""
+    """Extract email from the card."""
     try:
         elements = driver.find_elements(By.CSS_SELECTOR, 'a[href^="mailto:"]')
         for el in elements:
-            href = el.get_attribute('href') or ''
-            email = href.replace('mailto:', '').strip()
+            email = (el.get_attribute('href') or '').replace('mailto:', '').strip()
             if email and '@' in email:
                 return email
     except Exception:
         pass
-
-    # Try regex in page text
-    try:
-        page_text = driver.find_element(By.TAG_NAME, 'body').text
-        match = re.search(r'[\w.+-]+@[\w-]+\.[\w.-]+', page_text)
-        if match:
-            email = match.group(0)
-            if 'yandex' not in email.lower() and 'ya.ru' not in email.lower():
-                return email
-    except Exception:
-        pass
-
-    return None
-
-
-def _extract_working_hours(driver) -> Optional[str]:
-    """Extract working hours text."""
-    selectors = [
-        '.business-card-working-status-view__text',
-        '.business-working-status-view',
-        '.business-working-status-flip-view',
-        '[class*="working-status-view"]',
-    ]
-    text = _extract_text(driver, selectors)
-    if text:
-        return text[:500]
     return None
 
 
 def _extract_coordinates(url: str) -> Optional[tuple]:
-    """Extract lat/lng from Yandex Maps URL."""
-    # Try ll= parameter (URL encoded comma)
-    match = re.search(r'll=([-\d.]+)%2C([-\d.]+)', url)
-    if match:
-        try:
-            return (float(match.group(2)), float(match.group(1)))
-        except ValueError:
-            pass
-    # Try ll= parameter (regular comma)
-    match = re.search(r'll=([-\d.]+),([-\d.]+)', url)
-    if match:
-        try:
-            return (float(match.group(2)), float(match.group(1)))
-        except ValueError:
-            pass
+    """Extract lat/lng from URL."""
+    for pattern in [r'll=([-\d.]+)%2C([-\d.]+)', r'll=([-\d.]+),([-\d.]+)']:
+        match = re.search(pattern, url)
+        if match:
+            try:
+                return (float(match.group(2)), float(match.group(1)))
+            except ValueError:
+                pass
     return None
 
 
