@@ -62,7 +62,7 @@ def parse_yandex_maps_task(self, parse_task_id: int):
         proxy_data = _get_random_proxy()
         
         browser_id = browser_manager.create_browser_session(profile_data, proxy_data)
-        driver = browser_manager.get_driver(browser_id)
+        driver = browser_manager.active_browsers.get(browser_id)
         
         if not driver:
             raise Exception("Failed to create browser session")
