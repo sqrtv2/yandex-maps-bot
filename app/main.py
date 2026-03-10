@@ -841,19 +841,31 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
         first_id = None
         last_id = None
 
-        # Pre-generate AI personas if enabled
+        # Pre-generate AI personas if enabled.
+        # Cap Gemini calls to avoid blocking the event loop for hours
+        # on large bulk creates (e.g. 10,000 profiles).  We generate
+        # up to MAX_GEMINI_PERSONAS via API and re-cycle them for the rest.
+        MAX_GEMINI_PERSONAS = 100  # 10 Gemini calls × 10 personas ≈ 4 min max
         personas_pool = []
         try:
             from app.database import get_setting as _gs
             ai_enabled = _gs("ai_persona_enabled", True)
             if ai_enabled:
                 from core.ai_persona_generator import generate_personas as _gen_personas
-                # Generate personas in batches of 10 (Gemini returns them fast)
-                personas_needed = count
-                while len(personas_pool) < personas_needed:
-                    batch = _gen_personas(count=min(10, personas_needed - len(personas_pool)))
-                    personas_pool.extend(batch)
-                logger.info(f"Pre-generated {len(personas_pool)} AI personas for bulk creation")
+                import asyncio
+                personas_needed = min(count, MAX_GEMINI_PERSONAS)
+
+                def _gen_all():
+                    pool = []
+                    while len(pool) < personas_needed:
+                        batch = _gen_personas(count=min(10, personas_needed - len(pool)))
+                        pool.extend(batch)
+                    return pool
+
+                # Run synchronous Gemini calls in a thread to avoid blocking the event loop
+                loop = asyncio.get_event_loop()
+                personas_pool = await loop.run_in_executor(None, _gen_all)
+                logger.info(f"Pre-generated {len(personas_pool)} AI personas for bulk creation (cap={MAX_GEMINI_PERSONAS})")
                 # Warmup sites will be generated asynchronously via Celery after profiles are created
         except Exception as persona_err:
             logger.warning(f"AI persona pre-generation skipped: {persona_err}")
@@ -885,11 +897,11 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
 
                 ua_str = random.choice(ua_pool)
 
-                # Assign AI persona if available
+                # Assign AI persona if available (recycle pool for large creates)
                 persona = None
-                persona_idx = batch_start + i - 1  # 0-based index
-                if persona_idx < len(personas_pool):
-                    persona = personas_pool[persona_idx]
+                if personas_pool:
+                    persona_idx = (batch_start + i - 1) % len(personas_pool)
+                    persona = personas_pool[persona_idx].copy()
                     # Override timezone from persona for consistency
                     if persona.get("timezone"):
                         tz = persona["timezone"]

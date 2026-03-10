@@ -1335,7 +1335,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
     return {'found': False, 'page': max_pages, 'position': 0, 'clicked': False}
 
 
-@shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=30,
+@shared_task(base=BaseTask, bind=True, max_retries=3, default_retry_delay=30,
              soft_time_limit=600, time_limit=660)
 def yandex_search_click_task(self, profile_id: int, target_id: int,
                              keyword: str, task_id: int = None,
@@ -2176,11 +2176,19 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             except self.MaxRetriesExceededError:
                 logger.error(f"Max retries exceeded for browser crash (profile {profile_id})")
 
-        # Retry on proxy tunnel failures (ERR_TUNNEL_CONNECTION_FAILED)
-        if 'ERR_TUNNEL_CONNECTION_FAILED' in error_str or 'ERR_PROXY_CONNECTION_FAILED' in error_str:
-            logger.warning("🔄 Proxy tunnel failed — will retry with different proxy")
+        # Retry on proxy/connection failures
+        if ('ERR_TUNNEL_CONNECTION_FAILED' in error_str or 'ERR_PROXY_CONNECTION_FAILED' in error_str
+                or 'ERR_CONNECTION_CLOSED' in error_str or 'ERR_CONNECTION_RESET' in error_str
+                or 'ERR_CONNECTION_REFUSED' in error_str or 'ERR_CONNECTION_TIMED_OUT' in error_str):
+            logger.warning(f"🔄 Proxy/connection failed ({error_str[:80]}) — will retry with different proxy")
             if task_id:
-                _update_search_task_log(task_id, f"🔄 Прокси не работает, повторяем...")
+                _update_search_task_log(task_id, f"🔄 Проблема с соединением, повторяем...")
+            # Clean up orphaned Chrome processes before retry
+            try:
+                from core.browser_manager import cleanup_orphaned_chrome
+                cleanup_orphaned_chrome()
+            except Exception:
+                pass
             # Close current browser before retry
             if browser_manager and browser_id:
                 try:
@@ -2191,7 +2199,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             try:
                 raise self.retry(exc=e, countdown=10, max_retries=2)
             except self.MaxRetriesExceededError:
-                logger.error("Max retries exceeded for proxy tunnel failure")
+                logger.error("Max retries exceeded for proxy/connection failure")
         
         if task_id:
             _update_search_task_log(task_id, f"❌ Ошибка: {error_str[:200]}", status='failed', error=error_str[:500])

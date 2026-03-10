@@ -19,6 +19,9 @@ class YandexMapTarget(Base):
     title = Column(String(500), nullable=True)  # Optional title/description
     organization_name = Column(String(500), nullable=True)  # Extracted from URL
     
+    # Search-based navigation: instead of direct URL visit, search for company on Yandex Maps
+    search_query = Column(String(500), nullable=True)  # e.g. "Benesque" — search text for Yandex Maps
+    
     # Visit Configuration
     visits_per_day = Column(Integer, default=10)  # How many times to visit per day
     min_interval_minutes = Column(Integer, default=60)  # Minimum interval between visits
@@ -69,6 +72,7 @@ class YandexMapTarget(Base):
             "url": self.url,
             "title": self.title,
             "organization_name": self.organization_name,
+            "search_query": self.search_query,
             "visits_per_day": self.visits_per_day,
             "min_interval_minutes": self.min_interval_minutes,
             "max_interval_minutes": self.max_interval_minutes,

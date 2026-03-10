@@ -858,11 +858,20 @@ async def generate_personas_for_existing(data: Dict[str, Any], db: Session = Dep
 
         from core.ai_persona_generator import generate_personas as _gen_personas, generate_warmup_sites as _gen_warmup
 
-        # Generate personas in batches of 10
-        personas_pool = []
-        while len(personas_pool) < len(profiles):
-            batch = _gen_personas(count=min(10, len(profiles) - len(personas_pool)))
-            personas_pool.extend(batch)
+        # Generate personas in batches of 10 (cap at 100 to avoid blocking event loop)
+        import asyncio
+        MAX_GEMINI_PERSONAS = 100
+        personas_needed = min(len(profiles), MAX_GEMINI_PERSONAS)
+
+        def _gen_all():
+            pool = []
+            while len(pool) < personas_needed:
+                batch = _gen_personas(count=min(10, personas_needed - len(pool)))
+                pool.extend(batch)
+            return pool
+
+        loop = asyncio.get_event_loop()
+        personas_pool = await loop.run_in_executor(None, _gen_all)
 
         updated = 0
         warmup_sites_generated = 0
@@ -1265,6 +1274,7 @@ async def create_yandex_target(target_data: Dict[str, Any], db: Session = Depend
             url=target_data["url"],
             title=target_data.get("title"),
             organization_name=target_data.get("organization_name"),
+            search_query=target_data.get("search_query"),
             visits_per_day=target_data.get("visits_per_day", 10),
             min_interval_minutes=target_data.get("min_interval_minutes", 60),
             max_interval_minutes=target_data.get("max_interval_minutes", 180),
@@ -1570,8 +1580,13 @@ async def launch_visits(target_id: int, body: Dict[str, Any] = None, db: Session
             delay_seconds = idx * _random.randint(5, 15)
 
             try:
+                task_kwargs = {}
+                if target.search_query:
+                    task_kwargs['search_query'] = target.search_query
+                
                 visit_yandex_maps_profile_task.apply_async(
                     args=[profile.id, target.url, task_params, task.id],
+                    kwargs=task_kwargs,
                     countdown=delay_seconds,
                     queue='yandex_maps'
                 )

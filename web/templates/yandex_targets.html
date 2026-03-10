@@ -134,6 +134,13 @@
                         </div>
                     </div>
 
+                    <div class="mb-3">
+                        <label class="form-label"><i class="bi bi-search"></i> Поисковой запрос для Яндекс Карт</label>
+                        <input type="text" class="form-control" id="targetSearchQuery" 
+                               placeholder="Например: Benesque">
+                        <small class="text-muted">Если заполнено — бот откроет Яндекс Карты, найдёт компанию через поиск и перейдёт на карточку. Более естественно, чем прямой заход по URL.</small>
+                    </div>
+
                     <h6 class="mt-4 mb-3"><i class="bi bi-calendar-check"></i> Настройки посещений</h6>
                     
                     <div class="row">
@@ -280,6 +287,12 @@
                             <label class="form-label">Название организации</label>
                             <input type="text" class="form-control" id="editTargetOrgName">
                         </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label"><i class="bi bi-search"></i> Поисковой запрос для Яндекс Карт</label>
+                        <input type="text" class="form-control" id="editSearchQuery">
+                        <small class="text-muted">Если заполнено — бот ищет компанию на картах вместо прямого захода по URL</small>
                     </div>
 
                     <div class="row">
@@ -444,6 +457,7 @@ function renderTargetsTable() {
             <td>
                 <div><a href="${target.url}" target="_blank" class="text-decoration-none">${target.url.substring(0, 50)}...</a></div>
                 <small class="text-muted">${target.title || target.organization_name || 'Без названия'}</small>
+                ${target.search_query ? `<div><span class="badge bg-info text-dark" style="font-size:0.7rem"><i class="bi bi-search"></i> Поиск: ${target.search_query}</span></div>` : ''}
             </td>
             <td>
                 <div class="d-flex align-items-center gap-1">
@@ -613,6 +627,7 @@ async function addTarget() {
         url: document.getElementById('targetUrl').value,
         title: document.getElementById('targetTitle').value,
         organization_name: document.getElementById('targetOrgName').value,
+        search_query: document.getElementById('targetSearchQuery').value || null,
         visits_per_day: parseInt(document.getElementById('visitsPerDay').value),
         min_interval_minutes: parseInt(document.getElementById('minInterval').value),
         max_interval_minutes: parseInt(document.getElementById('maxInterval').value),
@@ -694,6 +709,7 @@ function editTarget(targetId) {
     document.getElementById('editTargetUrl').value = target.url;
     document.getElementById('editTargetTitle').value = target.title || '';
     document.getElementById('editTargetOrgName').value = target.organization_name || '';
+    document.getElementById('editSearchQuery').value = target.search_query || '';
     document.getElementById('editVisitsPerDay').value = target.visits_per_day;
     document.getElementById('editMinInterval').value = target.min_interval_minutes;
     document.getElementById('editMaxInterval').value = target.max_interval_minutes;
@@ -711,6 +727,7 @@ async function updateTarget() {
         url: document.getElementById('editTargetUrl').value,
         title: document.getElementById('editTargetTitle').value,
         organization_name: document.getElementById('editTargetOrgName').value,
+        search_query: document.getElementById('editSearchQuery').value || null,
         visits_per_day: parseInt(document.getElementById('editVisitsPerDay').value),
         min_interval_minutes: parseInt(document.getElementById('editMinInterval').value),
         max_interval_minutes: parseInt(document.getElementById('editMaxInterval').value),
