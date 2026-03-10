@@ -34,6 +34,7 @@ celery_app.conf.update(
         'tasks.yandex_search.*': {'queue': 'yandex_search'},
         'tasks.proxy.*': {'queue': 'proxy'},
         'tasks.maintenance.*': {'queue': 'maintenance'},
+        'tasks.parser.*': {'queue': 'parser'},
     },
 
     # Worker settings

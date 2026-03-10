@@ -1,0 +1,554 @@
+{% extends "base.html" %}
+
+{% block title %}Парсер Яндекс Карт{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2"><i class="bi bi-building"></i> Парсер Яндекс Карт</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <button class="btn btn-success me-2" data-bs-toggle="modal" data-bs-target="#newTaskModal">
+            <i class="bi bi-plus-circle"></i> Новый парсинг
+        </button>
+        <button class="btn btn-primary me-2" onclick="exportXls()">
+            <i class="bi bi-file-earmark-excel"></i> Экспорт XLS
+        </button>
+        <button class="btn btn-outline-secondary" onclick="loadAll()">
+            <i class="bi bi-arrow-clockwise"></i> Обновить
+        </button>
+    </div>
+</div>
+
+<!-- Stats Cards -->
+<div class="row mb-4" id="statsRow">
+    <div class="col-md-2">
+        <div class="card text-bg-primary stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">Компании</div>
+                        <div class="fs-4 fw-bold" id="statTotal">0</div>
+                    </div>
+                    <i class="bi bi-building fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-bg-success stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">С телефоном</div>
+                        <div class="fs-4 fw-bold" id="statPhone">0</div>
+                    </div>
+                    <i class="bi bi-telephone fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-bg-info stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">С email</div>
+                        <div class="fs-4 fw-bold" id="statEmail">0</div>
+                    </div>
+                    <i class="bi bi-envelope fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-bg-warning stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">С сайтом</div>
+                        <div class="fs-4 fw-bold" id="statWebsite">0</div>
+                    </div>
+                    <i class="bi bi-globe fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-bg-secondary stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">Запросов</div>
+                        <div class="fs-4 fw-bold" id="statQueries">0</div>
+                    </div>
+                    <i class="bi bi-search fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-bg-danger stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">В работе</div>
+                        <div class="fs-4 fw-bold" id="statRunning">0</div>
+                    </div>
+                    <i class="bi bi-gear-wide-connected fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Tasks Section -->
+<div class="card mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-list-task"></i> Задачи парсинга</h5>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover table-sm mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th>ID</th>
+                        <th>Запрос</th>
+                        <th>Регион</th>
+                        <th>Статус</th>
+                        <th>Найдено</th>
+                        <th>Сохранено</th>
+                        <th>Создано</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody id="tasksBody">
+                    <tr><td colspan="8" class="text-center text-muted py-3">Загрузка...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Companies Section -->
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-building"></i> Найденные компании</h5>
+        <div class="d-flex gap-2">
+            <input type="text" class="form-control form-control-sm" id="searchInput" 
+                   placeholder="Поиск..." style="width: 200px;" oninput="debounceSearch()">
+            <select class="form-select form-select-sm" id="queryFilter" style="width: 200px;" onchange="loadCompanies()">
+                <option value="">Все запросы</option>
+            </select>
+        </div>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover table-sm mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th>№</th>
+                        <th>Название</th>
+                        <th>Категория</th>
+                        <th>Адрес</th>
+                        <th>Телефон</th>
+                        <th>Email</th>
+                        <th>Сайт</th>
+                        <th>Соцсети</th>
+                        <th>Рейтинг</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody id="companiesBody">
+                    <tr><td colspan="10" class="text-center text-muted py-3">Загрузка...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div class="card-footer">
+        <nav id="pagination" class="d-flex justify-content-between align-items-center">
+            <small class="text-muted" id="paginationInfo">-</small>
+            <ul class="pagination pagination-sm mb-0" id="paginationLinks"></ul>
+        </nav>
+    </div>
+</div>
+
+<!-- New Task Modal -->
+<div class="modal fade" id="newTaskModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-plus-circle"></i> Новый парсинг</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label">Поисковый запрос <span class="text-danger">*</span></label>
+                    <input type="text" class="form-control" id="taskQuery" placeholder="Например: медцентр">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Регион</label>
+                    <select class="form-select" id="taskRegion">
+                        <option value="Москва" selected>Москва</option>
+                        <option value="Санкт-Петербург">Санкт-Петербург</option>
+                        <option value="Новосибирск">Новосибирск</option>
+                        <option value="Екатеринбург">Екатеринбург</option>
+                        <option value="Казань">Казань</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Ссылка Яндекс.Карт (необязательно)</label>
+                    <input type="text" class="form-control" id="taskUrl" placeholder="https://yandex.com/maps/...">
+                    <div class="form-text">Если указана — парсер откроет именно эту ссылку вместо поиска по запросу</div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Максимум компаний</label>
+                    <input type="number" class="form-control" id="taskMaxItems" value="100" min="1" max="500">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                <button type="button" class="btn btn-success" onclick="createTask()">
+                    <i class="bi bi-play-fill"></i> Запустить
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Task Log Modal -->
+<div class="modal fade" id="taskLogModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-journal-text"></i> Лог задачи</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <pre id="taskLogContent" class="bg-dark text-light p-3 rounded" style="max-height: 400px; overflow-y: auto; white-space: pre-wrap; font-size: 0.85em;">Загрузка...</pre>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-primary btn-sm" onclick="refreshTaskLog()">
+                    <i class="bi bi-arrow-clockwise"></i> Обновить
+                </button>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Закрыть</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Company Details Modal -->
+<div class="modal fade" id="companyModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="companyModalTitle">Компания</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="companyModalBody">
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let currentPage = 1;
+let currentLogTaskId = null;
+let searchTimeout = null;
+
+// ─── Init ────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', loadAll);
+
+function loadAll() {
+    loadStats();
+    loadTasks();
+    loadCompanies();
+}
+
+// ─── Stats ───────────────────────────────────────────
+async function loadStats() {
+    try {
+        const resp = await fetch('/api/parser/stats');
+        const data = await resp.json();
+        document.getElementById('statTotal').textContent = data.total_companies;
+        document.getElementById('statPhone').textContent = data.with_phone;
+        document.getElementById('statEmail').textContent = data.with_email;
+        document.getElementById('statWebsite').textContent = data.with_website;
+        document.getElementById('statQueries').textContent = data.unique_queries;
+        document.getElementById('statRunning').textContent = data.running_tasks;
+    } catch (e) {
+        console.error('Failed to load stats:', e);
+    }
+}
+
+// ─── Tasks ───────────────────────────────────────────
+async function loadTasks() {
+    try {
+        const resp = await fetch('/api/parser/tasks');
+        const tasks = await resp.json();
+        const tbody = document.getElementById('tasksBody');
+        
+        if (!tasks.length) {
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-3">Нет задач. Нажмите "Новый парсинг" чтобы начать.</td></tr>';
+            return;
+        }
+        
+        tbody.innerHTML = tasks.map(t => {
+            const statusBadge = getStatusBadge(t.status);
+            const created = t.created_at ? new Date(t.created_at).toLocaleString('ru') : '-';
+            return `<tr>
+                <td>${t.id}</td>
+                <td><strong>${escHtml(t.search_query)}</strong></td>
+                <td>${escHtml(t.region || '')}</td>
+                <td>${statusBadge}</td>
+                <td>${t.items_found || 0}</td>
+                <td>${t.items_saved || 0}</td>
+                <td><small>${created}</small></td>
+                <td>
+                    <div class="btn-group btn-group-sm">
+                        <button class="btn btn-outline-info" onclick="showTaskLog(${t.id})" title="Лог">
+                            <i class="bi bi-journal-text"></i>
+                        </button>
+                        ${t.status === 'running' ? `<button class="btn btn-outline-warning" onclick="cancelTask(${t.id})" title="Отменить"><i class="bi bi-stop-fill"></i></button>` : ''}
+                        ${t.status !== 'running' ? `<button class="btn btn-outline-danger" onclick="deleteTask(${t.id})" title="Удалить"><i class="bi bi-trash"></i></button>` : ''}
+                    </div>
+                </td>
+            </tr>`;
+        }).join('');
+        
+        // Update query filter dropdown
+        const queries = [...new Set(tasks.map(t => t.search_query))];
+        const sel = document.getElementById('queryFilter');
+        const currentVal = sel.value;
+        sel.innerHTML = '<option value="">Все запросы</option>' + 
+            queries.map(q => `<option value="${escHtml(q)}" ${q === currentVal ? 'selected' : ''}>${escHtml(q)}</option>`).join('');
+    } catch (e) {
+        console.error('Failed to load tasks:', e);
+    }
+}
+
+function getStatusBadge(status) {
+    const map = {
+        'pending': '<span class="badge bg-secondary">Ожидает</span>',
+        'running': '<span class="badge bg-primary"><i class="bi bi-gear-wide-connected spin"></i> В работе</span>',
+        'completed': '<span class="badge bg-success">Завершён</span>',
+        'failed': '<span class="badge bg-danger">Ошибка</span>',
+        'cancelled': '<span class="badge bg-warning text-dark">Отменён</span>',
+    };
+    return map[status] || `<span class="badge bg-secondary">${status}</span>`;
+}
+
+async function createTask() {
+    const query = document.getElementById('taskQuery').value.trim();
+    if (!query) { alert('Введите поисковый запрос'); return; }
+    
+    try {
+        const resp = await fetch('/api/parser/tasks', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                search_query: query,
+                region: document.getElementById('taskRegion').value,
+                yandex_maps_url: document.getElementById('taskUrl').value.trim(),
+                max_items: parseInt(document.getElementById('taskMaxItems').value) || 100,
+            })
+        });
+        
+        if (!resp.ok) { const err = await resp.json(); alert(err.detail || 'Ошибка'); return; }
+        
+        bootstrap.Modal.getInstance(document.getElementById('newTaskModal')).hide();
+        document.getElementById('taskQuery').value = '';
+        document.getElementById('taskUrl').value = '';
+        loadAll();
+        showToast('Задача парсинга запущена!', 'success');
+    } catch (e) {
+        alert('Ошибка: ' + e.message);
+    }
+}
+
+async function cancelTask(id) {
+    if (!confirm('Отменить задачу #' + id + '?')) return;
+    await fetch(`/api/parser/tasks/${id}/cancel`, {method: 'POST'});
+    loadAll();
+}
+
+async function deleteTask(id) {
+    if (!confirm('Удалить задачу #' + id + '?')) return;
+    await fetch(`/api/parser/tasks/${id}`, {method: 'DELETE'});
+    loadAll();
+}
+
+async function showTaskLog(id) {
+    currentLogTaskId = id;
+    document.getElementById('taskLogContent').textContent = 'Загрузка...';
+    new bootstrap.Modal(document.getElementById('taskLogModal')).show();
+    refreshTaskLog();
+}
+
+async function refreshTaskLog() {
+    if (!currentLogTaskId) return;
+    try {
+        const resp = await fetch(`/api/parser/tasks/${currentLogTaskId}`);
+        const task = await resp.json();
+        const content = task.log || 'Лог пуст';
+        document.getElementById('taskLogContent').textContent = content;
+        if (task.error_message) {
+            document.getElementById('taskLogContent').textContent += '\n\n❌ ОШИБКА:\n' + task.error_message;
+        }
+    } catch (e) {
+        document.getElementById('taskLogContent').textContent = 'Ошибка загрузки: ' + e.message;
+    }
+}
+
+// ─── Companies ───────────────────────────────────────
+async function loadCompanies(page) {
+    if (page) currentPage = page;
+    
+    const search = document.getElementById('searchInput').value.trim();
+    const queryFilter = document.getElementById('queryFilter').value;
+    
+    let url = `/api/parser/companies?page=${currentPage}&per_page=50`;
+    if (search) url += `&search=${encodeURIComponent(search)}`;
+    if (queryFilter) url += `&search_query=${encodeURIComponent(queryFilter)}`;
+    
+    try {
+        const resp = await fetch(url);
+        const data = await resp.json();
+        const tbody = document.getElementById('companiesBody');
+        
+        if (!data.companies.length) {
+            tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-3">Нет данных</td></tr>';
+            document.getElementById('paginationInfo').textContent = '0 компаний';
+            document.getElementById('paginationLinks').innerHTML = '';
+            return;
+        }
+        
+        tbody.innerHTML = data.companies.map((c, i) => {
+            const num = (data.page - 1) * data.per_page + i + 1;
+            const socials = [];
+            if (c.telegram) socials.push(`<a href="${escAttr(c.telegram)}" target="_blank" title="Telegram"><i class="bi bi-telegram text-primary"></i></a>`);
+            if (c.whatsapp) socials.push(`<a href="${escAttr(c.whatsapp)}" target="_blank" title="WhatsApp"><i class="bi bi-whatsapp text-success"></i></a>`);
+            if (c.vk) socials.push(`<a href="${escAttr(c.vk)}" target="_blank" title="VK"><span class="badge bg-primary">VK</span></a>`);
+            if (c.instagram) socials.push(`<a href="${escAttr(c.instagram)}" target="_blank" title="Instagram"><i class="bi bi-instagram text-danger"></i></a>`);
+            
+            const rating = c.rating ? `<span class="badge bg-warning text-dark">${c.rating} ★</span>` : '-';
+            const website = c.website ? `<a href="${escAttr(c.website)}" target="_blank" class="text-truncate d-inline-block" style="max-width:150px">${escHtml(new URL(c.website).hostname)}</a>` : '-';
+            
+            return `<tr style="cursor:pointer" ondblclick="showCompany(${c.id})">
+                <td>${num}</td>
+                <td><strong>${escHtml(c.name || '-')}</strong></td>
+                <td><small>${escHtml(c.category || '-')}</small></td>
+                <td><small>${escHtml(c.address || '-')}</small></td>
+                <td>${c.phone ? escHtml(c.phone) : '-'}</td>
+                <td>${c.email ? `<a href="mailto:${escAttr(c.email)}">${escHtml(c.email)}</a>` : '-'}</td>
+                <td>${website}</td>
+                <td>${socials.join(' ') || '-'}</td>
+                <td>${rating}</td>
+                <td>
+                    <button class="btn btn-outline-danger btn-sm" onclick="event.stopPropagation(); deleteCompany(${c.id})" title="Удалить">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </td>
+            </tr>`;
+        }).join('');
+        
+        // Pagination info
+        const from = (data.page - 1) * data.per_page + 1;
+        const to = Math.min(data.page * data.per_page, data.total);
+        document.getElementById('paginationInfo').textContent = `${from}-${to} из ${data.total}`;
+        
+        // Pagination links
+        let pages = '';
+        if (data.total_pages > 1) {
+            if (data.page > 1) pages += `<li class="page-item"><a class="page-link" href="#" onclick="loadCompanies(${data.page - 1}); return false;">«</a></li>`;
+            const startP = Math.max(1, data.page - 3);
+            const endP = Math.min(data.total_pages, data.page + 3);
+            for (let p = startP; p <= endP; p++) {
+                pages += `<li class="page-item ${p === data.page ? 'active' : ''}"><a class="page-link" href="#" onclick="loadCompanies(${p}); return false;">${p}</a></li>`;
+            }
+            if (data.page < data.total_pages) pages += `<li class="page-item"><a class="page-link" href="#" onclick="loadCompanies(${data.page + 1}); return false;">»</a></li>`;
+        }
+        document.getElementById('paginationLinks').innerHTML = pages;
+    } catch (e) {
+        console.error('Failed to load companies:', e);
+    }
+}
+
+function debounceSearch() {
+    clearTimeout(searchTimeout);
+    searchTimeout = setTimeout(() => { currentPage = 1; loadCompanies(); }, 300);
+}
+
+async function showCompany(id) {
+    try {
+        const resp = await fetch(`/api/parser/companies?search=&page=1&per_page=1000`);
+        const data = await resp.json();
+        const c = data.companies.find(x => x.id === id);
+        if (!c) return;
+        
+        document.getElementById('companyModalTitle').textContent = c.name || 'Компания';
+        document.getElementById('companyModalBody').innerHTML = `
+            <table class="table table-bordered">
+                <tr><th width="30%">Название</th><td>${escHtml(c.name || '-')}</td></tr>
+                <tr><th>Категория</th><td>${escHtml(c.category || '-')}</td></tr>
+                <tr><th>Адрес</th><td>${escHtml(c.address || '-')}</td></tr>
+                <tr><th>Телефон</th><td>${escHtml(c.phone || '-')}</td></tr>
+                <tr><th>Телефон 2</th><td>${escHtml(c.phone2 || '-')}</td></tr>
+                <tr><th>Email</th><td>${c.email ? `<a href="mailto:${escAttr(c.email)}">${escHtml(c.email)}</a>` : '-'}</td></tr>
+                <tr><th>Сайт</th><td>${c.website ? `<a href="${escAttr(c.website)}" target="_blank">${escHtml(c.website)}</a>` : '-'}</td></tr>
+                <tr><th>Telegram</th><td>${c.telegram ? `<a href="${escAttr(c.telegram)}" target="_blank">${escHtml(c.telegram)}</a>` : '-'}</td></tr>
+                <tr><th>WhatsApp</th><td>${c.whatsapp ? `<a href="${escAttr(c.whatsapp)}" target="_blank">${escHtml(c.whatsapp)}</a>` : '-'}</td></tr>
+                <tr><th>VK</th><td>${c.vk ? `<a href="${escAttr(c.vk)}" target="_blank">${escHtml(c.vk)}</a>` : '-'}</td></tr>
+                <tr><th>Instagram</th><td>${c.instagram ? `<a href="${escAttr(c.instagram)}" target="_blank">${escHtml(c.instagram)}</a>` : '-'}</td></tr>
+                <tr><th>Рейтинг</th><td>${c.rating ? c.rating + ' ★' : '-'} ${c.reviews_count ? `(${c.reviews_count} отзывов)` : ''}</td></tr>
+                <tr><th>Часы работы</th><td>${escHtml(c.working_hours || '-')}</td></tr>
+                <tr><th>Поисковый запрос</th><td>${escHtml(c.search_query || '-')}</td></tr>
+                <tr><th>Регион</th><td>${escHtml(c.region || '-')}</td></tr>
+                <tr><th>Яндекс Карты</th><td>${c.yandex_maps_url ? `<a href="${escAttr(c.yandex_maps_url)}" target="_blank">Открыть</a>` : '-'}</td></tr>
+                <tr><th>Добавлено</th><td>${c.created_at ? new Date(c.created_at).toLocaleString('ru') : '-'}</td></tr>
+            </table>`;
+        new bootstrap.Modal(document.getElementById('companyModal')).show();
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+async function deleteCompany(id) {
+    if (!confirm('Удалить компанию?')) return;
+    await fetch(`/api/parser/companies/${id}`, {method: 'DELETE'});
+    loadCompanies();
+    loadStats();
+}
+
+// ─── Export ──────────────────────────────────────────
+function exportXls() {
+    const queryFilter = document.getElementById('queryFilter').value;
+    let url = '/api/parser/export';
+    if (queryFilter) url += `?search_query=${encodeURIComponent(queryFilter)}`;
+    window.open(url, '_blank');
+}
+
+// ─── Helpers ─────────────────────────────────────────
+function escHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+function escAttr(str) {
+    return str.replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Auto-refresh running tasks
+setInterval(() => {
+    const runningBadge = document.querySelector('.badge.bg-primary .spin');
+    if (runningBadge) {
+        loadTasks();
+        loadStats();
+    }
+}, 10000);
+</script>
+
+<style>
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { display: inline-block; animation: spin 1s linear infinite; }
+</style>
+{% endblock %}

@@ -11,6 +11,8 @@ from .yandex_search_target import YandexSearchTarget
 from .profile_target_visit import ProfileTargetVisit
 from .profile_search_visit import ProfileSearchVisit
 from .search_position_history import SearchPositionHistory
+from .parsed_company import ParsedCompany
+from .parse_task import ParseTask, ParseTaskStatus
 
 __all__ = [
     "BrowserProfile",
@@ -25,5 +27,8 @@ __all__ = [
     "YandexSearchTarget",
     "ProfileTargetVisit",
     "ProfileSearchVisit",
-    "SearchPositionHistory"
+    "SearchPositionHistory",
+    "ParsedCompany",
+    "ParseTask",
+    "ParseTaskStatus"
 ]

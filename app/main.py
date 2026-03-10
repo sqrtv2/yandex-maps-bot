@@ -31,6 +31,9 @@ from web.auth import (
 # Import web routes
 from web.routes import router as web_router
 
+# Import parser routes
+from parser.routes import router as parser_router
+
 # Import Celery tasks
 try:
     from tasks.warmup import warmup_profile_task, warmup_multiple_profiles_task
@@ -338,6 +341,9 @@ async def logout(request: Request):
 
 # Include web routes
 app.include_router(web_router)
+
+# Include parser routes
+app.include_router(parser_router)
 
 
 # WebSocket manager for real-time updates
