@@ -163,7 +163,7 @@ def parse_yandex_maps_task(self, parse_task_id: int):
         # Cleanup browser
         if browser_manager and browser_id:
             try:
-                browser_manager.close_browser(browser_id)
+                browser_manager.close_browser_session(browser_id)
             except Exception:
                 pass
 
