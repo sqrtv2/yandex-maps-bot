@@ -125,7 +125,8 @@ celery_app.autodiscover_tasks([
     'tasks.yandex_scheduler',
     'tasks.yandex_search',
     'tasks.proxy',
-    'tasks.maintenance'
+    'tasks.maintenance',
+    'parser',
 ])
 
 
