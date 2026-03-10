@@ -21,18 +21,18 @@ class ParsedCompany(Base):
     
     # Company info
     name = Column(String(500), nullable=False, index=True)
-    category = Column(String(300), nullable=True)
+    category = Column(String(500), nullable=True)
     address = Column(String(1000), nullable=True)
     
     # Contacts
     website = Column(String(2048), nullable=True)
     phone = Column(String(200), nullable=True)
     phone2 = Column(String(200), nullable=True)
-    email = Column(String(300), nullable=True)
-    telegram = Column(String(300), nullable=True)
-    whatsapp = Column(String(300), nullable=True)
-    vk = Column(String(500), nullable=True)
-    instagram = Column(String(500), nullable=True)
+    email = Column(String(500), nullable=True)
+    telegram = Column(String(2048), nullable=True)
+    whatsapp = Column(String(2048), nullable=True)
+    vk = Column(String(2048), nullable=True)
+    instagram = Column(String(2048), nullable=True)
     
     # Yandex Maps data
     yandex_maps_url = Column(String(2048), nullable=True)
