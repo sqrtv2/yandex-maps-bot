@@ -11,16 +11,17 @@ from datetime import datetime, timedelta
 
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException, StaleElementReferenceException
+from core.playwright_driver import (
+    By, Keys, EC, expected_conditions,
+    PlaywrightActionChains as ActionChains,
+    PlaywrightWait as WebDriverWait,
+    TimeoutException, WebDriverException, StaleElementReferenceException,
+)
 
 from app.database import get_db_session, get_setting
 from app.models import BrowserProfile, Task
 from app.config import settings
+from sqlalchemy import func
 from core import BrowserManager, ProxyManager, ProfileGenerator
 from core.domain_manager import domain_manager
 from core.warmup_url_manager import get_warmup_urls
@@ -43,7 +44,7 @@ YANDEX_ECOSYSTEM = [
     "https://pogoda.yandex.ru",
     "https://news.yandex.ru",
     "https://music.yandex.ru",
-    "https://kinopoisk.ru",
+    "https://www.kinopoisk.ru",
     "https://translate.yandex.ru",
     "https://yandex.ru/images",
 ]
@@ -154,9 +155,9 @@ GOOGLE_SEARCH_QUERIES = [
 # Number of sessions required before marking profile as fully warmed
 MIN_WARMUP_SESSIONS = 3
 # Minimum hours between first and last warmup session
-MIN_WARMUP_HOURS_SPREAD = 2
+MIN_WARMUP_HOURS_SPREAD = 1
 # Hours between warmup sessions
-WARMUP_SESSION_INTERVAL_HOURS = 1
+WARMUP_SESSION_INTERVAL_HOURS = 0.25
 
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=30, time_limit=600, soft_time_limit=540)
@@ -428,6 +429,639 @@ def _try_dismiss_cookies(driver):
     except:
         pass
     return False
+
+
+def _read_dzen_articles(driver) -> bool:
+    """Open Dzen.ru, browse feed, and read 1-2 articles in depth."""
+    try:
+        driver.get("https://dzen.ru")
+        _fast_sleep(3, 5)
+        _try_dismiss_cookies(driver)
+        _fast_sleep(1, 2)
+
+        # Scroll the feed to load articles
+        _human_read_page(driver, min_time=5, max_time=10)
+
+        # Find article links in the feed
+        article_selectors = [
+            "a[href*='/a/']",
+            "a[data-testid='publication-title-link']",
+            ".feed__item a[href*='dzen.ru']",
+            ".card-image-one-column a",
+            "article a",
+        ]
+        articles = []
+        for sel in article_selectors:
+            try:
+                found = driver.find_elements(By.CSS_SELECTOR, sel)
+                articles.extend([a for a in found if a.is_displayed() and a.size.get('height', 0) > 20])
+            except:
+                continue
+
+        if not articles:
+            logger.debug("No Dzen articles found, reading feed only")
+            _human_read_page(driver, min_time=5, max_time=15)
+            return True
+
+        # Read 1-2 articles
+        articles_to_read = random.sample(articles[:15], min(random.randint(1, 2), len(articles[:15])))
+        for article in articles_to_read:
+            try:
+                ActionChains(driver).move_to_element(article).pause(
+                    random.uniform(0.3, 0.7)
+                ).click().perform()
+                _fast_sleep(2, 4)
+
+                # Read the article thoroughly
+                _human_read_page(driver, min_time=8, max_time=20)
+
+                # Go back to feed
+                driver.back()
+                _fast_sleep(1, 3)
+                # Scroll a bit more in the feed
+                _smooth_scroll(driver, "down", random.randint(300, 600))
+                _fast_sleep(1, 2)
+            except:
+                try:
+                    driver.back()
+                except:
+                    pass
+                continue
+
+        logger.info("📰 Dzen article reading completed")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Error reading Dzen articles: {e}")
+        return False
+
+
+def _watch_youtube_video(driver) -> bool:
+    """Open YouTube, search for a topic, and watch a video briefly."""
+    try:
+        topics = [
+            "обзор автомобиля", "рецепт ужина", "тренировка дома",
+            "путешествие россия", "ремонт квартиры", "лайфхаки кухня",
+            "новости технологий", "фильмы 2025 обзор", "музыка для работы",
+        ]
+        query = random.choice(topics)
+
+        driver.get(f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}")
+        _fast_sleep(3, 5)
+        _try_dismiss_cookies(driver)
+        _fast_sleep(1, 2)
+
+        # Find video thumbnails in search results
+        video_links = []
+        for sel in ["a#video-title", "a.ytd-video-renderer", "ytd-video-renderer a#thumbnail"]:
+            try:
+                found = driver.find_elements(By.CSS_SELECTOR, sel)
+                video_links.extend([v for v in found if v.is_displayed()])
+            except:
+                continue
+
+        if video_links:
+            # Click a random video from top 8
+            chosen = random.choice(video_links[:8])
+            ActionChains(driver).move_to_element(chosen).pause(
+                random.uniform(0.3, 0.6)
+            ).click().perform()
+            _fast_sleep(3, 5)
+
+            # "Watch" for 15-40 seconds (scroll comments, pause)
+            watch_time = random.uniform(15, 40) * SPEED_FACTOR
+            end_time = time.time() + watch_time
+            while time.time() < end_time:
+                action = random.choice(["pause", "scroll", "pause"])
+                if action == "scroll":
+                    _smooth_scroll(driver, "down", random.randint(100, 300))
+                _fast_sleep(2, 6)
+
+            logger.info(f"📺 YouTube video watched: '{query}' ({watch_time:.0f}s)")
+        else:
+            # Just browse search results
+            _human_read_page(driver, min_time=5, max_time=10)
+            logger.info(f"📺 YouTube browsed: '{query}'")
+
+        return True
+
+    except Exception as e:
+        logger.warning(f"Error watching YouTube: {e}")
+        return False
+
+
+def _deep_yandex_interaction(driver) -> bool:
+    """Interact with Yandex services: weather details, translate, images search."""
+    try:
+        service = random.choice(["weather", "translate", "images", "news"])
+
+        if service == "weather":
+            driver.get("https://pogoda.yandex.ru")
+            _fast_sleep(2, 4)
+            _try_dismiss_cookies(driver)
+            # Read the forecast
+            _human_read_page(driver, min_time=5, max_time=12)
+            # Try clicking on a specific day
+            try:
+                day_links = driver.find_elements(By.CSS_SELECTOR, "a[href*='details'], .forecast-briefly__day, .link_theme_normal")
+                visible = [d for d in day_links if d.is_displayed() and d.size.get('height', 0) > 10]
+                if visible:
+                    ActionChains(driver).move_to_element(random.choice(visible[:5])).pause(0.3).click().perform()
+                    _fast_sleep(2, 3)
+                    _human_read_page(driver, min_time=3, max_time=8)
+            except:
+                pass
+            logger.info("🌤️ Yandex Weather browsed in depth")
+
+        elif service == "translate":
+            driver.get("https://translate.yandex.ru")
+            _fast_sleep(2, 4)
+            _try_dismiss_cookies(driver)
+            # Type a phrase to translate
+            phrases = ["привет как дела", "хороший ресторан рядом", "сколько стоит доставка",
+                       "расписание электричек", "прогноз погоды на неделю"]
+            phrase = random.choice(phrases)
+            try:
+                text_input = None
+                for sel in ["textarea#fakeArea", "textarea.textinput__control", "div[contenteditable]", "textarea"]:
+                    try:
+                        elems = driver.find_elements(By.CSS_SELECTOR, sel)
+                        for elem in elems:
+                            if elem.is_displayed():
+                                text_input = elem
+                                break
+                        if text_input:
+                            break
+                    except:
+                        continue
+                if text_input:
+                    text_input.click()
+                    _fast_sleep(0.3, 0.6)
+                    for char in phrase:
+                        text_input.send_keys(char)
+                        time.sleep(random.uniform(0.04, 0.12) * SPEED_FACTOR)
+                    _fast_sleep(2, 4)  # Wait for translation
+                    _human_read_page(driver, min_time=3, max_time=6)
+            except:
+                pass
+            logger.info("🌐 Yandex Translate used")
+
+        elif service == "images":
+            queries = ["красивые места России", "рецепты тортов", "интерьер квартиры",
+                       "котики", "природа Байкал"]
+            query = random.choice(queries)
+            driver.get(f"https://yandex.ru/images/search?text={query.replace(' ', '+')}")
+            _fast_sleep(3, 5)
+            _human_read_page(driver, min_time=5, max_time=12)
+            # Click on an image (30% chance)
+            if random.random() < 0.3:
+                try:
+                    imgs = driver.find_elements(By.CSS_SELECTOR, ".serp-item__link, .serp-item a, img.serp-item__thumb")
+                    visible_imgs = [im for im in imgs if im.is_displayed()]
+                    if visible_imgs:
+                        ActionChains(driver).move_to_element(random.choice(visible_imgs[:10])).pause(0.3).click().perform()
+                        _fast_sleep(2, 4)
+                        _human_read_page(driver, min_time=3, max_time=6)
+                        driver.back()
+                        _fast_sleep(1, 2)
+                except:
+                    pass
+            logger.info(f"🖼️ Yandex Images browsed: '{query}'")
+
+        elif service == "news":
+            driver.get("https://dzen.ru/news")
+            _fast_sleep(2, 4)
+            _try_dismiss_cookies(driver)
+            _human_read_page(driver, min_time=5, max_time=12)
+            # Click on a news article (40% chance)
+            if random.random() < 0.4:
+                try:
+                    news = driver.find_elements(By.CSS_SELECTOR, "a[href*='story'], a.mg-card__link, .news-item a")
+                    visible_news = [n for n in news if n.is_displayed()]
+                    if visible_news:
+                        ActionChains(driver).move_to_element(random.choice(visible_news[:8])).pause(0.3).click().perform()
+                        _fast_sleep(2, 4)
+                        _human_read_page(driver, min_time=5, max_time=12)
+                        driver.back()
+                        _fast_sleep(1, 2)
+                except:
+                    pass
+            logger.info("📰 Yandex News browsed")
+
+        return True
+
+    except Exception as e:
+        logger.warning(f"Error in deep Yandex interaction: {e}")
+        return False
+
+
+def _inject_yandex_trust_markers(driver) -> bool:
+    """Set localStorage/cookie markers that Yandex uses to trust returning users."""
+    try:
+        script = """
+        try {
+            // Yandex uses these localStorage keys to track returning users
+            const now = Date.now();
+            const pastVisit = now - Math.floor(Math.random() * 86400000 * 7); // 1-7 days ago
+            
+            localStorage.setItem('yandex_login_hint', '');
+            localStorage.setItem('settings_lang', 'ru');
+            localStorage.setItem('yandex_gid', '213');  // Moscow geoid
+            
+            // Simulate previous Yandex visits timestamp
+            if (!localStorage.getItem('_ym_isad')) {
+                localStorage.setItem('_ym_isad', '1');
+            }
+            
+            // Maps-specific trust
+            localStorage.setItem('maps_last_position', JSON.stringify({
+                ll: [37.622504 + (Math.random()-0.5)*0.1, 55.753215 + (Math.random()-0.5)*0.05],
+                z: Math.floor(10 + Math.random() * 5)
+            }));
+            
+            return true;
+        } catch(e) { return false; }
+        """
+        result = driver.execute_script(script)
+        if result:
+            logger.debug("✅ Yandex trust markers injected into localStorage")
+        return bool(result)
+    except Exception as e:
+        logger.debug(f"Could not inject trust markers: {e}")
+        return False
+
+
+# === Yandex Market queries for warmup ===
+YANDEX_MARKET_QUERIES = [
+    "наушники беспроводные", "чехол для телефона", "кроссовки мужские",
+    "робот пылесос", "кофемашина", "ноутбук для учёбы",
+    "смартфон до 30000", "электрическая зубная щётка", "рюкзак городской",
+    "блендер", "фитнес браслет", "книга бестселлер",
+    "настольная лампа", "сковорода с антипригарным покрытием",
+    "зимняя куртка мужская", "детские игрушки",
+]
+
+# === Kinopoisk / movie queries ===
+KINOPOISK_QUERIES = [
+    "лучшие фильмы 2025", "комедии русские", "сериалы новинки",
+    "триллеры топ", "фантастика фильмы", "драмы оскар",
+    "мультфильмы для детей", "детективы сериалы", "исторические фильмы",
+    "документальные фильмы", "ужасы новинки", "аниме популярные",
+]
+
+# === Yandex Music queries ===
+YANDEX_MUSIC_QUERIES = [
+    "русский рок", "поп музыка 2025", "классическая музыка",
+    "рэп русский", "инди музыка", "электронная музыка",
+    "джаз плейлист", "музыка для тренировки", "спокойная музыка для сна",
+    "хиты 90-х", "новинки музыки", "кавказская музыка",
+]
+
+
+def _browse_yandex_market(driver) -> bool:
+    """Browse Yandex Market: search products, view cards, read reviews, use filters."""
+    try:
+        query = random.choice(YANDEX_MARKET_QUERIES)
+        driver.get(f"https://market.yandex.ru/search?text={query.replace(' ', '+')}")
+        _fast_sleep(3, 6)
+        _try_dismiss_cookies(driver)
+        _fast_sleep(1, 2)
+
+        # Scroll through product listings
+        _human_read_page(driver, min_time=5, max_time=12)
+
+        # Try to apply a filter (30% chance) — price sort or rating
+        if random.random() < 0.3:
+            try:
+                filter_selectors = [
+                    "button[data-autotest-id*='dprice']",
+                    "[data-autotest-id='sort'] button",
+                    "button[data-zone-name='sort']",
+                    "a[href*='how=dprice']",
+                    "a[href*='how=aprice']",
+                    ".n-filter-sorter button",
+                ]
+                for sel in filter_selectors:
+                    btns = driver.find_elements(By.CSS_SELECTOR, sel)
+                    visible = [b for b in btns if b.is_displayed() and b.size.get('height', 0) > 10]
+                    if visible:
+                        ActionChains(driver).move_to_element(random.choice(visible[:3])).pause(
+                            random.uniform(0.3, 0.6)
+                        ).click().perform()
+                        _fast_sleep(2, 4)
+                        _human_read_page(driver, min_time=3, max_time=6)
+                        break
+            except:
+                pass
+
+        # Click on a product card (70% chance)
+        if random.random() < 0.7:
+            try:
+                product_selectors = [
+                    "a[data-autotest-id='product-link']",
+                    "article a[href*='/product--']",
+                    "a[href*='/product--']",
+                    ".n-snippet-card2__title a",
+                    "[data-zone-name='snippetList'] a[href*='product']",
+                    "a[data-baobab-name='title']",
+                ]
+                products = []
+                for sel in product_selectors:
+                    found = driver.find_elements(By.CSS_SELECTOR, sel)
+                    products.extend([p for p in found if p.is_displayed() and p.size.get('height', 0) > 10])
+                    if len(products) >= 5:
+                        break
+
+                if products:
+                    chosen = random.choice(products[:8])
+                    ActionChains(driver).move_to_element(chosen).pause(
+                        random.uniform(0.3, 0.6)
+                    ).click().perform()
+                    _fast_sleep(3, 5)
+
+                    # Read the product page: scroll through specs, photos
+                    _human_read_page(driver, min_time=8, max_time=18)
+
+                    # Try scrolling to reviews section (50% chance)
+                    if random.random() < 0.5:
+                        try:
+                            review_selectors = [
+                                "a[href*='reviews']",
+                                "[data-autotest-id='product-review']",
+                                "span:has-text('Отзывы')",
+                                "a[data-zone-name='reviews']",
+                                "[id*='review']",
+                            ]
+                            for sel in review_selectors:
+                                elems = driver.find_elements(By.CSS_SELECTOR, sel)
+                                visible = [e for e in elems if e.is_displayed()]
+                                if visible:
+                                    ActionChains(driver).move_to_element(visible[0]).perform()
+                                    _fast_sleep(0.5, 1)
+                                    visible[0].click()
+                                    _fast_sleep(2, 4)
+                                    _human_read_page(driver, min_time=5, max_time=12)
+                                    break
+                        except:
+                            pass
+
+                    driver.back()
+                    _fast_sleep(1, 3)
+            except:
+                pass
+
+        logger.info(f"🛒 Yandex Market browsed: '{query}'")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Error browsing Yandex Market: {e}")
+        return False
+
+
+def _browse_kinopoisk(driver) -> bool:
+    """Browse Kinopoisk: explore movies, read ratings and reviews."""
+    try:
+        action = random.choice(["main", "search", "top"])
+
+        if action == "main":
+            # Browse main page (hd.kinopoisk.ru avoids CSP issues)
+            driver.get("https://hd.kinopoisk.ru")
+            _fast_sleep(3, 5)
+            _try_dismiss_cookies(driver)
+            _human_read_page(driver, min_time=5, max_time=12)
+
+        elif action == "search":
+            # Search for something
+            query = random.choice(KINOPOISK_QUERIES)
+            driver.get(f"https://www.kinopoisk.ru/s/type/all/find/{query.replace(' ', '+')}/")
+            _fast_sleep(3, 5)
+            _try_dismiss_cookies(driver)
+            _human_read_page(driver, min_time=5, max_time=10)
+
+        else:
+            # Browse top-250
+            driver.get("https://www.kinopoisk.ru/lists/movies/top250/")
+            _fast_sleep(3, 5)
+            _try_dismiss_cookies(driver)
+            _human_read_page(driver, min_time=5, max_time=12)
+
+        # Click on a movie/series card (60% chance)
+        if random.random() < 0.6:
+            try:
+                movie_selectors = [
+                    "a[href*='/film/']",
+                    "a[href*='/series/']",
+                    "a[data-tid='film-link']",
+                    ".selection-film-item-meta a",
+                    ".styles_root__m0wje a",
+                    "a.base-movie-main-info_link",
+                ]
+                movies = []
+                for sel in movie_selectors:
+                    found = driver.find_elements(By.CSS_SELECTOR, sel)
+                    movies.extend([m for m in found if m.is_displayed() and m.size.get('height', 0) > 10])
+                    if len(movies) >= 8:
+                        break
+
+                if movies:
+                    chosen = random.choice(movies[:10])
+                    ActionChains(driver).move_to_element(chosen).pause(
+                        random.uniform(0.3, 0.6)
+                    ).click().perform()
+                    _fast_sleep(3, 5)
+
+                    # Read the movie page: plot, cast, rating
+                    _human_read_page(driver, min_time=8, max_time=20)
+
+                    # Scroll to reviews (40% chance)
+                    if random.random() < 0.4:
+                        try:
+                            _smooth_scroll(driver, "down", random.randint(800, 1500))
+                            _fast_sleep(1, 2)
+                            _human_read_page(driver, min_time=3, max_time=8)
+                        except:
+                            pass
+
+                    driver.back()
+                    _fast_sleep(1, 2)
+            except:
+                pass
+
+        logger.info("🎬 Kinopoisk browsed")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Error browsing Kinopoisk: {e}")
+        return False
+
+
+def _browse_yandex_music(driver) -> bool:
+    """Browse Yandex Music: search artists, explore playlists, play previews."""
+    try:
+        action = random.choice(["main", "search", "chart"])
+
+        if action == "main":
+            driver.get("https://music.yandex.ru")
+            _fast_sleep(3, 5)
+            _try_dismiss_cookies(driver)
+            _human_read_page(driver, min_time=5, max_time=12)
+
+        elif action == "search":
+            query = random.choice(YANDEX_MUSIC_QUERIES)
+            driver.get(f"https://music.yandex.ru/search?text={query.replace(' ', '+')}")
+            _fast_sleep(3, 5)
+            _try_dismiss_cookies(driver)
+            _human_read_page(driver, min_time=5, max_time=10)
+
+        else:
+            # Browse chart
+            driver.get("https://music.yandex.ru/chart")
+            _fast_sleep(3, 5)
+            _try_dismiss_cookies(driver)
+            _human_read_page(driver, min_time=5, max_time=12)
+
+        # Click on an artist or track (50% chance)
+        if random.random() < 0.5:
+            try:
+                link_selectors = [
+                    "a[href*='/artist/']",
+                    "a[href*='/album/']",
+                    "a.d-track__title",
+                    ".playlist__title-link",
+                    "a.artist__name",
+                    "a[href*='/track/']",
+                ]
+                links = []
+                for sel in link_selectors:
+                    found = driver.find_elements(By.CSS_SELECTOR, sel)
+                    links.extend([l for l in found if l.is_displayed()])
+                    if len(links) >= 6:
+                        break
+
+                if links:
+                    chosen = random.choice(links[:8])
+                    ActionChains(driver).move_to_element(chosen).pause(
+                        random.uniform(0.3, 0.6)
+                    ).click().perform()
+                    _fast_sleep(3, 5)
+                    _human_read_page(driver, min_time=5, max_time=15)
+                    driver.back()
+                    _fast_sleep(1, 2)
+            except:
+                pass
+
+        logger.info("🎵 Yandex Music browsed")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Error browsing Yandex Music: {e}")
+        return False
+
+
+def _yandex_search_click_through(driver, search_queries_pool: list) -> bool:
+    """Perform realistic search with click-through on organic results.
+    
+    This is a KEY behavioral signal: search → click result → read page → back to SERP → 
+    maybe click another result. Builds strong organic search behavior profile.
+    """
+    try:
+        query = random.choice(search_queries_pool) if search_queries_pool else random.choice(YANDEX_SEARCH_QUERIES)
+
+        # Open Yandex search directly
+        encoded_query = query.replace(' ', '+')
+        driver.get(f"https://yandex.ru/search/?text={encoded_query}")
+        _fast_sleep(3, 5)
+        _try_dismiss_cookies(driver)
+
+        # Read SERP first (like a real user scanning results)
+        _human_read_page(driver, min_time=3, max_time=7)
+
+        # Collect organic result links
+        result_selectors = [
+            "a.OrganicTitle-Link",
+            "li.serp-item a.link",
+            ".organic__url",
+            "a[data-cid] h2 a",
+            ".Organic a.Path-Item",
+            "h2 a[href]:not([href*='yandex']):not([href*='direct'])",
+        ]
+        results = []
+        for sel in result_selectors:
+            found = driver.find_elements(By.CSS_SELECTOR, sel)
+            results.extend([r for r in found if r.is_displayed() and r.size.get('height', 0) > 5])
+
+        if not results:
+            logger.debug("No organic results found for click-through")
+            _human_read_page(driver, min_time=3, max_time=6)
+            return True
+
+        # Click 1-3 results with natural reading and back behavior
+        clicks_to_do = random.randint(1, min(3, len(results)))
+        clicked_indices = set()
+
+        for click_num in range(clicks_to_do):
+            # Pick a result (prefer top results but not always #1)
+            available = [i for i in range(min(8, len(results))) if i not in clicked_indices]
+            if not available:
+                break
+            idx = random.choice(available)
+            clicked_indices.add(idx)
+
+            try:
+                result = results[idx]
+                # Scroll the result into view and move cursor to it
+                ActionChains(driver).move_to_element(result).pause(
+                    random.uniform(0.4, 0.8)  # Reading the snippet before clicking
+                ).click().perform()
+                _fast_sleep(2, 5)
+
+                # Read the page we landed on
+                read_time = random.uniform(8, 25) * SPEED_FACTOR
+                _human_read_page(driver, min_time=int(read_time * 0.6), max_time=int(read_time))
+
+                # Go back to SERP
+                driver.back()
+                _fast_sleep(1, 3)
+
+                # Scroll a bit on SERP (looking for next result)
+                if click_num < clicks_to_do - 1:
+                    _smooth_scroll(driver, "down", random.randint(100, 400))
+                    _fast_sleep(1, 3)
+
+            except Exception:
+                try:
+                    driver.back()
+                    _fast_sleep(1, 2)
+                except:
+                    pass
+                continue
+
+        # Sometimes scroll SERP to page 2 (15% chance)
+        if random.random() < 0.15:
+            try:
+                next_selectors = [
+                    "a.Pager-Item_type_next",
+                    "a[aria-label='Следующая страница']",
+                    ".pager__item_kind_next a",
+                    "a.pager__button_kind_next",
+                ]
+                for sel in next_selectors:
+                    nexts = driver.find_elements(By.CSS_SELECTOR, sel)
+                    visible = [n for n in nexts if n.is_displayed()]
+                    if visible:
+                        ActionChains(driver).move_to_element(visible[0]).pause(0.3).click().perform()
+                        _fast_sleep(2, 4)
+                        _human_read_page(driver, min_time=3, max_time=8)
+                        break
+            except:
+                pass
+
+        logger.info(f"🔎 Search click-through completed: '{query}' ({len(clicked_indices)} clicks)")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Error in search click-through: {e}")
+        return False
 
 
 def _perform_yandex_search(driver, query: str) -> bool:
@@ -817,19 +1451,13 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
         )
 
         # Build stage-appropriate site list
-        # With AI warmup sites: visit 15-20 different sites per session (from pool of 50)
-        # Without: legacy 8-22 range
+        # Target ~50 total visits across all sessions (50 / MIN_WARMUP_SESSIONS ≈ 17 per session)
+        target_per_session = max(10, 50 // MIN_WARMUP_SESSIONS)
         if has_ai_warmup_sites:
-            if FAST_MODE:
-                sites_count = random.randint(12, 16)
-            else:
-                sites_count = random.randint(16, 22)
+            sites_count = target_per_session
             logger.info(f"   AI warmup pool: {len(profile_persona_data['warmup_sites'])} sites, picking {sites_count}")
         else:
-            if FAST_MODE:
-                sites_count = random.randint(8, 12) if current_stage >= 2 else random.randint(8, 14)
-            else:
-                sites_count = random.randint(12, 18) if current_stage >= 2 else random.randint(15, 22)
+            sites_count = target_per_session
         if not sites_list:
             sites_list = _build_warmup_site_list(profile_id, count=sites_count, stage=current_stage, persona_data=profile_persona_data)
 
@@ -878,7 +1506,8 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
                 'height': profile_viewport_height
             },
             'timezone': profile_timezone,
-            'language': profile_language
+            'language': profile_language,
+            'images_enabled': True,  # Images enabled — Yandex detects image-less browsers
         })
         
         if is_mobile:
@@ -916,8 +1545,12 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
                 logger.debug(f"Added {len(all_persona_queries)} persona+AI search queries for profile {profile_id}")
 
         # --- Stage-specific pre-browsing ---
+        
+        # Inject Yandex trust markers in localStorage on every session
+        _inject_yandex_trust_markers(driver)
+        
         if current_stage == 1:
-            # Stage 1: Start with Yandex search to get cookies
+            # Stage 1: Yandex search + Dzen reading (build cookies & history)
             if random.random() < 0.9:
                 query = random.choice(search_queries_pool)
                 if _perform_yandex_search(driver, query):
@@ -925,13 +1558,32 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
                     total_time_spent += 15
                 _fast_sleep(2, 5)
 
+            # Read Dzen articles (60% chance) — builds Yandex cookie trust
+            if random.random() < 0.6:
+                if _read_dzen_articles(driver):
+                    total_time_spent += 20
+                _fast_sleep(1, 3)
+
+            # Kinopoisk browsing (30% chance) — early Yandex ecosystem touch
+            if random.random() < 0.3:
+                if _browse_kinopoisk(driver):
+                    total_time_spent += 15
+                _fast_sleep(1, 3)
+
         elif current_stage == 2:
-            # Stage 2: Yandex search + first Maps visit
+            # Stage 2: Yandex search + Maps + Market + YouTube + services
             query = random.choice(search_queries_pool)
             if _perform_yandex_search(driver, query):
                 searches_done += 1
                 total_time_spent += 15
             _fast_sleep(2, 5)
+
+            # Search click-through (50% chance) — key behavioral signal
+            if random.random() < 0.5:
+                if _yandex_search_click_through(driver, search_queries_pool):
+                    searches_done += 1
+                    total_time_spent += 20
+                _fast_sleep(2, 4)
 
             # Browse Yandex Maps without search (just explore)
             if _browse_yandex_maps(driver, query=None):
@@ -939,8 +1591,41 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
                 total_time_spent += 20
             _fast_sleep(2, 4)
 
+            # Yandex Market browsing (50% chance)
+            if random.random() < 0.5:
+                if _browse_yandex_market(driver):
+                    total_time_spent += 20
+                _fast_sleep(1, 3)
+
+            # Deep Yandex service interaction (70% chance)
+            if random.random() < 0.7:
+                if _deep_yandex_interaction(driver):
+                    total_time_spent += 10
+                _fast_sleep(1, 3)
+
+            # Kinopoisk (35% chance)
+            if random.random() < 0.35:
+                if _browse_kinopoisk(driver):
+                    total_time_spent += 15
+                _fast_sleep(1, 3)
+
+            # YouTube video (40% chance)
+            if random.random() < 0.4:
+                if _watch_youtube_video(driver):
+                    total_time_spent += 25
+                _fast_sleep(1, 3)
+
         elif current_stage >= 3:
-            # Stage 3+: Yandex search + Maps with organization search
+            # Stage 3+: Full activity — search, Maps, Market, Kinopoisk, Music, Dzen, YouTube, services
+
+            # Search click-through (65% chance) — CORE behavioral signal
+            if random.random() < 0.65:
+                if _yandex_search_click_through(driver, search_queries_pool):
+                    searches_done += 1
+                    total_time_spent += 25
+                _fast_sleep(2, 5)
+
+            # Regular Yandex search
             query = random.choice(search_queries_pool)
             if _perform_yandex_search(driver, query):
                 searches_done += 1
@@ -961,6 +1646,42 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
                     maps_browsed += 1
                     total_time_spent += 20
                 _fast_sleep(2, 4)
+
+            # Yandex Market (55% chance) — product browsing builds e-commerce profile
+            if random.random() < 0.55:
+                if _browse_yandex_market(driver):
+                    total_time_spent += 20
+                _fast_sleep(1, 3)
+
+            # Kinopoisk (40% chance) — movies/series browsing
+            if random.random() < 0.4:
+                if _browse_kinopoisk(driver):
+                    total_time_spent += 15
+                _fast_sleep(1, 3)
+
+            # Yandex Music (30% chance) — audio platform engagement
+            if random.random() < 0.3:
+                if _browse_yandex_music(driver):
+                    total_time_spent += 12
+                _fast_sleep(1, 3)
+
+            # Read Dzen articles (50% chance)
+            if random.random() < 0.5:
+                if _read_dzen_articles(driver):
+                    total_time_spent += 20
+                _fast_sleep(1, 3)
+
+            # Deep Yandex service (60% chance)
+            if random.random() < 0.6:
+                if _deep_yandex_interaction(driver):
+                    total_time_spent += 10
+                _fast_sleep(1, 3)
+
+            # YouTube (30% chance)
+            if random.random() < 0.3:
+                if _watch_youtube_video(driver):
+                    total_time_spent += 25
+                _fast_sleep(1, 3)
 
         # --- Visit sites with realistic browsing ---
         consecutive_failures = 0
@@ -1372,8 +2093,8 @@ def auto_schedule_initial_warmup():
                 BrowserProfile.status == "warming_up"
             ).count()
 
-            # Allow up to 5 concurrent warmup tasks (matches actual worker concurrency)
-            MAX_WARMUP_CONCURRENT = 5
+            # Allow up to 50 concurrent warmup tasks
+            MAX_WARMUP_CONCURRENT = 50
             slots = max(0, MAX_WARMUP_CONCURRENT - active_warming)
 
             if slots <= 0:
@@ -1503,3 +2224,152 @@ def auto_fix_stuck_processes():
         logger.error(f"Error in auto_fix_stuck_processes: {e}")
 
     return {"fixed": fixed}
+
+
+@shared_task(base=BaseTask)
+def auto_maintain_profile_pool():
+    """
+    Auto-create profiles to keep total warmed/active pool at ~500.
+    Runs every 10 minutes via Celery Beat.
+    Creates profiles in batches when warmed count drops below threshold.
+    """
+    TARGET_POOL_SIZE = 2000
+    BATCH_SIZE = 400  # create up to 400 at a time (profiles burn fast: 1 profile = 1 click)
+
+    try:
+        with get_db_session() as db:
+            # Count profiles that are warmed or actively being warmed
+            warmed_count = db.query(BrowserProfile).filter(
+                BrowserProfile.is_active == True,
+                BrowserProfile.warmup_completed == True,
+            ).count()
+
+            warming_count = db.query(BrowserProfile).filter(
+                BrowserProfile.is_active == True,
+                BrowserProfile.warmup_completed == False,
+                BrowserProfile.status.in_(['created', 'warming_up']),
+            ).count()
+
+            total_pipeline = warmed_count + warming_count
+
+            if total_pipeline >= TARGET_POOL_SIZE:
+                logger.info(
+                    f"📋 Profile pool OK: {warmed_count} warmed + {warming_count} warming = {total_pipeline} (target={TARGET_POOL_SIZE})"
+                )
+                return {"status": "ok", "warmed": warmed_count, "warming": warming_count, "created": 0}
+
+            need = min(TARGET_POOL_SIZE - total_pipeline, BATCH_SIZE)
+            logger.info(
+                f"📦 Profile pool low: {warmed_count} warmed + {warming_count} warming = {total_pipeline}. Creating {need} new profiles..."
+            )
+
+            # Find the current max profile id for naming
+            max_id = db.query(func.max(BrowserProfile.id)).scalar() or 0
+
+            # Generate profiles with randomized settings
+            viewports = [
+                (1366, 768), (1920, 1080), (1440, 900), (1536, 864),
+                (1280, 720), (1600, 1200), (2560, 1440), (1024, 768)
+            ]
+            timezones = [
+                "Europe/Moscow", "Europe/Moscow", "Europe/Moscow",
+                "Europe/Samara", "Asia/Yekaterinburg", "Europe/Volgograd",
+            ]
+            languages = ["ru-RU", "ru-RU", "ru-RU", "ru-RU", "ru,en-US;q=0.9,en;q=0.8"]
+
+            try:
+                from fake_useragent import UserAgent
+                ua = UserAgent()
+                ua_pool = []
+                for _ in range(min(need, 50)):
+                    try:
+                        ua_pool.append(ua.random)
+                    except Exception:
+                        ua_pool.append(
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"
+                        )
+            except ImportError:
+                ua_pool = [
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ]
+
+            # Pre-generate AI personas if enabled
+            personas = []
+            try:
+                ai_enabled = get_setting("ai_persona_enabled", True)
+                if ai_enabled:
+                    from core.ai_persona_generator import generate_personas
+                    personas = generate_personas(count=min(need, 10))
+                    # Extend if we need more
+                    while len(personas) < need:
+                        personas.extend(generate_personas(count=min(10, need - len(personas))))
+            except Exception as persona_err:
+                logger.warning(f"AI persona generation skipped: {persona_err}")
+
+            rows = []
+            for i in range(need):
+                w, h = random.choice(viewports)
+                tz = random.choice(timezones)
+                lang = random.choice(languages)
+                persona = personas[i] if i < len(personas) else None
+                if persona and persona.get("timezone"):
+                    tz = persona["timezone"]
+
+                rows.append({
+                    "name": f"Profile-{max_id + i + 1}",
+                    "user_agent": random.choice(ua_pool),
+                    "viewport_width": w,
+                    "viewport_height": h,
+                    "timezone": tz,
+                    "language": lang,
+                    "platform": random.choice(["Win32", "MacIntel", "Linux x86_64"]),
+                    "status": "created",
+                    "is_active": True,
+                    "warmup_completed": False,
+                    "warmup_sessions_count": 0,
+                    "warmup_time_spent": 0,
+                    "total_sessions": 0,
+                    "successful_sessions": 0,
+                    "failed_sessions": 0,
+                    "webrtc_leak_protect": True,
+                    "geolocation_enabled": False,
+                    "notifications_enabled": False,
+                    "persona_data": persona,
+                })
+
+            db.bulk_insert_mappings(BrowserProfile, rows)
+            db.commit()
+
+            # Trigger warmup sites generation for profiles with personas
+            if personas:
+                try:
+                    last_id = db.query(func.max(BrowserProfile.id)).scalar()
+                    first_id = last_id - need + 1
+                    new_ids = list(range(first_id, last_id + 1))
+                    generate_warmup_sites_task.delay(new_ids)
+                except Exception as ws_err:
+                    logger.warning(f"Warmup sites generation trigger failed: {ws_err}")
+
+            logger.info(f"✅ Auto-created {need} new profiles (pool: {total_pipeline} → {total_pipeline + need})")
+            return {"status": "created", "warmed": warmed_count, "warming": warming_count, "created": need}
+
+    except Exception as e:
+        logger.error(f"Error in auto_maintain_profile_pool: {e}")
+        return {"error": str(e)}
+
+
+@shared_task(base=BaseTask)
+def cleanup_orphaned_chrome_processes():
+    """Kill orphaned Chrome processes with no active browser session.
+    
+    Runs every 10 minutes via Celery Beat.
+    """
+    try:
+        from core.browser_manager import cleanup_orphaned_chrome
+        killed = cleanup_orphaned_chrome()
+        return {"killed": killed}
+    except Exception as e:
+        logger.error(f"Error in cleanup_orphaned_chrome_processes: {e}")
+        return {"error": str(e)}

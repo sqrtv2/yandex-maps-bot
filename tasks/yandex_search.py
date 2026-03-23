@@ -14,14 +14,12 @@ from datetime import datetime, timedelta
 
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
+from core.playwright_driver import (
+    By, Keys, EC, expected_conditions,
+    PlaywrightActionChains as ActionChains,
+    PlaywrightWait as WebDriverWait,
     TimeoutException, NoSuchElementException, WebDriverException,
-    ElementClickInterceptedException, StaleElementReferenceException
+    ElementClickInterceptedException, StaleElementReferenceException,
 )
 
 from app.database import get_db_session
@@ -36,6 +34,96 @@ from .celery_app import BaseTask
 from celery.utils.log import get_task_logger
 
 logger = logging.getLogger(__name__)
+
+
+# Memory budget: max RSS (in MB) before we gracefully abort.
+# Set below --max-memory-per-child (8GB=~7600MB) to bail BEFORE Celery SIGKILL's us.
+MEMORY_BUDGET_MB = 6000  # 6 GB — leaves ~1.6 GB headroom
+
+
+def _check_memory_budget() -> tuple:
+    """Check current process RSS against memory budget.
+    Returns (over_budget: bool, rss_mb: float)."""
+    try:
+        import resource
+        # ru_maxrss is in KB on Linux, bytes on macOS
+        import platform
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if platform.system() == 'Darwin':
+            rss_mb = rss_kb / (1024 * 1024)  # bytes → MB
+        else:
+            rss_mb = rss_kb / 1024  # KB → MB
+        return rss_mb > MEMORY_BUDGET_MB, rss_mb
+    except Exception:
+        return False, 0
+
+
+def _classify_error(error_str: str) -> str:
+    """Classify error string into a category."""
+    e = error_str.lower()
+    if 'captcha' in e:
+        return 'captcha'
+    if 'renderer dead' in e or 'empty title' in e:
+        return 'renderer_death'
+    if 'click failed' in e or 'не удалось кликнуть' in e:
+        return 'click_failed'
+    if 'not found in search' in e or 'не найден' in e:
+        return 'not_found'
+    if 'softttimelimit' in e or 'timed out' in e or 'timeout' in e:
+        return 'timeout'
+    if 'browser window not found' in e or 'invalid session' in e or 'browser crashed' in e:
+        return 'browser_crash'
+    if 'err_tunnel' in e or 'err_proxy' in e or 'proxy' in e:
+        return 'proxy_error'
+    if 'watchdog' in e or 'worker restarted' in e or 'auto-cleanup' in e:
+        return 'worker_killed'
+    return 'unknown'
+
+
+def _retire_profile_after_search(profile_id: int):
+    """Deactivate profile after a single search click use (1 profile = 1 click)."""
+    try:
+        with get_db_session() as db:
+            profile = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+            if profile:
+                profile.is_active = False
+                profile.status = 'retired'
+                db.commit()
+                logger.info(f"🗑️ Profile {profile_id} retired after search click (1 profile = 1 click)")
+    except Exception as e:
+        logger.warning(f"Failed to retire profile {profile_id}: {e}")
+
+
+def _save_error_log(task_id: int = None, task_type: str = 'yandex_search',
+                    profile_id: int = None, profile_name: str = None,
+                    error_message: str = '', error_detail: str = None,
+                    keyword: str = None, domain: str = None,
+                    proxy_host: str = None, proxy_id: int = None,
+                    task_duration: int = None, error_category: str = None):
+    """Save a structured error record for later analysis."""
+    try:
+        from app.models.error_log import ErrorLog
+        if not error_category:
+            error_category = _classify_error(error_message or '')
+        with get_db_session() as db:
+            entry = ErrorLog(
+                task_id=task_id,
+                task_type=task_type,
+                profile_id=profile_id,
+                profile_name=profile_name or (f'Profile-{profile_id}' if profile_id else None),
+                error_category=error_category,
+                error_message=(error_message or '')[:500],
+                error_detail=(error_detail or '')[:5000] if error_detail else None,
+                keyword=keyword,
+                domain=domain,
+                proxy_host=proxy_host,
+                proxy_id=proxy_id,
+                task_duration_seconds=task_duration,
+            )
+            db.add(entry)
+            db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to save error log: {e}")
 
 
 def _update_search_task_log(task_id: int, message: str, status: str = None,
@@ -64,62 +152,106 @@ def _update_search_task_log(task_id: int, message: str, status: str = None,
 
 
 def _safe_click(driver, element, pause_min=0.3, pause_max=0.8):
-    """Safely click an element: scroll into view, try ActionChains, fallback to JS click.
+    """Safely click an element using Playwright's native click (trusted events).
     
-    Handles 'move target out of bounds' and 'element not interactable' by
-    scrolling element into viewport first with multiple strategies.
+    Uses element.click() which does proper actionability checks, scrolling,
+    and dispatches trusted browser events — same approach that fixed typing.
     """
+    # Get raw Playwright ElementHandle for direct operations
+    from playwright.sync_api import ElementHandle as _EH
+    raw = None
+    if hasattr(element, '_handle'):
+        raw = element._handle
+    elif isinstance(element, _EH):
+        raw = element
+
+    # Strategy 1: Playwright ElementHandle.click() — trusted events with actionability checks
     try:
-        # First scroll element into viewport
-        driver.execute_script(
-            "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});",
-            element
-        )
-        time.sleep(random.uniform(0.3, 0.7))
-        
-        # Ensure element is visible and not covered by overlays
-        driver.execute_script("""
-            var elem = arguments[0];
-            var rect = elem.getBoundingClientRect();
-            // If element is outside viewport, scroll again
-            if (rect.top < 0 || rect.bottom > window.innerHeight) {
-                elem.scrollIntoView({block: 'center'});
-            }
-            // Remove any potential overlay/popup blocking the click
-            var overlay = document.querySelector('.popup-overlay, .modal-overlay, .overlay');
-            if (overlay) overlay.remove();
-        """, element)
-        time.sleep(random.uniform(0.2, 0.4))
-        
-        # Try ActionChains click (more human-like)
+        if raw:
+            raw.scroll_into_view_if_needed(timeout=3000)
+            time.sleep(random.uniform(pause_min, pause_max))
+            raw.click(timeout=5000)
+            return
+        elif hasattr(element, 'click'):
+            element.click()
+            return
+    except Exception as e1:
+        logger.info(f"_safe_click: Playwright click failed ({e1}), trying mouse click...")
+
+    # Strategy 2: Mouse click at element coordinates (more control)
+    try:
+        if raw:
+            raw.evaluate("el => el.scrollIntoView({behavior: 'smooth', block: 'center'})")
+        else:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});",
+                element
+            )
+        time.sleep(random.uniform(0.3, 0.5))
         ActionChains(driver).move_to_element(element).pause(
             random.uniform(pause_min, pause_max)
         ).click().perform()
-    except Exception as e:
-        error_msg = str(e).lower()
-        # If element not interactable, try clicking a child <a> or the parent
-        if 'not interactable' in error_msg or 'not clickable' in error_msg:
-            try:
-                # Try finding a clickable child link
-                child_links = element.find_elements(By.TAG_NAME, 'a')
-                if child_links:
-                    driver.execute_script(
-                        "arguments[0].scrollIntoView({block: 'center'});",
-                        child_links[0]
-                    )
-                    time.sleep(random.uniform(0.2, 0.4))
-                    ActionChains(driver).move_to_element(child_links[0]).pause(
-                        random.uniform(pause_min, pause_max)
-                    ).click().perform()
-                    return
-            except Exception:
-                pass
-        # Fallback: JS click
-        try:
+        return
+    except Exception as e2:
+        logger.info(f"_safe_click: ActionChains click failed ({e2}), trying JS click...")
+
+    # Strategy 3: JS click fallback
+    try:
+        if raw:
+            raw.evaluate("el => el.click()")
+        else:
             driver.execute_script("arguments[0].click();", element)
-        except Exception as js_err:
-            logger.warning(f"_safe_click: both ActionChains ({e}) and JS ({js_err}) failed")
-            raise
+    except Exception as js_err:
+        logger.warning(f"_safe_click: all click strategies failed (JS: {js_err})")
+        raise
+
+
+def _dismiss_yandex_overlays(driver):
+    """Dismiss Yandex 'download app' overlay (DistributionSplashScreen) and similar modals
+    that intercept pointer events and block pagination clicks."""
+    try:
+        dismissed = driver.execute_script("""
+            var dominated = false;
+            // 1. DistributionSplashScreen close button
+            var closeSelectors = [
+                '.DistributionSplashScreenModalScene .modal__close',
+                '.DistributionSplashScreenModalScene [class*="close"]',
+                '.DistributionSplashScreenModalScene button',
+                '[class*="DistributionSplash"] [class*="close"]',
+                '[class*="DistributionSplash"] [class*="Close"]',
+                '[class*="DistributionSplash"] button[class*="close" i]',
+                '[class*="DistributionSplash"] button',
+                '.Modal-Content [class*="close"]',
+            ];
+            for (var i = 0; i < closeSelectors.length; i++) {
+                var btn = document.querySelector(closeSelectors[i]);
+                if (btn && btn.offsetParent !== null) {
+                    btn.click();
+                    dominated = true;
+                    break;
+                }
+            }
+            // 2. Remove the overlay entirely if close button didn't work
+            if (!dominated) {
+                var overlays = document.querySelectorAll(
+                    '.DistributionSplashScreenModalScene, ' +
+                    '[id*="DistributionSplashscreen"], ' +
+                    '[class*="DistributionSplash"]'
+                );
+                for (var j = 0; j < overlays.length; j++) {
+                    overlays[j].remove();
+                    dominated = true;
+                }
+            }
+            return dominated;
+        """)
+        if dismissed:
+            logger.info("  🗑️ Dismissed Yandex distribution overlay")
+            time.sleep(random.uniform(0.5, 1.0))
+        return dismissed
+    except Exception as e:
+        logger.debug(f"  _dismiss_yandex_overlays: {e}")
+        return False
 
 
 def _wait_for_search_results_page(driver, keyword: str, max_wait: int = 20) -> bool:
@@ -159,7 +291,7 @@ def _wait_for_search_results_page(driver, keyword: str, max_wait: int = 20) -> b
     if '/search' not in current_url or 'text=' not in current_url:
         logger.info(f"⚠️ Not on search results after captcha, navigating directly...")
         encoded = quote_plus(keyword)
-        driver.get(f"https://ya.ru/search/?text={encoded}")
+        _safe_get(driver, f"https://ya.ru/search/?text={encoded}", timeout=40, label="search direct")
         time.sleep(random.uniform(4, 7))
         
         final_url = driver.current_url.lower()
@@ -172,16 +304,124 @@ def _wait_for_search_results_page(driver, keyword: str, max_wait: int = 20) -> b
 
 
 def _human_scroll(driver, min_scrolls=2, max_scrolls=5):
-    """Simulate human-like scrolling on a page."""
+    """Simulate human-like scrolling using mouse wheel events with variable speed.
+    
+    Uses page.mouse.wheel() to emit real wheel events instead of JS scrollBy,
+    with acceleration/deceleration curves to mimic trackpad/mouse behavior.
+    """
     num_scrolls = random.randint(min_scrolls, max_scrolls)
-    for _ in range(num_scrolls):
-        scroll_amount = random.randint(200, 600)
-        driver.execute_script(f"window.scrollBy(0, {scroll_amount})")
-        time.sleep(random.uniform(0.5, 2.0))
-    # Sometimes scroll back up a bit
+    page = getattr(driver, '_page', None)
+    
+    for i in range(num_scrolls):
+        # Total scroll distance for this "gesture"
+        total_delta = random.randint(200, 600)
+        
+        if page and hasattr(page, 'mouse'):
+            # Smooth wheel scroll: break into micro-steps with acceleration curve
+            num_steps = random.randint(4, 10)
+            # Generate bell-curve distribution for step sizes (accelerate then decelerate)
+            raw_weights = [math.sin(math.pi * (j + 0.5) / num_steps) for j in range(num_steps)]
+            weight_sum = sum(raw_weights)
+            for j in range(num_steps):
+                step_delta = int(total_delta * raw_weights[j] / weight_sum)
+                if step_delta < 1:
+                    step_delta = 1
+                try:
+                    page.mouse.wheel(0, step_delta)
+                except Exception:
+                    # Fallback to JS if wheel fails
+                    driver.execute_script(f"window.scrollBy(0, {step_delta})")
+                # Variable micro-delay between wheel ticks (30-120ms, faster in middle)
+                micro_delay = random.uniform(0.03, 0.12)
+                time.sleep(micro_delay)
+        else:
+            # Fallback: JS scrollBy for non-Playwright drivers
+            driver.execute_script(f"window.scrollBy(0, {total_delta})")
+        
+        # Pause between scroll gestures — sometimes short (reading), sometimes long (browsing)
+        if random.random() < 0.3:
+            time.sleep(random.uniform(1.5, 4.0))  # Long pause — "reading"
+        else:
+            time.sleep(random.uniform(0.4, 1.5))  # Short pause
+    
+    # Sometimes scroll back up a bit (30% chance)
     if random.random() < 0.3:
-        driver.execute_script(f"window.scrollBy(0, -{random.randint(100, 300)})")
+        up_amount = random.randint(80, 250)
+        if page and hasattr(page, 'mouse'):
+            up_steps = random.randint(3, 6)
+            for j in range(up_steps):
+                step = int(up_amount / up_steps)
+                try:
+                    page.mouse.wheel(0, -step)
+                except Exception:
+                    driver.execute_script(f"window.scrollBy(0, -{step})")
+                time.sleep(random.uniform(0.03, 0.08))
+        else:
+            driver.execute_script(f"window.scrollBy(0, -{up_amount})")
         time.sleep(random.uniform(0.5, 1.0))
+
+
+def _human_mouse_move(driver, duration=None):
+    """Simulate idle mouse movement between actions.
+    
+    Moves the mouse cursor to random positions on the page with natural
+    Bezier-like curves. Real users constantly move their mouse while reading.
+    """
+    page = getattr(driver, '_page', None)
+    if not page or not hasattr(page, 'mouse'):
+        return
+    
+    if duration is None:
+        duration = random.uniform(0.5, 2.0)
+    
+    try:
+        # Get viewport dimensions
+        vp = page.viewport_size or {'width': 1366, 'height': 768}
+        vw, vh = vp['width'], vp['height']
+        
+        # Number of movement points
+        num_moves = random.randint(2, 5)
+        start_time = time.time()
+        
+        for _ in range(num_moves):
+            if time.time() - start_time > duration:
+                break
+            # Target: random position biased towards content area
+            target_x = random.randint(int(vw * 0.1), int(vw * 0.85))
+            target_y = random.randint(int(vh * 0.15), int(vh * 0.8))
+            
+            # Move with steps to simulate smooth curve
+            steps = random.randint(3, 8)
+            try:
+                page.mouse.move(target_x, target_y, steps=steps)
+            except Exception:
+                break
+            time.sleep(random.uniform(0.1, 0.5))
+    except Exception:
+        pass  # Non-critical, never fail on mouse movement
+
+
+def _safe_get(driver, url, timeout=40, label="page"):
+    """Navigate to URL with timeout handling.
+    Returns True if loaded, False if timed out, 'dead' if browser/page is dead."""
+    try:
+        driver.set_page_load_timeout(timeout)
+        driver.get(url)
+        return True
+    except TimeoutException:
+        logger.warning(f"⏱️ {label} timed out after {timeout}s, stopping page load: {url[:100]}")
+        try:
+            driver.execute_script("window.stop()")
+        except Exception:
+            pass
+        return False
+    except Exception as e:
+        err_str = str(e).lower()
+        if 'closed' in err_str or 'target' in err_str:
+            logger.warning(f"💀 {label} navigation error — browser/page DEAD: {e}")
+            return 'dead'
+        logger.warning(f"⚠️ {label} navigation error: {e}")
+        return False
 
 
 # === Shared analytics blocking configuration ===
@@ -196,9 +436,7 @@ _ANALYTICS_BLOCKED_URLS = [
     '*informer.yandex.ru*',
     '*webvisor*',
     '*webvisor2*',
-    '*watch/*',
     # Metrika script files
-    '*tag.js*',
     '*metrika/tag*',
     '*metrika/watch*',
     # Google Analytics / Tag Manager
@@ -220,6 +458,43 @@ _ANALYTICS_BLOCKED_URLS = [
     '*an.yandex.ru*',
     '*yandexadexchange*',
     '*ads.adfox.ru*',
+    # --- Heavy resources: fonts ---
+    '*fonts.googleapis.com*',
+    '*fonts.gstatic.com*',
+    '*.woff2*',
+    '*.woff*',
+    '*.ttf*',
+    '*.otf*',
+    # --- Heavy resources: video/media ---
+    '*.mp4*',
+    '*.webm*',
+    '*.m3u8*',
+    '*video.yandex*',
+    '*strm.yandex.*',
+    '*player.vimeo.com*',
+    '*youtube.com/embed*',
+    '*youtube.com/iframe*',
+    '*rutube.ru/play/embed*',
+    # --- Ads & social widgets ---
+    '*pagead2.googlesyndication.com*',
+    '*adservice.google.*',
+    '*doubleclick.net*',
+    '*ad.mail.ru*',
+    '*ssp.rambler.ru*',
+    '*vk.com/js/api/openapi*',
+    '*vk.com/share*',
+    '*platform.twitter.com*',
+    '*cdn.jsdelivr.net/npm/jquery*',
+    # --- Chat widgets ---
+    '*jivosite.com*',
+    '*calltouch.*',
+    '*callibri.*',
+    '*envybox.io*',
+    '*comagic.ru*',
+    '*livetex.ru*',
+    '*talk-me.ru*',
+    '*chatra.io*',
+    '*carrotquest.io*',
 ]
 
 # Comprehensive JS that kills all analytics BEFORE any page script runs.
@@ -336,7 +611,7 @@ _ANALYTICS_KILL_JS = """
                     if (val && (val.indexOf('metrika') !== -1 || val.indexOf('mc.yandex') !== -1 ||
                         val.indexOf('metrica') !== -1 || val.indexOf('google-analytics') !== -1 ||
                         val.indexOf('googletagmanager') !== -1 || val.indexOf('webvisor') !== -1 ||
-                        val.indexOf('tag.js') !== -1 || val.indexOf('hotjar') !== -1 ||
+                        val.indexOf('hotjar') !== -1 ||
                         val.indexOf('clarity.ms') !== -1 || val.indexOf('an.yandex') !== -1)) {
                         return; // Block analytics script
                     }
@@ -481,11 +756,14 @@ def _abort_page_load_fast(driver, wait_before_abort=None):
 
 
 def _human_read_page(driver, min_time=5, max_time=15):
-    """Simulate reading a page: scroll and pause."""
+    """Simulate reading a page: scroll, pause, and move mouse."""
     read_time = random.uniform(min_time, max_time)
     start = time.time()
     while time.time() - start < read_time:
         _human_scroll(driver, 1, 2)
+        # Occasionally move mouse between scrolls (simulates looking at content)
+        if random.random() < 0.5:
+            _human_mouse_move(driver, duration=random.uniform(0.3, 1.0))
         time.sleep(random.uniform(1.0, 3.0))
 
 
@@ -558,7 +836,7 @@ def _save_position_history(search_target_id: int, keyword: str, domain: str,
                            found: bool, page: int = None, position: int = None,
                            profile_id: int = None, task_id: int = None,
                            clicked: bool = False, browse_time: float = None,
-                           serp_position: int = None):
+                           serp_position: int = None, referrer_used: bool = False):
     """Save a position check result to the history table for analytics.
     
     Args:
@@ -588,6 +866,7 @@ def _save_position_history(search_target_id: int, keyword: str, domain: str,
                 task_id=task_id,
                 clicked=clicked,
                 browse_time=browse_time,
+                referrer_used=referrer_used,
                 checked_at=datetime.utcnow()
             )
             db.add(record)
@@ -635,91 +914,94 @@ def _check_and_disable_keyword(target_id: int, keyword: str, domain: str, consec
         )
 
 
-def _calculate_keyword_clicks(db, target_id: int, keyword: str, target_success_rate: float = 100.0) -> dict:
+def _calculate_keyword_clicks(db, target_id: int, keyword: str, target_success_rate: float = 100.0, freq_weight: float = 1.0) -> dict:
     """
-    Position-adaptive click calculation for a keyword.
+    Gradual position-adaptive click calculation targeting TOP-3.
     
-    Takes target_success_rate (0-100%) to scale up clicks_per_day so that the
-    desired number of *effective* clicks is achieved despite failed attempts.
+    Philosophy:
+    - Goal is TOP-3.  Once there → maintain with 2-3 clicks/day.
+    - Outside TOP-3 → gradually increase clicks.  If no growth (stagnation)
+      → escalate further, up to 24/day (1/hour) or 48/day (1/30min) for
+      long stagnation.
+    - Recovery after drop from TOP-3 → start at 4-6, build up if no progress.
+    - Normal limit: 24 clicks/day (1 per hour).
+    - Stagnation 10+ days: up to 48 clicks/day (1 per 30 min).
+    - freq_weight: multiplier (0.7-1.5) based on exact Wordstat frequency.
     
-    Algorithm (reduction ONLY after TOP-3):
-    - New keyword (no data): 4 clicks/day (soft start)
-    - Position 20-30: 4-6 clicks/day
-    - Position 10-20: 8-12 clicks/day
-    - Position 4-10: 12-20 clicks/day (aggressive push to TOP-3)
-    - TOP-3 reached: reduce to 2 clicks/day (maintain)
-    - Position drops after being TOP-3: ramp back up
-    
-    Returns dict with:
-        clicks_per_day: int - recommended clicks for today
-        phase: str - current phase (start, ramp_up, peak, ramp_down, maintain, recovery)
-        current_position: float|None
-        trend: str (improving, declining, stable, unknown)
-        reason: str - human-readable explanation
+    Returns dict with clicks_per_day, phase, current_position, trend, reason.
     """
     scheduler_logger = logging.getLogger(__name__ + '.strategy')
     
     try:
-        # Get last 7 days of position history for this keyword
-        since_7d = datetime.utcnow() - timedelta(days=7)
-        records_7d = db.query(SearchPositionHistory).filter(
+        # ── Gather history ──
+        since_14d = datetime.utcnow() - timedelta(days=14)
+        since_7d  = datetime.utcnow() - timedelta(days=7)
+        since_3d  = datetime.utcnow() - timedelta(days=3)
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        records_14d = db.query(SearchPositionHistory).filter(
             SearchPositionHistory.search_target_id == target_id,
             SearchPositionHistory.keyword == keyword,
-            SearchPositionHistory.checked_at >= since_7d
+            SearchPositionHistory.checked_at >= since_14d
         ).order_by(SearchPositionHistory.checked_at.asc()).all()
         
-        # Also get last 3 days for recent trend
-        since_3d = datetime.utcnow() - timedelta(days=3)
-        records_3d = [r for r in records_7d if r.checked_at >= since_3d]
+        records_7d = [r for r in records_14d if r.checked_at >= since_7d]
+        records_3d = [r for r in records_14d if r.checked_at >= since_3d]
         
-        # Count today's clicks for this keyword
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        # Count ALL attempts today (not just clicks) to prevent
+        # infinite retry of keywords that are never found in search results
         today_clicks = db.query(SearchPositionHistory).filter(
             SearchPositionHistory.search_target_id == target_id,
             SearchPositionHistory.keyword == keyword,
-            SearchPositionHistory.clicked == True,
             SearchPositionHistory.checked_at >= today_start
         ).count()
         
-        # ── No data → soft start ──
-        if not records_7d:
+        # ── No data → start with 6 clicks ──
+        if not records_14d:
+            clicks = max(2, int(math.ceil(6 * freq_weight)))
             return {
-                "clicks_per_day": 4,
+                "clicks_per_day": clicks,
                 "today_done": today_clicks,
                 "phase": "start",
                 "current_position": None,
                 "trend": "unknown",
-                "reason": "Новый ключ — мягкий старт 4 клика/день"
+                "reason": f"Новый ключ — старт {clicks} кликов/день"
             }
         
         # ── Calculate positions ──
-        found_7d = [r for r in records_7d if r.found and r.absolute_position]
-        found_3d = [r for r in records_3d if r.found and r.absolute_position]
+        found_14d = [r for r in records_14d if r.found and r.absolute_position]
+        found_7d  = [r for r in records_7d  if r.found and r.absolute_position]
+        found_3d  = [r for r in records_3d  if r.found and r.absolute_position]
         
-        if not found_7d:
-            # Keyword checked but never found — still try regularly
+        if not found_14d:
+            clicks = max(2, int(math.ceil(6 * freq_weight)))
             return {
-                "clicks_per_day": 4,
+                "clicks_per_day": clicks,
                 "today_done": today_clicks,
                 "phase": "not_found",
                 "current_position": None,
                 "trend": "not_found",
-                "reason": "Сайт не найден в выдаче — 4 попытки/день для обнаружения"
+                "reason": f"Не найден в выдаче — {clicks} попыток/день"
             }
         
-        # Current position = average of last 3 days (or all if less)
-        recent_positions = [r.absolute_position for r in found_3d] if found_3d else [r.absolute_position for r in found_7d[-5:]]
+        # Current position = average of last 3 days
+        recent_positions = ([r.absolute_position for r in found_3d] 
+                           if found_3d else [r.absolute_position for r in found_7d[-3:]])
         current_pos = sum(recent_positions) / len(recent_positions)
         
-        # Previous position = average of days 4-7 (or earlier data)
+        # Previous position = average of days 4-7
         earlier_positions = [r.absolute_position for r in found_7d if r.checked_at < since_3d]
         prev_pos = sum(earlier_positions) / len(earlier_positions) if earlier_positions else current_pos
+        
+        # Week-before position = average of days 8-14  
+        week_before = [r.absolute_position for r in found_14d if r.checked_at < since_7d]
+        week_before_pos = sum(week_before) / len(week_before) if week_before else None
         
         # ── Trend calculation ──
         if len(found_7d) < 3:
             trend = "unknown"
         else:
-            diff = prev_pos - current_pos  # positive = improving (lower position = better)
+            diff = prev_pos - current_pos  # positive = improving
             if diff > 2:
                 trend = "improving"
             elif diff < -2:
@@ -727,93 +1009,162 @@ def _calculate_keyword_clicks(db, target_id: int, keyword: str, target_success_r
             else:
                 trend = "stable"
         
-        # ── Check if was ever in TOP-3 ──
-        best_recent = min(recent_positions)
-        was_top3 = any(r.absolute_position <= 3 for r in found_7d)
+        # ── Stagnation detection ──
+        # How many days position hasn't meaningfully changed?
+        days_stagnant = 0
+        if week_before_pos is not None and abs(week_before_pos - current_pos) < 3:
+            days_stagnant = 10  # ~2 weeks of no movement
+        elif week_before_pos is not None and abs(week_before_pos - current_pos) < 5:
+            days_stagnant = 7
+        elif trend == "stable":
+            days_stagnant = 3
         
-        # ── Position-based click calculation ──
-        # Снижение ТОЛЬКО после попадания в ТОП-3
+        # ── Was consistently in TOP-3 during last 14 days? ──
+        # Require 3+ measurements AND 30%+ of found results in TOP-3
+        # to avoid false triggers from single lucky outliers
+        top3_count_14d = sum(1 for r in found_14d if r.absolute_position <= 3)
+        top3_count_7d = sum(1 for r in found_7d if r.absolute_position <= 3)
+        top3_ratio_14d = top3_count_14d / len(found_14d) if found_14d else 0
+        top3_ratio_7d = top3_count_7d / len(found_7d) if found_7d else 0
+        was_top3 = top3_count_14d >= 3 and top3_ratio_14d >= 0.3
+        was_top3_recently = top3_count_7d >= 3 and top3_ratio_7d >= 0.3
+        best_14d = min(r.absolute_position for r in found_14d)
+        
+        # ── CORE ALGORITHM: Gradual clicks targeting TOP-3 ──
+        # Normal cap: 24/day (1/hour).  Stagnation 10+ days: up to 48/day (1/30min).
+        
         if current_pos <= 3:
-            # TOP-3 stable — maintain mode
-            clicks = 2
-            phase = "maintain"
-            reason = f"TOP-3 (поз. {current_pos:.1f}) — поддержка 2 клика/день"
+            # ✅ TOP-3 — maintenance
+            if days_stagnant >= 7:
+                # Stable in TOP-3 for a long time → minimal support
+                clicks = 1
+                phase = "maintain"
+                reason = f"TOP-3 стабильно (поз. {current_pos:.1f}, {days_stagnant}д) — 1 клик/день"
+            else:
+                clicks = 2
+                phase = "maintain"
+                reason = f"TOP-3 (поз. {current_pos:.1f}) — поддержка 2 клика/день"
             if trend == "declining":
-                clicks = 6
-                phase = "recovery"
-                reason = f"TOP-3 но падает (поз. {current_pos:.1f}) — усиление до 6 кликов"
+                clicks = 5
+                phase = "maintain"
+                reason = f"TOP-3 но падает ({current_pos:.1f}) — усиление до 5"
+        
+        elif current_pos <= 5:
+            # TOP-5 — push toward TOP-3
+            clicks = 6
+            phase = "ramp_up"
+            reason = f"TOP-5 ({current_pos:.1f}) — продвижение в TOP-3: 6 кликов"
+            if trend == "improving":
+                clicks = 8
+                reason = f"TOP-5 и растёт ({current_pos:.1f}) — ускорение 8 кликов"
+            elif trend == "declining":
+                clicks = 10
+                reason = f"TOP-5 но падает ({current_pos:.1f}) — усиление 10 кликов"
+            elif days_stagnant >= 7:
+                clicks = 12
+                reason = f"TOP-5 застой ({current_pos:.1f}, {days_stagnant}д) — 12 кликов"
         
         elif current_pos <= 10:
-            # TOP-10 (включая 4-5) — агрессивное продвижение к TOP-3
+            # TOP-10 — active push
+            clicks = 10
+            phase = "ramp_up"
+            reason = f"TOP-10 ({current_pos:.1f}) — активное продвижение 10 кликов"
             if trend == "improving":
-                clicks = 16
-                phase = "peak"
-                reason = f"TOP-10 и растёт (поз. {current_pos:.1f}) — максимум 16 кликов (~1/час)"
-            elif trend == "declining" and was_top3:
-                clicks = 20
-                phase = "recovery"
-                reason = f"Был TOP-3, упал до {current_pos:.1f} — восстановление 20 кликов"
-            elif trend == "declining":
-                clicks = 14
-                phase = "recovery"
-                reason = f"TOP-10 но падает (поз. {current_pos:.1f}) — усиление 14 кликов"
-            else:
                 clicks = 12
-                phase = "ramp_up"
-                reason = f"TOP-10 (поз. {current_pos:.1f}) — активное продвижение 12 кликов"
+                reason = f"TOP-10 и растёт ({current_pos:.1f}) — 12 кликов"
+            elif days_stagnant >= 7:
+                clicks = 16
+                reason = f"TOP-10 застой ({current_pos:.1f}, {days_stagnant}д) — усиление 16"
+            elif days_stagnant >= 10:
+                clicks = 20
+                reason = f"TOP-10 долгий застой ({current_pos:.1f}, {days_stagnant}д) — 20 кликов"
+            if was_top3 and trend == "declining":
+                clicks = 6
+                phase = "recovery"
+                reason = f"Выпал из TOP-3 → {current_pos:.1f} — восстановление 6 кликов"
         
         elif current_pos <= 20:
-            # Page 2 — active promotion
+            # Page 2 — aggressive promotion
+            clicks = 10
+            phase = "ramp_up"
+            reason = f"Стр.2 ({current_pos:.1f}) — 10 кликов"
             if trend == "improving":
-                clicks = 12
-                phase = "ramp_up"
-                reason = f"Стр.2 и растёт (поз. {current_pos:.1f}) — усиление 12 кликов"
-            else:
-                clicks = 8
-                phase = "ramp_up"
-                reason = f"Стр.2 (поз. {current_pos:.1f}) — продвижение 8 кликов"
+                clicks = 14
+                reason = f"Стр.2 и растёт ({current_pos:.1f}) — 14 кликов"
+            elif days_stagnant >= 7:
+                clicks = 18
+                reason = f"Стр.2 застой ({current_pos:.1f}, {days_stagnant}д) — 18 кликов"
+            elif days_stagnant >= 10:
+                clicks = 24
+                reason = f"Стр.2 долгий застой ({current_pos:.1f}, {days_stagnant}д) — 24 кл/день"
+            if was_top3 and not was_top3_recently:
+                clicks = 6
+                phase = "recovery"
+                reason = f"Был TOP-3, упал → стр.2 ({current_pos:.1f}) — восстановление 6 кликов"
+            elif was_top3_recently:
+                clicks = 4
+                phase = "recovery"
+                reason = f"Недавно выпал из TOP-3 → {current_pos:.1f} — старт восстановления 4 клика"
         
         elif current_pos <= 30:
-            # Page 3 — moderate start
+            # Page 3 — building up
+            clicks = 8
+            phase = "ramp_up"
+            reason = f"Стр.3 ({current_pos:.1f}) — 8 кликов"
             if trend == "improving":
-                clicks = 6
-                phase = "ramp_up"
-                reason = f"Стр.3 и растёт (поз. {current_pos:.1f}) — 6 кликов"
-            else:
+                clicks = 12
+                reason = f"Стр.3 и растёт ({current_pos:.1f}) — 12 кликов"
+            elif days_stagnant >= 7:
+                clicks = 16
+                reason = f"Стр.3 застой ({current_pos:.1f}, {days_stagnant}д) — 16 кликов"
+            elif days_stagnant >= 10:
+                clicks = 24
+                reason = f"Стр.3 долгий застой ({current_pos:.1f}, {days_stagnant}д) — 24 кл/день"
+            if was_top3:
                 clicks = 4
-                phase = "start"
-                reason = f"Стр.3 (поз. {current_pos:.1f}) — начальная фаза 4 клика"
-        
-        elif current_pos <= 40:
-            # Page 4 — early detection
-            if trend == "improving":
-                clicks = 5
-                phase = "ramp_up"
-                reason = f"Стр.4 и растёт (поз. {current_pos:.1f}) — 5 кликов"
-            else:
-                clicks = 3
-                phase = "start"
-                reason = f"Стр.4 (поз. {current_pos:.1f}) — начальная фаза 3 клика"
+                phase = "recovery"
+                reason = f"Был TOP-3, упал → стр.3 ({current_pos:.1f}) — плавный старт 4 клика"
         
         elif current_pos <= 50:
-            # Page 5 — just found
-            clicks = 3
+            # Pages 4-5 — far from goal
+            clicks = 6
             phase = "start"
-            reason = f"Стр.5 (поз. {current_pos:.1f}) — старт 3 клика"
+            reason = f"Далеко ({current_pos:.1f}) — 6 кликов"
+            if trend == "improving":
+                clicks = 10
+                phase = "ramp_up"
+                reason = f"Далеко но растёт ({current_pos:.1f}) — 10 кликов"
+            elif days_stagnant >= 7:
+                clicks = 14
+                phase = "ramp_up"
+                reason = f"Далеко, застой ({current_pos:.1f}, {days_stagnant}д) — 14 кликов"
+            elif days_stagnant >= 10:
+                clicks = 20
+                phase = "ramp_up"
+                reason = f"Далеко, долгий застой ({current_pos:.1f}, {days_stagnant}д) — 20 кликов"
         
         else:
-            # Far away — still try
-            clicks = 3
+            # Very far (50+) — exploration
+            clicks = 4
             phase = "start"
-            reason = f"Далеко (поз. {current_pos:.1f}) — старт 3 клика"
+            reason = f"Очень далеко ({current_pos:.1f}) — 4 клика"
+            if days_stagnant >= 10:
+                clicks = 8
+                reason = f"Очень далеко, застой ({current_pos:.1f}, {days_stagnant}д) — 8 кликов"
+        
+        # ── Frequency weight (subtle: 0.7 – 1.5) ──
+        if freq_weight != 1.0 and freq_weight > 0:
+            clicks = max(1, int(math.ceil(clicks * freq_weight)))
         
         # ── Success rate correction ──
-        # Scale up clicks to compensate for failed attempts
-        effective_clicks = clicks  # desired successful clicks
+        effective_clicks = clicks
         if target_success_rate > 0 and target_success_rate < 95:
-            rate = max(target_success_rate, 5.0) / 100.0  # floor at 5% to avoid insane numbers
-            clicks = min(int(math.ceil(effective_clicks / rate)), 50)  # cap at 50 attempts/day per keyword
-            reason += f" (×{1/rate:.1f} корр. на {target_success_rate:.0f}% успеха)"
+            rate = max(target_success_rate, 10.0) / 100.0
+            clicks = int(math.ceil(effective_clicks / rate))
+            reason += f" (корр. {target_success_rate:.0f}%)"
+        
+        # No artificial daily cap — position strategy is the sole authority.
+        # visits_per_day on the target is a scale-up goal, not a ceiling.
         
         return {
             "clicks_per_day": clicks,
@@ -857,8 +1208,12 @@ def _extract_organic_results_js(driver) -> list:
                 if (rect.height < 20) continue;  // Skip invisible items
                 
                 // Skip ads (sponsored results)  
-                var isAd = item.querySelector('.label_theme_direct, .DirectBanner, [class*="Direct"], [class*="Ad_type"]');
+                var isAd = item.querySelector('.label_theme_direct, .DirectBanner, [class*="Direct"], [class*="Ad_type"], [class*="Ad_label"], [class*="AdvLabel"]');
                 if (isAd) continue;
+                
+                // Skip ads by text markers (Яндекс Директ labels)
+                var textContent = item.textContent || '';
+                if (textContent.indexOf('Реклама') !== -1 && textContent.indexOf('Реклама') < 200) continue;
                 
                 // Find the main title link in this result
                 var titleLink = item.querySelector(
@@ -890,6 +1245,9 @@ def _extract_organic_results_js(driver) -> list:
                 var href = titleLink.href || titleLink.getAttribute('href') || '';
                 if (!href || href === '#') continue;
                 
+                // Skip Yandex Direct ad clicks (yabs.yandex.ru = always ads)
+                if (href.indexOf('yabs.yandex.ru') !== -1 || href.indexOf('an.yandex.ru') !== -1) continue;
+                
                 // Extract visible domain from green URL or compute from href
                 var greenUrl = '';
                 var greenEl = item.querySelector(
@@ -914,6 +1272,17 @@ def _extract_organic_results_js(driver) -> list:
                 }
                 
                 var title = titleLink.textContent.trim() || item.querySelector('h2, [class*="Title"]')?.textContent?.trim() || '';
+                
+                // Skip Yandex internal widgets (images, maps, popular products, etc.)
+                var domLower = domain.toLowerCase();
+                if (domLower === 'ya.ru' || domLower === 'yandex.ru') {
+                    // Allow actual yandex.ru organic results (sub-services like realty.yandex.ru)
+                    // but skip search/images/maps redirects
+                    if (href.indexOf('/search') !== -1 || href.indexOf('/images') !== -1 || 
+                        href.indexOf('/maps') !== -1 || href.indexOf('/video') !== -1) {
+                        continue;
+                    }
+                }
                 
                 results.push({
                     index: results.length,
@@ -957,6 +1326,54 @@ def _extract_organic_results_js(driver) -> list:
                 }
             }
             
+            // Strategy 3 fallback: generic approach — find all visible links with external hrefs
+            if (results.length < 3) {
+                var allLinks = document.querySelectorAll('a[href]');
+                var seenHrefs = {};
+                for (var m = 0; m < results.length; m++) seenHrefs[results[m].href] = true;
+                
+                for (var n = 0; n < allLinks.length; n++) {
+                    var a = allLinks[n];
+                    var ah = a.href || '';
+                    if (!ah || ah === '#' || seenHrefs[ah]) continue;
+                    // Must be external or /clck redirect
+                    if (ah.indexOf('yandex.ru/clck') === -1 && ah.indexOf('ya.ru/clck') === -1) {
+                        try {
+                            var au = new URL(ah);
+                            if (au.hostname.indexOf('yandex') !== -1 || au.hostname.indexOf('ya.ru') !== -1) continue;
+                        } catch(e) { continue; }
+                    }
+                    // Skip tiny/invisible elements
+                    var ar = a.getBoundingClientRect();
+                    if (ar.height < 12 || ar.width < 40) continue;
+                    // Skip ads
+                    if (ah.indexOf('yabs.yandex.ru') !== -1 || ah.indexOf('an.yandex.ru') !== -1) continue;
+                    
+                    var ad = '';
+                    try {
+                        if (ah.indexOf('/clck') !== -1) {
+                            // Try parent's text for green URL
+                            var parentItem = a.closest('[data-cid], .serp-item, [class*="Organic"]');
+                            var greenEl3 = parentItem ? parentItem.querySelector('[class*="Path"], [class*="greenurl"], [data-log-node="path"]') : null;
+                            ad = greenEl3 ? greenEl3.textContent.trim().replace(/^https?:\\/\\//, '').replace(/^www\\./, '').split('/')[0].split(' ')[0] : '';
+                        } else {
+                            ad = new URL(ah).hostname.replace(/^www\\./, '');
+                        }
+                    } catch(e) { continue; }
+                    if (!ad) continue;
+                    
+                    seenHrefs[ah] = true;
+                    results.push({
+                        index: results.length,
+                        title: a.textContent.trim().substring(0, 100),
+                        href: ah,
+                        domain: ad.toLowerCase(),
+                        greenUrl: '',
+                        displayed: true
+                    });
+                }
+            }
+            
             return results;
         """)
         return results or []
@@ -965,7 +1382,8 @@ def _extract_organic_results_js(driver) -> list:
         return []
 
 
-def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
+def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str = None,
+                           task_start_time: float = None) -> dict:
     """
     Search through Yandex search results to find and click target domain.
     Uses JS-based extraction for reliable result parsing.
@@ -973,23 +1391,269 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
     Returns:
         dict with keys: found (bool), page (int), position (int), clicked (bool)
     """
+    from tasks.yandex_maps import detect_captcha_or_block, handle_yandex_protection
+    
     domain_clean = domain.lower().replace('https://', '').replace('http://', '').replace('www.', '').rstrip('/')
     
+    # Time budget: leave 120s buffer before soft_time_limit (540s) for click-through browsing
+    TIME_BUDGET = 420  # seconds max for search phase (7 min)
+    _start = task_start_time or time.time()
+    
+    prev_page_domains = set()  # Track previous page domains for dedup detection
+    
     for page_num in range(1, max_pages + 1):
-        logger.info(f"🔍 Scanning search results page {page_num} for domain: {domain_clean}")
+        # === Time budget check: bail out if running too long ===
+        elapsed = time.time() - _start
+        if page_num > 1 and elapsed > TIME_BUDGET:
+            logger.warning(f"⏰ Time budget exceeded ({elapsed:.0f}s > {TIME_BUDGET}s) before page {page_num}, stopping search")
+            break
+        
+        # === Memory budget check: bail out gracefully before Celery SIGKILL's us ===
+        if page_num > 1:
+            over_budget, rss_mb = _check_memory_budget()
+            if over_budget:
+                logger.warning(f"🧠 Memory budget exceeded ({rss_mb:.0f}MB > {MEMORY_BUDGET_MB}MB) before page {page_num}, stopping search to avoid SIGKILL")
+                break
+        
+        logger.info(f"🔍 Scanning search results page {page_num} for domain: {domain_clean} (elapsed: {elapsed:.0f}s)")
+        
+        # Log actual page from URL for monitoring (p=0 is page 1, p=1 is page 2, etc.)
+        try:
+            from urllib.parse import urlparse as _up_log, parse_qs as _pq_log
+            _log_parsed = _pq_log(_up_log(driver.current_url).query)
+            _url_page = int(_log_parsed.get('p', ['0'])[0]) + 1
+            if _url_page != page_num:
+                logger.warning(f"  ⚠️ URL says page {_url_page} but we expect page {page_num}! URL: {driver.current_url[:150]}")
+        except Exception:
+            pass
+        
         time.sleep(random.uniform(2, 4))
+        
+        # === Safety check: if we're on ya.ru homepage (not search results), navigate to search ===
+        current_url_check = driver.current_url.lower()
+        current_url_path = current_url_check.split('?')[0]
+        if page_num == 1 and keyword and '/search' not in current_url_check and 'text=' not in current_url_check \
+                and 'showcaptcha' not in current_url_path and 'checkcaptcha' not in current_url_path:
+            logger.warning(f"  ⚠️ Not on search page (URL={driver.current_url[:120]}), navigating to search directly...")
+            encoded = quote_plus(keyword)
+            _safe_get(driver, f"https://ya.ru/search/?text={encoded}", timeout=40, label="search redirect")
+            time.sleep(random.uniform(4, 7))
         
         # Save current URL to verify pagination later
         url_before_scan = driver.current_url
         
+        # === Wait for search results to render ===
+        try:
+            WebDriverWait(driver, 15).until(
+                lambda d: len(d.find_elements(By.CSS_SELECTOR, '[data-cid]')) >= 3
+            )
+        except TimeoutException:
+            logger.warning(f"  ⏱️ Waited 15s but [data-cid] elements < 3 on page {page_num}")
+        
         # === Extract organic results via JavaScript ===
         organic_results = _extract_organic_results_js(driver)
+        
+        # If 0 results, save diagnostic info and retry once after extra wait
+        if not organic_results:
+            diag_url = driver.current_url
+            diag_title = driver.title
+            diag_cid_count = len(driver.find_elements(By.CSS_SELECTOR, '[data-cid]'))
+            diag_serp_count = len(driver.find_elements(By.CSS_SELECTOR, '.serp-item, li.serp-item'))
+            logger.warning(
+                f"  ⚠️ 0 organic results on page {page_num}! "
+                f"URL={diag_url[:150]}, Title='{diag_title}', "
+                f"data-cid={diag_cid_count}, serp-item={diag_serp_count}"
+            )
+            # Save page source + screenshot for debugging
+            try:
+                ts = int(time.time())
+                html_path = f"screenshots/search_0results_p{page_num}_{ts}.html"
+                page_src = driver.page_source or ''
+                with open(html_path, 'w', encoding='utf-8') as f:
+                    f.write(page_src)
+                logger.info(f"  📄 Zero-results page source: {html_path} ({len(page_src)} bytes)")
+                # Save screenshot
+                try:
+                    scr_path = f"screenshots/search_0results_p{page_num}_{ts}.png"
+                    driver.save_screenshot(scr_path)
+                    logger.info(f"  📸 Zero-results screenshot: {scr_path}")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            
+            # Check if it's a captcha page — also detect by title
+            # (sometimes URL hasn't changed to /showcaptcha yet but the page is a captcha)
+            _captcha_titles = ('верификация', 'вы не робот', 'подтвердите', 'captcha', 'robot')
+            _diag_title_lower = (diag_title or '').lower()
+            _is_captcha_by_title = any(ct in _diag_title_lower for ct in _captcha_titles)
+            if _is_captcha_by_title:
+                logger.warning(f"  🚨 Captcha detected by page title: '{diag_title}'")
+            url_path = diag_url.lower().split('?')[0]
+            if _is_captcha_by_title or 'showcaptcha' in url_path or 'checkcaptcha' in url_path or detect_captcha_or_block(driver):
+                logger.warning(f"  🚨 Page {page_num} is a captcha page, attempting to solve...")
+                # === Solve captcha during pagination ===
+                try:
+                    captcha_solver = CaptchaSolver()
+                    solved_pag = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=3)
+                    if solved_pag:
+                        logger.info(f"  ✅ Captcha on page {page_num} solved, retrying extraction...")
+                        # After solving, check if we're back on search or need to re-navigate
+                        time.sleep(random.uniform(2, 4))
+                        post_url = driver.current_url.lower()
+                        if 'search' in post_url and 'text=' in post_url:
+                            # We're on search results — wait for render and retry
+                            try:
+                                WebDriverWait(driver, 15).until(
+                                    lambda d: len(d.find_elements(By.CSS_SELECTOR, '[data-cid]')) >= 3
+                                )
+                            except TimeoutException:
+                                pass
+                            organic_results = _extract_organic_results_js(driver)
+                            logger.info(f"  🔄 After captcha solve: found {len(organic_results)} organic results")
+                        else:
+                            logger.warning(f"  ⚠️ After captcha solve, not on search page: {post_url[:120]}")
+                    else:
+                        logger.warning(f"  ❌ Could not solve captcha on page {page_num}")
+                except SoftTimeLimitExceeded:
+                    raise
+                except Exception as cap_err:
+                    logger.warning(f"  ❌ Captcha solve error on page {page_num}: {cap_err}")
+            elif diag_cid_count > 0:
+                # DOM has data-cid elements but JS extraction failed — wait more and retry
+                logger.info(f"  🔄 {diag_cid_count} data-cid elements exist, waiting 5s and retrying extraction...")
+                time.sleep(5)
+                organic_results = _extract_organic_results_js(driver)
+                logger.info(f"  🔄 Retry: found {len(organic_results)} organic results")
+            else:
+                # data-cid=0, no captcha — page JS may not have rendered yet (SPA)
+                logger.info(f"  🔄 No data-cid elements and no captcha, waiting 10s for JS render...")
+                time.sleep(10)
+                # Check if page rendered now
+                post_cid = len(driver.find_elements(By.CSS_SELECTOR, '[data-cid]'))
+                if post_cid > 0:
+                    organic_results = _extract_organic_results_js(driver)
+                    logger.info(f"  🔄 After extra wait: found {len(organic_results)} organic results (data-cid={post_cid})")
+                else:
+                    # Try page reload up to 2 times as last resort
+                    for _reload_num in range(1, 3):
+                        logger.info(f"  🔄 Still no results, refreshing page (attempt {_reload_num})...")
+                        try:
+                            # Stop any pending loads to avoid renderer timeout on refresh
+                            try:
+                                driver.execute_script("window.stop()")
+                            except Exception:
+                                pass
+                            time.sleep(0.5)
+                            driver.refresh()
+                            time.sleep(random.uniform(3, 5))
+                            try:
+                                WebDriverWait(driver, 15).until(
+                                    lambda d: len(d.find_elements(By.CSS_SELECTOR, '[data-cid]')) >= 3
+                                )
+                            except TimeoutException:
+                                pass
+                            # Check for captcha after refresh
+                            if detect_captcha_or_block(driver):
+                                logger.warning(f"  🚨 Captcha appeared after refresh on page {page_num}")
+                                try:
+                                    captcha_solver = CaptchaSolver()
+                                    solved_ref = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=3)
+                                    if solved_ref:
+                                        time.sleep(random.uniform(2, 4))
+                                except SoftTimeLimitExceeded:
+                                    raise
+                                except Exception:
+                                    pass
+                            organic_results = _extract_organic_results_js(driver)
+                            logger.info(f"  🔄 After refresh #{_reload_num}: found {len(organic_results)} organic results")
+                            if organic_results:
+                                break
+                        except Exception as ref_err:
+                            logger.warning(f"  ⚠️ Page refresh #{_reload_num} failed: {ref_err}")
+                            break
+                    
+                    # If still 0 results after refreshes, try fresh navigation to search URL
+                    if not organic_results and keyword and page_num == 1:
+                        logger.warning(f"  🔄 Refreshes didn't help, navigating to search URL directly...")
+                        encoded = quote_plus(keyword)
+                        _safe_get(driver, f"https://ya.ru/search/?text={encoded}", timeout=40, label="search recovery")
+                        time.sleep(random.uniform(4, 7))
+                        try:
+                            WebDriverWait(driver, 15).until(
+                                lambda d: len(d.find_elements(By.CSS_SELECTOR, '[data-cid]')) >= 3
+                            )
+                        except TimeoutException:
+                            pass
+                        if detect_captcha_or_block(driver):
+                            try:
+                                captcha_solver = CaptchaSolver()
+                                solved_nav = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=3)
+                                if solved_nav:
+                                    time.sleep(random.uniform(2, 4))
+                            except SoftTimeLimitExceeded:
+                                raise
+                            except Exception:
+                                pass
+                        organic_results = _extract_organic_results_js(driver)
+                        logger.info(f"  🔄 After direct navigation: found {len(organic_results)} organic results")
         
         logger.info(f"  Found {len(organic_results)} organic results on page {page_num}")
         
         # Log first 10 results for debugging
         for res in organic_results[:10]:
             logger.info(f"    #{res['index']+1}: {res['title'][:50]} → {res['domain']} ({res['href'][:80]})")
+        
+        # === Dedup detection: if this page's results match previous page, pagination failed ===
+        current_page_domains = set(r['domain'] for r in organic_results if r.get('domain'))
+        if page_num > 1 and prev_page_domains and current_page_domains:
+            overlap = current_page_domains & prev_page_domains
+            overlap_ratio = len(overlap) / max(len(current_page_domains), 1)
+            if overlap_ratio > 0.6:
+                logger.warning(f"  🔄 Page {page_num} results are {overlap_ratio:.0%} identical to page {page_num - 1} — pagination failed!")
+                logger.warning(f"  🔄 Forcing URL navigation to get real page {page_num}...")
+                # Force URL navigation as a full page reload
+                try:
+                    from urllib.parse import urlparse as _up2, parse_qs as _pq2, urlencode as _ue2
+                    parsed_url = _up2(driver.current_url)
+                    url_params = _pq2(parsed_url.query)
+                    url_params['p'] = [str(page_num - 1)]  # p=0 is page 1
+                    new_q = _ue2({k: v[0] for k, v in url_params.items()})
+                    reload_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}?{new_q}"
+                    logger.info(f"  ➡️ Reloading page {page_num} via URL: {reload_url[:120]}")
+                    _safe_get(driver, reload_url, timeout=40, label=f"page {page_num} dedup reload")
+                    time.sleep(random.uniform(3, 5))
+                    # Wait for results
+                    try:
+                        WebDriverWait(driver, 15).until(
+                            lambda d: len(d.find_elements(By.CSS_SELECTOR, '[data-cid]')) >= 3
+                        )
+                    except TimeoutException:
+                        pass
+                    # Check captcha after reload
+                    reload_url_check = driver.current_url.lower()
+                    reload_url_path = reload_url_check.split('?')[0]
+                    if 'showcaptcha' in reload_url_path or 'checkcaptcha' in reload_url_path or detect_captcha_or_block(driver):
+                        logger.warning(f"  🚨 Captcha after dedup reload on page {page_num}, solving...")
+                        try:
+                            pag_solver2 = CaptchaSolver()
+                            pag_solved2 = handle_yandex_protection(driver, pag_solver2, max_kaleidoscope_attempts=3)
+                            if pag_solved2:
+                                logger.info(f"  ✅ Dedup reload captcha solved")
+                                time.sleep(random.uniform(2, 4))
+                        except SoftTimeLimitExceeded:
+                            raise
+                        except Exception:
+                            pass
+                    # Re-extract results  
+                    organic_results = _extract_organic_results_js(driver)
+                    current_page_domains = set(r['domain'] for r in organic_results if r.get('domain'))
+                    logger.info(f"  🔄 After dedup reload: found {len(organic_results)} organic results on page {page_num}")
+                    for res in organic_results[:10]:
+                        logger.info(f"    #{res['index']+1}: {res['title'][:50]} → {res['domain']} ({res['href'][:80]})")
+                except Exception as dedup_err:
+                    logger.warning(f"  ❌ Dedup reload failed: {dedup_err}")
+        prev_page_domains = current_page_domains
         
         # === Human-like behavior: scroll through results before clicking ===
         # Simulate reading the SERP - scroll through a few results naturally
@@ -1011,8 +1675,14 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
             # Also check green URL for redirect links
             green_domain = res.get('greenUrl', '').lower().replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0].split(' ')[0]
             
+            # Skip ad results (yabs.yandex.ru, an.yandex.ru are always ads)
+            res_href = res.get('href', '').lower()
+            if 'yabs.yandex.ru' in res_href or 'an.yandex.ru' in res_href or 'ads-captcha.yandex.ru' in res_href:
+                logger.info(f"    ⛔ Skipping ad result #{position}: {res['title'][:50]} → {res_href[:80]}")
+                continue
+            
             if domain_clean in res_domain or domain_clean in green_domain or \
-               res_domain.endswith('.' + domain_clean) or domain_clean in res.get('href', '').lower():
+               res_domain.endswith('.' + domain_clean) or domain_clean in res_href:
                 target_result = res
                 target_position = position
                 logger.info(f"✅ Found target '{domain_clean}' at page {page_num}, position {position}")
@@ -1081,7 +1751,36 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
                     logger.warning(f"   Could not find element by position: {pos_err}")
             
             if not click_element:
-                logger.warning(f"   ⚠️ Found target in DOM data but cannot get clickable element")
+                logger.warning(f"   ⚠️ Found target in DOM data but cannot get clickable element, trying direct navigation")
+                # Even if we can't find the element, try navigating directly
+                direct_href = target_result.get('href', '')
+                if direct_href and direct_href.startswith('http'):
+                    try:
+                        _pre_inject_analytics_blocker(driver)
+                        logger.info(f"   🔄 Direct navigation to: {direct_href[:100]}")
+                        driver.get(direct_href)
+                        time.sleep(random.uniform(1.0, 2.0))
+                        try:
+                            driver.execute_script("window.stop();")
+                        except Exception:
+                            pass
+                        try:
+                            final_url = driver.current_url.lower()
+                            final_host = urlparse(final_url).netloc.lower().replace('www.', '')
+                            if domain_clean in final_host or domain_clean in final_url:
+                                logger.info(f"   ✅ Direct navigation succeeded: {final_host}")
+                                return {
+                                    'found': True,
+                                    'page': page_num,
+                                    'position': target_position,
+                                    'clicked': True,
+                                    'href': target_result['href'],
+                                    'serp_position': target_position
+                                }
+                        except Exception:
+                            pass
+                    except Exception as nav_err:
+                        logger.warning(f"   Direct navigation failed: {nav_err}")
                 return {
                     'found': True,
                     'page': page_num,
@@ -1094,6 +1793,9 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
             # === Click the target result ===
             logger.info(f"   Clicking target element...")
             
+            # Dismiss overlays (app banners etc.) that may block the click
+            _dismiss_yandex_overlays(driver)
+            
             # Remember windows before click
             windows_before = driver.window_handles
             
@@ -1105,10 +1807,59 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
             _pre_inject_analytics_blocker(driver)
             
             # Click the result — Yandex /clck redirect registers the click
+            # Pre-extract href for fallback navigation
+            target_href = ''
+            try:
+                target_href = click_element.get_attribute('href') or target_result.get('href', '')
+            except Exception:
+                target_href = target_result.get('href', '')
+            
+            # Capture Yandex /clck/ tracking URL by dispatching mousedown first
+            # (Yandex JS changes <a> href on mousedown to include click tracking)
+            clck_href = ''
+            try:
+                clck_href = driver.execute_script("""
+                    var el = arguments[0];
+                    var rect = el.getBoundingClientRect();
+                    var cx = rect.left + rect.width / 2;
+                    var cy = rect.top + rect.height / 2;
+                    var opts = {bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0};
+                    el.dispatchEvent(new MouseEvent('mousedown', opts));
+                    // Only mousedown — Yandex JS rewrites href on mousedown.
+                    // Do NOT dispatch mouseup to avoid triggering a navigation/new tab.
+                    return el.href || el.getAttribute('href') || '';
+                """, click_element)
+                if clck_href and '/clck/' in clck_href:
+                    logger.info(f"   🔗 Captured Yandex tracking URL: {clck_href[:120]}")
+                elif clck_href:
+                    logger.info(f"   🔗 Href after mousedown (no /clck/): {clck_href[:120]}")
+            except Exception as me_err:
+                logger.info(f"   ⚠️ Could not capture /clck/ URL: {me_err}")
+            
+            click_succeeded = False
             try:
                 _safe_click(driver, click_element)
+                click_succeeded = True
             except Exception as click_err:
                 logger.warning(f"   Click failed: {click_err}")
+                # Fallback: navigate via /clck/ tracking URL or direct href
+                try:
+                    fallback_href = clck_href or target_href
+                    if fallback_href and fallback_href.startswith('http'):
+                        logger.info(f"   🔄 Fallback: navigating to ({fallback_href[:120]})")
+                        driver.get(fallback_href)
+                        click_succeeded = True
+                    else:
+                        # Try JS click on the parent <a> tag
+                        driver.execute_script("""
+                            var el = arguments[0];
+                            var link = el.closest('a') || el.querySelector('a');
+                            if (link) link.click();
+                            else el.click();
+                        """, click_element)
+                        click_succeeded = True
+                except Exception as fallback_err:
+                    logger.warning(f"   Fallback click also failed: {fallback_err}")
             
             # === Wait for Yandex click redirect ===
             # Click goes yandex.ru/clck → target site.
@@ -1169,11 +1920,35 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
             still_on_yandex = _is_on_yandex(current_url) if current_url else True
             
             if still_on_yandex:
-                # Poll URL — once off Yandex, immediately abort page load
-                max_nav_checks = 10
-                nav_wait_each = random.uniform(0.8, 1.3)
+                # Poll URL — once off Yandex, immediately abort page load.
+                # Also check for new tabs — _safe_click may have opened target in a new tab
+                # while the current tab stays on SERP.
+                max_nav_checks = 5
+                nav_wait_each = random.uniform(0.8, 1.2)
+                used_fallback = False
                 for nav_i in range(max_nav_checks):
                     time.sleep(nav_wait_each)
+                    
+                    # --- Check for new tabs from previous click ---
+                    try:
+                        windows_now = driver.window_handles
+                    except Exception:
+                        windows_now = windows_before
+                    if len(windows_now) > len(windows_before):
+                        new_window = [w for w in windows_now if w not in windows_before][-1]
+                        logger.info(f"   New tab detected at check {nav_i+1}, switching to it")
+                        driver.switch_to.window(new_window)
+                        try:
+                            driver.execute_cdp_cmd('Network.enable', {})
+                            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
+                        except Exception:
+                            pass
+                        try:
+                            driver.execute_script("window.stop();")
+                        except Exception:
+                            pass
+                        break
+                    
                     try:
                         current_url = driver.current_url.lower()
                     except TimeoutException:
@@ -1212,13 +1987,24 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
                     if 'clck' in current_url:
                         logger.info(f"   ⏳ Still on /clck (check {nav_i+1}/{max_nav_checks})...")
                         continue
-                    # Still on SERP — retry JS click
-                    if nav_i in (1, 3, 5):
-                        logger.info(f"   🔄 Still on SERP, retrying JS click...")
-                        try:
-                            driver.execute_script("arguments[0].click();", click_element)
-                        except Exception:
-                            pass
+                    # Still on SERP — use ONE URL-based fallback (no extra click events
+                    # that would open additional tabs)
+                    if not used_fallback and nav_i >= 2:
+                        nav_href = clck_href or target_href or target_result.get('href', '')
+                        if nav_href and nav_href.startswith('http'):
+                            logger.info(f"   🔄 Still on SERP, navigating to: {nav_href[:120]}")
+                            used_fallback = True
+                            try:
+                                driver.get(nav_href)
+                            except TimeoutException:
+                                logger.info(f"   ⏳ driver.get() timed out, stopping page load...")
+                                try:
+                                    driver.execute_script("window.stop();")
+                                except Exception:
+                                    pass
+                            except Exception as nav_err:
+                                logger.warning(f"   driver.get() failed: {nav_err}")
+                            break
                 else:
                     logger.warning(f"   ⏰ Navigation did not happen after {max_nav_checks} checks")
             else:
@@ -1228,7 +2014,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
             
             # Restore normal page_load_timeout
             try:
-                driver.set_page_load_timeout(60)
+                driver.set_page_load_timeout(40)
             except Exception:
                 pass
             
@@ -1265,68 +2051,217 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
         if page_num < max_pages:
             next_page_success = False
             
-            # Method 1: Direct URL manipulation (most reliable)
+            # Scroll to the very bottom to trigger lazy-loading of pagination
             try:
-                current_search_url = driver.current_url
-                if 'text=' in current_search_url:
-                    # Build URL for next page
-                    from urllib.parse import urlparse as _up, parse_qs, urlencode
-                    parsed = _up(current_search_url)
-                    params = parse_qs(parsed.query)
-                    params['p'] = [str(page_num)]  # p=0 is page 1, p=1 is page 2, etc.
-                    new_query = urlencode({k: v[0] for k, v in params.items()})
-                    next_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
-                    logger.info(f"  ➡️ Navigating to page {page_num + 1} via URL: {next_url[:120]}")
-                    driver.get(next_url)
-                    time.sleep(random.uniform(3, 6))
-                    
-                    # Verify URL changed
-                    new_url = driver.current_url
-                    if new_url != url_before_scan:
-                        next_page_success = True
-                        logger.info(f"  ✅ On page {page_num + 1}")
-                    else:
-                        logger.warning(f"  ⚠️ URL didn't change after pagination")
-            except Exception as url_nav_err:
-                logger.warning(f"  URL pagination failed: {url_nav_err}")
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(random.uniform(1.5, 2.5))
+                # Scroll a bit more in case of dynamic content loading
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(random.uniform(1.0, 2.0))
+            except Exception:
+                pass
             
-            # Method 2: Click next button (fallback)
+            # Method 1: Click next button (preferred — natural, avoids captcha)
+            try:
+                next_selectors = [
+                    "a.pager__item_kind_next",
+                    "a[aria-label='Следующая страница']",
+                    "a.Pager-Item_type_next",
+                    ".pager__item_kind_next",
+                    ".pager-load-more a",
+                    "a.pager-more__button",
+                    ".pager a[aria-label*='След']",
+                    "a[data-fast-name='next']",
+                    ".Pager .Pager-Item_type_next a",
+                    "a.VanillaReact.Pager-Item_type_next",
+                    "[class*='Pager'] a[aria-label*='next' i]",
+                    "[class*='Pager'] a[aria-label*='след' i]",
+                ]
+                
+                next_btn = None
+                for sel in next_selectors:
+                    try:
+                        elems = driver.find_elements(By.CSS_SELECTOR, sel)
+                        for e in elems:
+                            if e.is_displayed():
+                                next_btn = e
+                                break
+                        if next_btn:
+                            break
+                    except:
+                        continue
+                
+                if next_btn:
+                    # Dismiss any Yandex overlay that might intercept the click
+                    _dismiss_yandex_overlays(driver)
+                    
+                    logger.info(f"  ➡️ Found pagination button, clicking to go to page {page_num + 1}")
+                    
+                    # Before click: capture first result href to detect content change
+                    first_href_before = None
+                    try:
+                        first_href_before = driver.execute_script("""
+                            var el = document.querySelector('[data-cid] a.OrganicTitle-Link, [data-cid] h2 a[href]');
+                            return el ? el.href : null;
+                        """)
+                    except Exception:
+                        pass
+                    
+                    _safe_click(driver, next_btn, 0.3, 0.7)
+                    
+                    # Wait for actual content change (not just elements existing)
+                    content_changed = False
+                    if first_href_before:
+                        try:
+                            WebDriverWait(driver, 12).until(
+                                lambda d: d.execute_script("""
+                                    var el = document.querySelector('[data-cid] a.OrganicTitle-Link, [data-cid] h2 a[href]');
+                                    return el ? el.href : null;
+                                """) != first_href_before
+                            )
+                            content_changed = True
+                            logger.info(f"  ✅ Page content changed after button click")
+                        except TimeoutException:
+                            logger.warning(f"  ⚠️ Content didn't change after button click — SPA may not have updated")
+                    
+                    if not content_changed:
+                        time.sleep(random.uniform(2, 4))
+                        # Extra wait and scroll to trigger any lazy rendering
+                        try:
+                            driver.execute_script("window.scrollTo(0, 0);")
+                            time.sleep(1)
+                        except Exception:
+                            pass
+                    
+                    # Final check: wait for [data-cid] elements
+                    try:
+                        WebDriverWait(driver, 10).until(
+                            lambda d: len(d.find_elements(By.CSS_SELECTOR, '[data-cid]')) >= 3
+                        )
+                    except TimeoutException:
+                        logger.warning(f"  ⏱️ Search results slow to load on page {page_num + 1}")
+                    
+                    # Check for captcha after pagination
+                    pag_url = driver.current_url.lower()
+                    pag_url_path = pag_url.split('?')[0]
+                    if 'showcaptcha' in pag_url_path or 'checkcaptcha' in pag_url_path or detect_captcha_or_block(driver):
+                        logger.warning(f"  🚨 Captcha appeared after navigating to page {page_num + 1}, solving...")
+                        try:
+                            pag_solver = CaptchaSolver()
+                            pag_solved = handle_yandex_protection(driver, pag_solver, max_kaleidoscope_attempts=3)
+                            if pag_solved:
+                                logger.info(f"  ✅ Pagination captcha solved")
+                                time.sleep(random.uniform(2, 4))
+                                # After captcha, retpath often redirects to page 1 (no p= param).
+                                # Check if we're on the correct page, re-navigate if not.
+                                post_captcha_url = driver.current_url
+                                if 'search' in post_captcha_url and 'text=' in post_captcha_url and page_num > 0:
+                                    from urllib.parse import urlparse as _up_cap, parse_qs as _pq_cap
+                                    _pc_parsed = _up_cap(post_captcha_url)
+                                    _pc_params = _pq_cap(_pc_parsed.query)
+                                    _pc_page = int(_pc_params.get('p', ['0'])[0])
+                                    if _pc_page != page_num:
+                                        logger.warning(
+                                            f"  🔄 Captcha redirected to page {_pc_page + 1} instead of {page_num + 1}, re-navigating..."
+                                        )
+                                        _pc_params['p'] = [str(page_num)]
+                                        from urllib.parse import urlencode as _ue_cap
+                                        _correct_query = _ue_cap({k: v[0] for k, v in _pc_params.items()})
+                                        _correct_url = f"{_pc_parsed.scheme}://{_pc_parsed.netloc}{_pc_parsed.path}?{_correct_query}"
+                                        _safe_get(driver, _correct_url, timeout=40, label=f"page {page_num + 1} (post-captcha fix)")
+                                        time.sleep(random.uniform(2, 4))
+                                        # Check for another captcha after re-navigation
+                                        _pc2_url = driver.current_url.lower()
+                                        if 'showcaptcha' in _pc2_url or 'checkcaptcha' in _pc2_url:
+                                            logger.warning(f"  🚨 Another captcha after re-navigation to page {page_num + 1}")
+                                            try:
+                                                pag_solved2 = handle_yandex_protection(driver, pag_solver, max_kaleidoscope_attempts=3)
+                                                if pag_solved2:
+                                                    time.sleep(random.uniform(2, 4))
+                                            except SoftTimeLimitExceeded:
+                                                raise
+                                            except Exception:
+                                                pass
+                            else:
+                                logger.warning(f"  ❌ Could not solve pagination captcha")
+                        except SoftTimeLimitExceeded:
+                            raise
+                        except Exception as pag_cap_err:
+                            logger.warning(f"  ❌ Pagination captcha error: {pag_cap_err}")
+                    
+                    # Verify we're on a search page (not captcha) and content changed
+                    post_nav_url = driver.current_url.lower()
+                    on_search_page = 'search' in post_nav_url and 'text=' in post_nav_url
+                    if on_search_page and content_changed:
+                        next_page_success = True
+                        logger.info(f"  ✅ Navigated to page {page_num + 1} via button (content confirmed changed)")
+                    elif on_search_page:
+                        next_page_success = True
+                        logger.warning(f"  ⚠️ URL changed but content may not have updated for page {page_num + 1}")
+                    else:
+                        logger.warning(f"  ⚠️ Button click didn't reach search page (URL: {driver.current_url[:100]})")
+                else:
+                    logger.info(f"  ⚠️ No pagination button found on page")
+            except Exception as nav_err:
+                logger.warning(f"  Button pagination failed: {nav_err}")
+            
+            # Method 2: Direct URL manipulation (fallback — may trigger captcha)
             if not next_page_success:
                 try:
-                    next_selectors = [
-                        "a.pager__item_kind_next",
-                        "a[aria-label='Следующая страница']",
-                        "a.Pager-Item_type_next",
-                        ".pager__item_kind_next",
-                        ".pager-load-more a",
-                        "a.pager-more__button",
-                        ".pager a[aria-label*='След']",
-                    ]
-                    
-                    next_btn = None
-                    for sel in next_selectors:
+                    current_search_url = driver.current_url
+                    if 'text=' in current_search_url:
+                        # Build URL for next page
+                        from urllib.parse import urlparse as _up, parse_qs, urlencode
+                        parsed = _up(current_search_url)
+                        params = parse_qs(parsed.query)
+                        params['p'] = [str(page_num)]  # p=0 is page 1, p=1 is page 2, etc.
+                        new_query = urlencode({k: v[0] for k, v in params.items()})
+                        next_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+                        logger.info(f"  ➡️ Navigating to page {page_num + 1} via URL: {next_url[:120]}")
+                        _safe_get(driver, next_url, timeout=40, label=f"page {page_num + 1}")
+                        time.sleep(random.uniform(2, 4))
+                        
+                        # Wait for search results to appear on new page
                         try:
-                            elems = driver.find_elements(By.CSS_SELECTOR, sel)
-                            for e in elems:
-                                if e.is_displayed():
-                                    next_btn = e
-                                    break
-                            if next_btn:
-                                break
-                        except:
-                            continue
-                    
-                    if next_btn:
-                        _safe_click(driver, next_btn, 0.3, 0.7)
-                        time.sleep(random.uniform(3, 6))
-                        # Verify we moved
-                        if driver.current_url != url_before_scan:
+                            WebDriverWait(driver, 15).until(
+                                lambda d: len(d.find_elements(By.CSS_SELECTOR, '[data-cid]')) >= 3
+                            )
+                        except TimeoutException:
+                            logger.warning(f"  ⏱️ Search results slow to load on page {page_num + 1}")
+                        
+                        # Check for captcha after pagination
+                        pag_url = driver.current_url.lower()
+                        pag_url_path = pag_url.split('?')[0]
+                        if 'showcaptcha' in pag_url_path or 'checkcaptcha' in pag_url_path or detect_captcha_or_block(driver):
+                            logger.warning(f"  🚨 Captcha appeared after navigating to page {page_num + 1}, solving...")
+                            try:
+                                pag_solver = CaptchaSolver()
+                                pag_solved = handle_yandex_protection(driver, pag_solver, max_kaleidoscope_attempts=3)
+                                if pag_solved:
+                                    logger.info(f"  ✅ Pagination captcha solved")
+                                    time.sleep(random.uniform(2, 4))
+                                    # After solving, we might need to re-navigate to the page
+                                    post_solve_url = driver.current_url.lower()
+                                    if 'text=' not in post_solve_url or 'search' not in post_solve_url:
+                                        logger.info(f"  🔄 Re-navigating to page {page_num + 1} after captcha solve...")
+                                        _safe_get(driver, next_url, timeout=40, label=f"page {page_num + 1} (post-captcha)")
+                                        time.sleep(random.uniform(2, 4))
+                                else:
+                                    logger.warning(f"  ❌ Could not solve pagination captcha")
+                            except SoftTimeLimitExceeded:
+                                raise
+                            except Exception as pag_cap_err:
+                                logger.warning(f"  ❌ Pagination captcha error: {pag_cap_err}")
+                        
+                        # Verify URL changed
+                        new_url = driver.current_url
+                        if new_url != url_before_scan:
                             next_page_success = True
-                            logger.info(f"  ✅ Navigated to page {page_num + 1} via button")
+                            logger.info(f"  ✅ On page {page_num + 1}")
                         else:
-                            logger.warning(f"  ⚠️ Button click didn't change page")
-                except Exception as nav_err:
-                    logger.warning(f"  Button pagination failed: {nav_err}")
+                            logger.warning(f"  ⚠️ URL didn't change after pagination")
+                except Exception as url_nav_err:
+                    logger.warning(f"  URL pagination failed: {url_nav_err}")
             
             if not next_page_success:
                 logger.info(f"  ❌ Could not navigate to page {page_num + 1}, stopping")
@@ -1336,7 +2271,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3) -> dict:
 
 
 @shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=30,
-             soft_time_limit=600, time_limit=660)
+             soft_time_limit=540, time_limit=600)
 def yandex_search_click_task(self, profile_id: int, target_id: int,
                              keyword: str, task_id: int = None,
                              search_params: Dict = None):
@@ -1359,15 +2294,18 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
     browser_id = None
     _profile_dir_for_cleanup = None  # Track profile dir for cleanup even if browser_id is None
     params = search_params or {}
+    proxy_data = None  # Initialize here so it's always in scope for error handlers
 
     try:
+        start_time = time.time()
+
         # Load target config
         with get_db_session() as db:
             target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
             if not target:
                 raise ValueError(f"Search target {target_id} not found")
             domain = target.domain
-            max_pages = params.get('max_search_pages', target.max_search_pages) or 3
+            max_pages = params.get('max_search_pages', target.max_search_pages) or 5
             min_time_on_site = params.get('min_time_on_site', target.min_time_on_site) or 30
             max_time_on_site = params.get('max_time_on_site', target.max_time_on_site) or 120
 
@@ -1417,8 +2355,12 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         proxy_manager.load_proxies_from_db()
 
         # Get proxy from profile or proxy pool
-        proxy_data = None
-        if profile_data_from_db['proxy_host'] and profile_data_from_db['proxy_port']:
+        no_proxy = params.get('no_proxy', False)
+        exclude_proxy_ids = params.get('exclude_proxy_ids', [])
+        if no_proxy:
+            logger.info("🚫 no_proxy mode — running without proxy")
+            proxy_data = None
+        elif profile_data_from_db['proxy_host'] and profile_data_from_db['proxy_port']:
             proxy_data = {
                 'host': profile_data_from_db['proxy_host'],
                 'port': profile_data_from_db['proxy_port'],
@@ -1427,9 +2369,11 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 'proxy_type': profile_data_from_db['proxy_type'] or 'http'
             }
         else:
-            proxy_data = proxy_manager.get_available_proxy()
+            proxy_data = proxy_manager.get_available_proxy(exclude_ids=exclude_proxy_ids or None)
+            if exclude_proxy_ids:
+                logger.info(f"🔄 Retry: выбран новый прокси (исключены ID: {exclude_proxy_ids})")
 
-        if not proxy_data:
+        if not proxy_data and not no_proxy:
             error_msg = "🚫 Нет доступных прокси! Поиск без прокси запрещён."
             logger.error(error_msg)
             if task_id:
@@ -1452,7 +2396,8 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 'height': profile_data_from_db['viewport_height']
             },
             'timezone': profile_data_from_db['timezone'],
-            'language': 'ru-RU'
+            'language': 'ru-RU',
+            'images_enabled': False,  # Disable images for speed
         })
         
         if is_mobile:
@@ -1464,38 +2409,149 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
 
         browser_id = browser_manager.create_browser_session(profile_data, proxy_data)
         driver = browser_manager.active_browsers[browser_id]
-        start_time = time.time()
+        driver.set_page_load_timeout(40)  # 40s instead of default 300s
+        driver.set_script_timeout(15)  # Prevent execute_script from hanging on dead renderer
 
+        # Block heavy resources from the very first page load via CDP
+        try:
+            driver.execute_cdp_cmd('Network.enable', {})
+            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
+            logger.info(f"🚀 Pre-blocked {len(_ANALYTICS_BLOCKED_URLS)} heavy/analytics URLs from start")
+        except Exception as e:
+            logger.warning(f"⚠️ CDP resource blocking failed: {e}")
+
+        # === Step 0: Entry point — 50/50 direct ya.ru vs through mail.ru ===
+        # Real users arrive at Yandex via different paths: direct, bookmarks, or from other sites
+        _referrer_used = False
+        _entry_method = random.choice(['direct', 'mail.ru'])
+        
+        if _entry_method == 'mail.ru':
+            logger.info(f"🔗 Entry via mail.ru (50% chance)")
+            if task_id:
+                _update_search_task_log(task_id, f"🔗 Заходим через mail.ru...")
+            
+            ref_loaded = _safe_get(driver, 'https://mail.ru', timeout=30, label="mail.ru entry")
+            if ref_loaded == 'dead':
+                logger.warning("💀 Browser died visiting mail.ru — recovering page...")
+                if hasattr(driver, 'recover_page') and driver.recover_page():
+                    logger.info("✅ Page recovered after mail.ru crash")
+                else:
+                    logger.error("❌ Cannot recover page after mail.ru crash")
+                    raise Exception("Browser died visiting mail.ru, cannot recover")
+            elif ref_loaded:
+                _referrer_used = True
+                # Browse mail.ru briefly like a real user
+                time.sleep(random.uniform(2, 5))
+                _human_mouse_move(driver, duration=random.uniform(0.5, 1.5))
+                _human_scroll(driver, 1, 3)
+                time.sleep(random.uniform(1, 3))
+                logger.info(f"✅ mail.ru visited, now going to Yandex")
+            else:
+                logger.warning(f"⏱️ mail.ru timed out, going direct to Yandex")
+                try:
+                    driver.execute_script("window.stop()")
+                except Exception:
+                    pass
+        else:
+            logger.info(f"🔗 Direct entry to ya.ru (50% chance)")
+        
         if task_id:
             _update_search_task_log(task_id, "🌐 Открываем Яндекс...")
 
         # === Step 1: Open Yandex ===
-        driver.get("https://ya.ru")
+        ya_loaded = _safe_get(driver, "https://ya.ru", timeout=40, label="ya.ru")
+        if ya_loaded == 'dead':
+            logger.warning("💀 Browser died navigating to ya.ru — recovering...")
+            if hasattr(driver, 'recover_page') and driver.recover_page():
+                logger.info("✅ Page recovered, retrying ya.ru...")
+                ya_loaded = _safe_get(driver, "https://ya.ru", timeout=40, label="ya.ru recovery")
+                if ya_loaded == 'dead':
+                    raise Exception("Browser died twice navigating to ya.ru — proxy/browser broken")
+            else:
+                raise Exception("Browser died navigating to ya.ru, cannot recover")
+        if not ya_loaded:
+            logger.warning("⏱️ ya.ru timed out but continuing...")
         time.sleep(random.uniform(3, 6))
+
+        # === Check if page actually rendered (JS executed) ===
+        # If ya.ru timed out and title is empty, the renderer is likely dead/stuck.
+        # Try refreshing once before proceeding.
+        try:
+            _init_title = driver.title or ''
+        except Exception:
+            _init_title = ''
+        
+        if not _init_title.strip():
+            logger.warning("⚠️ ya.ru loaded but Title is EMPTY — page JS did not execute, retrying...")
+            try:
+                driver.execute_script("window.stop()")
+            except Exception:
+                pass
+            time.sleep(1)
+            # If page is dead, recover first
+            try:
+                driver.execute_script("1")
+            except Exception:
+                logger.warning("💀 Page dead after empty title — recovering...")
+                if hasattr(driver, 'recover_page') and driver.recover_page():
+                    logger.info("✅ Page recovered")
+                else:
+                    raise Exception("Browser dead after ya.ru empty title, cannot recover")
+            # Try loading ya.ru one more time
+            ya_retry = _safe_get(driver, "https://ya.ru", timeout=40, label="ya.ru retry")
+            if ya_retry == 'dead':
+                logger.error("💀 Browser died again on ya.ru retry — recovering...")
+                if hasattr(driver, 'recover_page') and driver.recover_page():
+                    ya_retry = _safe_get(driver, "https://ya.ru", timeout=40, label="ya.ru retry2")
+                    if ya_retry == 'dead':
+                        raise Exception("Browser died 3 times navigating to ya.ru")
+                else:
+                    raise Exception("Browser dead on ya.ru retry, cannot recover")
+            if ya_retry:
+                time.sleep(random.uniform(3, 5))
+            else:
+                logger.warning("⏱️ ya.ru retry also timed out")
+                time.sleep(2)
+            
+            try:
+                _retry_title = driver.title or ''
+            except Exception:
+                _retry_title = ''
+            
+            if not _retry_title.strip():
+                logger.error("💀 ya.ru Title still empty after retry — proxy/renderer dead, failing fast")
+                raise Exception("Browser renderer dead: ya.ru loaded with empty title after 2 attempts (proxy too slow)")
+            else:
+                logger.info(f"✅ ya.ru retry worked: Title='{_retry_title}'")
 
         # Check for captcha
         from tasks.yandex_maps import detect_captcha_or_block, handle_yandex_protection
         
-        # === DETAILED CAPTCHA DIAGNOSTICS ===
-        current_url_debug = driver.current_url
-        page_title_debug = driver.title
+        # === LIGHTWEIGHT CAPTCHA DIAGNOSTICS (avoid killing renderer) ===
+        try:
+            current_url_debug = driver.current_url
+        except Exception:
+            current_url_debug = ''
+        try:
+            page_title_debug = driver.title
+        except Exception:
+            page_title_debug = ''
         logger.info(f"📋 [DIAG] After ya.ru load: URL={current_url_debug}, Title='{page_title_debug}'")
         if task_id:
             _update_search_task_log(task_id, f"📋 URL: {current_url_debug[:120]}, Title: '{page_title_debug}'")
         
-        # Save screenshot for every attempt
-        try:
-            diag_ss = f"screenshots/search_diag_{profile_id}_{int(time.time())}.png"
-            driver.save_screenshot(diag_ss)
-            logger.info(f"📸 [DIAG] Screenshot saved: {diag_ss}")
-        except Exception as ss_err:
-            logger.warning(f"[DIAG] Screenshot failed: {ss_err}")
-        
-        # Detect captcha type in detail
-        page_src_lower = driver.page_source[:5000].lower()
-        # IMPORTANT: For URL checks, only check the path (before ?) to avoid
-        # false positives from utm_referrer=...showcaptcha... in search result URLs
+        # Detect captcha from URL first (zero renderer cost)
         _url_path_lower = current_url_debug.lower().split('?')[0]
+        _url_captcha = 'showcaptcha' in _url_path_lower or '/captcha' in _url_path_lower
+        
+        # Only read page_source if URL doesn't already tell us it's captcha
+        page_src_lower = ''
+        if not _url_captcha:
+            try:
+                page_src_lower = driver.page_source[:3000].lower()
+            except Exception:
+                pass
+        
         captcha_indicators = {
             'showcaptcha_url': 'showcaptcha' in _url_path_lower,
             'captcha_url': '/captcha' in _url_path_lower,
@@ -1517,15 +2573,6 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         else:
             logger.info(f"🔍 [DIAG] No captcha indicators detected")
         
-        # Save page source for later analysis
-        try:
-            diag_html = f"screenshots/search_diag_{profile_id}_{int(time.time())}.html"
-            with open(diag_html, 'w', encoding='utf-8') as f:
-                f.write(driver.page_source)
-            logger.info(f"📄 [DIAG] Page source saved: {diag_html}")
-        except:
-            pass
-        
         if detect_captcha_or_block(driver):
             logger.warning(f"🚨 Captcha detected on Yandex homepage! Types: {detected_types}")
             if task_id:
@@ -1533,22 +2580,29 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             captcha_solver = CaptchaSolver()
             
             heavy_captcha_detected = any(t in detected_types for t in ('kaleidoscope', 'silhouette', 'advanced_captcha'))
-            max_home_captcha_attempts = 2  # Give heavy captchas 2 outer attempts (7 inner each)
+            max_home_captcha_attempts = 1  # Fail fast — retry with new proxy is better than looping
 
             # Try solving captcha with limited attempts
             solved = False
             for captcha_attempt in range(1, max_home_captcha_attempts + 1):
                 solve_start = time.time()
                 try:
-                    solved = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=7)
+                    solved = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=3)
+                except SoftTimeLimitExceeded:
+                    raise
                 except Exception as _hp_err:
                     _hp_str = str(_hp_err)
-                    if 'Timed out' in _hp_str or 'timeout' in _hp_str.lower():
+                    # Browser death — fail fast, no point retrying on dead browser
+                    if ('closed' in _hp_str.lower() or 'Target page' in _hp_str 
+                        or 'Browser died' in _hp_str or 'PoW' in _hp_str):
+                        logger.error(f"💀 Browser died during home captcha solving — failing fast: {_hp_str[:200]}")
+                        raise
+                    elif 'Timed out' in _hp_str or 'timeout' in _hp_str.lower():
                         logger.warning(f"⚠️ Renderer timeout in handle_yandex_protection (home captcha attempt {captcha_attempt}): {_hp_str[:200]}")
                         # Wait for renderer recovery before continuing
                         time.sleep(10)
                         try:
-                            _ = driver.current_url
+                            driver.execute_script("1")
                             logger.info("✅ Browser responsive after timeout — checking captcha state...")
                             if not detect_captcha_or_block(driver):
                                 solved = True
@@ -1574,27 +2628,46 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     logger.info(f"🔄 Captcha attempt {captcha_attempt} failed, refreshing for retry...")
                     if task_id:
                         _update_search_task_log(task_id, f"🔄 Попытка {captcha_attempt} не удалась, пробуем ещё раз...")
+                    # If page is dead, recover it first (page.url is cached, use evaluate)
+                    page_alive = True
                     try:
-                        driver.refresh()
-                    except Exception as _ref_err:
-                        if 'Timed out' in str(_ref_err) or 'timeout' in str(_ref_err).lower():
-                            logger.warning("⚠️ Renderer timeout during refresh — waiting...")
-                            time.sleep(10)
+                        driver.execute_script("1")
+                    except Exception:
+                        page_alive = False
+                        logger.warning("⚠️ Page is dead, recovering via new tab...")
+                        if hasattr(driver, 'recover_page') and driver.recover_page():
+                            logger.info("✅ New page created in same browser context")
+                            page_alive = True
                         else:
-                            raise
-                    time.sleep(random.uniform(3, 5))
-                    if not detect_captcha_or_block(driver):
-                        logger.info("🎉 Captcha disappeared after refresh!")
-                        solved = True
-                        break
+                            logger.error("❌ Could not recover page — stopping retries")
+                            break
+                    if page_alive:
+                        try:
+                            driver.get("https://ya.ru/")
+                        except Exception as _ref_err:
+                            _ref_str = str(_ref_err)
+                            if 'Timed out' in _ref_str or 'timeout' in _ref_str.lower():
+                                logger.warning("⚠️ Renderer timeout during refresh — waiting...")
+                                time.sleep(10)
+                            elif 'closed' in _ref_str.lower() or 'Target' in _ref_str:
+                                logger.warning(f"⚠️ Page died during navigation: {_ref_str[:200]}")
+                                if hasattr(driver, 'recover_page') and driver.recover_page():
+                                    logger.info("✅ Recovered page, retrying navigation")
+                                    try:
+                                        driver.get("https://ya.ru/")
+                                    except Exception:
+                                        pass
+                                else:
+                                    break
+                            else:
+                                raise
+                        time.sleep(random.uniform(3, 5))
+                        if not detect_captcha_or_block(driver):
+                            logger.info("🎉 Captcha disappeared after refresh!")
+                            solved = True
+                            break
             
-            # Save post-solve screenshot
-            try:
-                post_ss = f"screenshots/search_post_captcha_{profile_id}_{int(time.time())}.png"
-                driver.save_screenshot(post_ss)
-                logger.info(f"📸 [DIAG] Post-captcha screenshot: {post_ss}")
-            except:
-                pass
+            # Post-captcha screenshots disabled to save time
             
             if not solved:
                 if task_id:
@@ -1623,6 +2696,9 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             except Exception:
                 logger.warning("⚠️ Could not read URL after captcha redirect")
 
+        # === Idle mouse movement on ya.ru before typing (natural user behavior) ===
+        _human_mouse_move(driver, duration=random.uniform(0.8, 2.5))
+
         # === Step 2: Type keyword via keyboard emulation ===
         if task_id:
             _update_search_task_log(task_id, f"⌨️ Вводим запрос: '{keyword}'")
@@ -1630,6 +2706,34 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         logger.info(f"⌨️ Step 2: Typing keyword '{keyword}' into search input")
         logger.info(f"   Current URL: {driver.current_url}")
         logger.info(f"   Page title: {driver.title}")
+
+        # Wait for page to be interactive before searching for input elements
+        # ya.ru is a React SPA — inputs may not be in DOM immediately
+        _primary_input_selectors = [
+            'input[name="text"]', 'input.search3__input',
+            'input.mini-suggest__input', 'input[role="searchbox"]',
+            'textarea[name="text"]',
+        ]
+        _found_early = False
+        try:
+            for _psel in _primary_input_selectors:
+                try:
+                    loc = driver._page.locator(_psel)
+                    loc.first.wait_for(state='visible', timeout=8000)
+                    _found_early = True
+                    logger.info(f"   ✅ Input ready (wait_for): '{_psel}'")
+                    break
+                except Exception:
+                    continue
+            if not _found_early:
+                logger.info("   ⏳ No input visible yet, waiting for networkidle...")
+                try:
+                    driver._page.wait_for_load_state('networkidle', timeout=10000)
+                except Exception:
+                    pass
+                time.sleep(1)
+        except Exception as _wait_err:
+            logger.warning(f"   ⚠️ Input pre-wait failed: {_wait_err}")
 
         search_input = None
         
@@ -1757,53 +2861,102 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 _safe_click(driver, search_input, 0.3, 0.7)
                 time.sleep(random.uniform(0.5, 1.0))
                 
-                # Clear any existing text
+                # Diagnose: what element actually has focus after clicking textarea?
                 try:
-                    search_input.clear()
-                except Exception:
-                    driver.execute_script("arguments[0].value = '';", search_input)
-                time.sleep(random.uniform(0.2, 0.5))
-
-                # Type keyword character by character with human-like delays
-                logger.info(f"   Typing '{keyword}' character by character...")
-                for i, char in enumerate(keyword):
-                    search_input.send_keys(char)
-                    # Variable delay: faster in middle of word, slower at start/after space
-                    if char == ' ':
-                        time.sleep(random.uniform(0.15, 0.4))
-                    elif i < 2:
-                        time.sleep(random.uniform(0.1, 0.3))
-                    else:
-                        time.sleep(random.uniform(0.04, 0.18))
-                typing_succeeded = True
-            except Exception as type_err:
-                logger.warning(f"   send_keys failed ({type_err}), falling back to JS typing")
-                # Fallback: type via JavaScript
-                try:
-                    driver.execute_script("""
-                        var input = arguments[0];
-                        var text = arguments[1];
-                        input.focus();
-                        input.value = '';
-                        // Use native input setter to trigger React/Vue events
-                        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                        nativeInputValueSetter.call(input, text);
-                        input.dispatchEvent(new Event('input', { bubbles: true }));
-                        input.dispatchEvent(new Event('change', { bubbles: true }));
-                    """, search_input, keyword)
+                    diag = driver.execute_script("""
+                        var ae = document.activeElement;
+                        if (!ae) return 'none';
+                        return JSON.stringify({
+                            tag: ae.tagName, name: ae.name||'', id: ae.id||'',
+                            cls: (ae.className||'').substring(0,80),
+                            ce: ae.contentEditable, type: ae.type||'',
+                            val: (ae.value||'').substring(0,30),
+                            txt: (ae.textContent||'').substring(0,30)
+                        });
+                    """)
+                    logger.info(f"   [DIAG] Active element after click: {diag}")
+                except Exception as diag_err:
+                    logger.warning(f"   [DIAG] Active element check failed: {diag_err}")
+                
+                # Strategy 1: Use Playwright page.type() with selector (most reliable)
+                # This re-finds the element, focuses it properly, then types
+                typed_via_playwright = False
+                input_selectors_pw = [
+                    'input.mini-suggest__input',
+                    'input.search3__input',
+                    'textarea[name="text"]',
+                    'input[name="text"]',
+                    'input[role="searchbox"]',
+                    'input[role="combobox"]',
+                ]
+                for sel in input_selectors_pw:
+                    try:
+                        # Check if element exists and is visible
+                        count = driver._page.locator(sel).count()
+                        if count > 0 and driver._page.locator(sel).first.is_visible():
+                            logger.info(f"   Using Playwright type() on '{sel}'...")
+                            driver._page.locator(sel).first.click()
+                            time.sleep(0.3)
+                            driver._page.keyboard.press("Control+a")
+                            driver._page.keyboard.press("Backspace")
+                            time.sleep(0.2)
+                            driver._page.locator(sel).first.type(keyword, delay=random.randint(40, 90))
+                            typed_via_playwright = True
+                            break
+                    except Exception:
+                        continue
+                
+                if typed_via_playwright:
                     typing_succeeded = True
-                    logger.info(f"   JS typing succeeded")
-                except Exception as js_type_err:
-                    logger.warning(f"   JS typing also failed: {js_type_err}")
+                else:
+                    # Strategy 2: Fallback — fill() via Playwright (non-human but reliable)
+                    logger.warning(f"   Playwright type() failed on all selectors, using fill()...")
+                    for sel in input_selectors_pw:
+                        try:
+                            if driver._page.locator(sel).count() > 0:
+                                driver._page.locator(sel).first.fill(keyword)
+                                typing_succeeded = True
+                                logger.info(f"   fill() succeeded on '{sel}'")
+                                break
+                        except Exception:
+                            continue
+                    
+                    if not typing_succeeded:
+                        # Strategy 3: JS setter on textarea
+                        logger.warning(f"   fill() also failed, using JS native setter...")
+                        driver.execute_script("""
+                            var el = arguments[0];
+                            var text = arguments[1];
+                            el.focus();
+                            var proto = el.tagName === 'TEXTAREA' 
+                                ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                            var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+                            setter.call(el, text);
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        """, search_input, keyword)
+                        typing_succeeded = True
+                        logger.info(f"   JS setter applied for '{keyword}'")
+            except Exception as type_err:
+                logger.warning(f"   All typing methods failed: {type_err}")
             
             if typing_succeeded:
                 logger.info(f"   Keyword typed. Waiting for suggestions...")
                 time.sleep(random.uniform(1.0, 2.5))
                 
-                # Check what's in the input now
+                # Verify value in any relevant input element
                 try:
-                    current_value = search_input.get_attribute('value') or ''
-                    logger.info(f"   Input value after typing: '{current_value}'")
+                    current_value = driver.execute_script("""
+                        var sels = ['input.mini-suggest__input', 'input.search3__input', 
+                                    'textarea[name=text]', 'input[name=text]'];
+                        for (var i = 0; i < sels.length; i++) {
+                            var el = document.querySelector(sels[i]);
+                            if (el && el.value) return el.value;
+                        }
+                        var ae = document.activeElement;
+                        return ae ? (ae.value || ae.textContent || '') : '';
+                    """) or ''
+                    logger.info(f"   Input value after typing: '{current_value[:50]}'")
                 except:
                     pass
             
@@ -1860,10 +3013,35 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             
             time.sleep(random.uniform(4, 7))
             
-            logger.info(f"   Search submitted. URL: {driver.current_url[:120]}")
+            # Stop any still-loading page to free the renderer
+            try:
+                driver.execute_script("window.stop()")
+            except Exception:
+                pass
+            time.sleep(0.5)
+            
+            try:
+                logger.info(f"   Search submitted. URL: {driver.current_url[:120]}")
+            except Exception as _url_err:
+                logger.warning(f"   Search submitted but cannot read URL (renderer busy): {str(_url_err)[:80]}")
             
             # Verify we're on search results page
-            current_url = driver.current_url.lower()
+            try:
+                current_url = driver.current_url.lower()
+            except Exception:
+                # Renderer still busy — wait and retry
+                logger.warning("   Renderer timeout reading URL, waiting 10s...")
+                time.sleep(10)
+                try:
+                    driver.execute_script("window.stop()")
+                except Exception:
+                    pass
+                try:
+                    current_url = driver.current_url.lower()
+                except Exception as _retry_err:
+                    logger.error(f"   Still cannot read URL after wait: {str(_retry_err)[:80]}")
+                    raise Exception(f"Browser renderer dead: cannot read URL after search submit")
+            
             if '/search' not in current_url and 'text=' not in current_url:
                 logger.warning(f"   Not on search results page! URL: {current_url}")
                 # If we landed on a captcha page, DON'T try direct URL fallback —
@@ -1878,7 +3056,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     logger.info(f"   Falling back to direct URL search...")
                     encoded = quote_plus(keyword)
                     try:
-                        driver.set_page_load_timeout(30)
+                        driver.set_page_load_timeout(40)
                         driver.get(f"https://ya.ru/search/?text={encoded}")
                         time.sleep(random.uniform(4, 7))
                         logger.info(f"   After fallback URL: {driver.current_url[:120]}")
@@ -1890,28 +3068,96 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             # Last resort fallback: direct URL navigation
             logger.warning("⚠️ Could not find search input — using direct URL as fallback")
             encoded = quote_plus(keyword)
-            driver.get(f"https://ya.ru/search/?text={encoded}")
-            time.sleep(random.uniform(4, 7))
+            _safe_get(driver, f"https://ya.ru/search/?text={encoded}", timeout=40, label="search fallback")
+            time.sleep(random.uniform(3, 5))
+            # Wait for search results to render
+            try:
+                driver._page.wait_for_selector('[data-cid]', timeout=10000)
+            except Exception:
+                pass
 
         # Check for captcha on search results
-        search_url_debug = driver.current_url
-        search_title_debug = driver.title
-        logger.info(f"📋 [DIAG] Search results page: URL={search_url_debug[:150]}, Title='{search_title_debug}'")
-        
-        # Save search results screenshot
+        # Stop loading to prevent renderer timeouts on slow proxies
         try:
-            search_ss = f"screenshots/search_results_{profile_id}_{int(time.time())}.png"
-            driver.save_screenshot(search_ss)
-            logger.info(f"📸 [DIAG] Search results screenshot: {search_ss}")
-        except:
+            driver.execute_script("window.stop()")
+        except Exception:
             pass
         
-        # Detailed captcha check on search results
-        search_src_lower = driver.page_source[:5000].lower()
+        try:
+            search_url_debug = driver.current_url
+            search_title_debug = driver.title
+        except Exception as _diag_err:
+            logger.warning(f"⚠️ Renderer timeout reading search page state: {str(_diag_err)[:80]}")
+            time.sleep(5)
+            try:
+                driver.execute_script("window.stop()")
+            except Exception:
+                pass
+            try:
+                search_url_debug = driver.current_url
+                search_title_debug = driver.title
+            except Exception:
+                raise Exception("Browser renderer dead: cannot read URL after search")
+        
+        logger.info(f"📋 [DIAG] Search results page: URL={search_url_debug[:150]}, Title='{search_title_debug}'")
+        
+        # Skip heavy screenshot here to preserve renderer health
+        
+        # === Force refresh if page didn't render (Title='' or Title='Яндекс') ===
+        if search_title_debug.strip() in ('', 'Яндекс') and not detect_captcha_or_block(driver):
+            for _refresh_attempt in range(1, 4):
+                logger.warning(f"🔄 Empty page detected (Title='{search_title_debug}'), forced refresh #{_refresh_attempt}...")
+                try:
+                    # Stop pending loads before refresh to avoid renderer timeout
+                    try:
+                        driver.execute_script("window.stop()")
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                    driver.refresh()
+                    time.sleep(random.uniform(4, 7))
+                    try:
+                        WebDriverWait(driver, 15).until(
+                            lambda d: len(d.find_elements(By.CSS_SELECTOR, '[data-cid]')) >= 3
+                        )
+                    except TimeoutException:
+                        pass
+                    _new_title = driver.title
+                    _new_cid = len(driver.find_elements(By.CSS_SELECTOR, '[data-cid]'))
+                    logger.info(f"🔄 After refresh #{_refresh_attempt}: Title='{_new_title}', data-cid={_new_cid}")
+                    if _new_cid >= 3 or (_new_title.strip() not in ('', 'Яндекс') and 'captcha' not in _new_title.lower()):
+                        search_title_debug = _new_title
+                        break
+                    if detect_captcha_or_block(driver):
+                        logger.warning(f"🚨 Captcha appeared after refresh #{_refresh_attempt}")
+                        break
+                except Exception as _ref_err:
+                    logger.warning(f"⚠️ Refresh #{_refresh_attempt} error: {_ref_err}")
+                    break
+
+        # === Detect dead browser/proxy: still on ya.ru/ with empty Title after all retries ===
+        _post_refresh_url = driver.current_url
+        _post_refresh_title = driver.title
+        if (_post_refresh_title.strip() in ('', 'Яндекс') 
+                and '/search' not in _post_refresh_url.lower()
+                and not detect_captcha_or_block(driver)):
+            logger.error(f"💀 Browser/proxy is dead — page never loaded. URL={_post_refresh_url}, Title='{_post_refresh_title}'")
+            raise Exception(f"Browser renderer dead: page never loaded (URL={_post_refresh_url}, Title='{_post_refresh_title}')")
+
+        # Detect captcha from URL first (cheap), then page_source only if needed
+        _search_url_lower = search_url_debug.lower().split('?')[0]
+        _search_url_captcha = 'showcaptcha' in _search_url_lower or '/captcha' in _search_url_lower
+        
+        search_src_lower = ''
+        if not _search_url_captcha:
+            try:
+                search_src_lower = driver.page_source[:3000].lower()
+            except Exception:
+                pass
+        
         search_captcha_indicators = {
-            # Check only URL path for captcha (not query params like utm_referrer)
-            'showcaptcha_url': 'showcaptcha' in search_url_debug.lower().split('?')[0],
-            'captcha_url': '/captcha' in search_url_debug.lower().split('?')[0],
+            'showcaptcha_url': 'showcaptcha' in _search_url_lower,
+            'captcha_url': '/captcha' in _search_url_lower,
             'checkbox_captcha': 'checkboxcaptcha' in search_src_lower,
             'advanced_captcha': 'advancedcaptcha' in search_src_lower,
             'silhouette': 'silhouette' in search_src_lower,
@@ -1938,7 +3184,10 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             captcha_solver = CaptchaSolver()
             
             heavy_search_captcha = any(t in search_detected for t in ('kaleidoscope', 'silhouette', 'advanced_captcha'))
-            max_search_captcha_attempts = 2  # Give heavy captchas 2 outer attempts (7 inner each)
+            # showcaptcha_url is mostly unsolvable (PoW rejected); use 2 attempts to fail faster
+            # kaleidoscope/silhouette have better solve rates — give them 3 attempts
+            is_showcaptcha = 'showcaptcha_url' in search_detected
+            max_search_captcha_attempts = 2 if is_showcaptcha else 3
 
             # Try solving with limited attempts
             solved2 = False
@@ -1946,13 +3195,20 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 solve_start2 = time.time()
                 try:
                     solved2 = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=7)
+                except SoftTimeLimitExceeded:
+                    raise
                 except Exception as _hp2_err:
                     _hp2_str = str(_hp2_err)
-                    if 'Timed out' in _hp2_str or 'timeout' in _hp2_str.lower():
+                    # Browser death — fail fast, no point retrying on dead browser
+                    if ('closed' in _hp2_str.lower() or 'Target page' in _hp2_str 
+                        or 'Browser died' in _hp2_str or 'PoW' in _hp2_str):
+                        logger.error(f"💀 Browser died during search captcha solving — failing fast: {_hp2_str[:200]}")
+                        raise
+                    elif 'Timed out' in _hp2_str or 'timeout' in _hp2_str.lower():
                         logger.warning(f"⚠️ Renderer timeout in handle_yandex_protection (search captcha attempt {search_captcha_attempt}): {_hp2_str[:200]}")
                         time.sleep(10)
                         try:
-                            _ = driver.current_url
+                            driver.execute_script("1")
                             logger.info("✅ Browser responsive after timeout — checking captcha state...")
                             if not detect_captcha_or_block(driver):
                                 solved2 = True
@@ -1978,27 +3234,61 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     logger.info(f"🔄 Search captcha attempt {search_captcha_attempt} failed, refreshing for retry...")
                     if task_id:
                         _update_search_task_log(task_id, f"🔄 Попытка {search_captcha_attempt} не удалась, повтор...")
-                    # Try reloading the search page directly (with timeout protection)
+                    # Recover page if dead (page.url is cached so check with evaluate)
                     encoded_retry = quote_plus(keyword)
+                    page_alive = True
                     try:
-                        driver.set_page_load_timeout(30)
-                        driver.get(f"https://ya.ru/search/?text={encoded_retry}")
-                        time.sleep(random.uniform(4, 7))
-                    except TimeoutException:
-                        logger.warning("⚠️ Search page reload timed out")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Search page reload error: {e}")
-                    if not detect_captcha_or_block(driver):
-                        logger.info("🎉 Search page loaded without captcha on retry!")
-                        solved2 = True
-                        break
+                        driver.execute_script("1")
+                    except Exception:
+                        page_alive = False
+                        logger.warning("⚠️ Page is dead, recovering via new tab...")
+                        if hasattr(driver, 'recover_page') and driver.recover_page():
+                            logger.info("✅ New page created in same browser context")
+                            page_alive = True
+                        else:
+                            logger.error("❌ Could not recover page — stopping retries")
+                            break
+                    if page_alive:
+                        try:
+                            # Navigate to ya.ru homepage first to break captcha redirect loop
+                            driver.set_page_load_timeout(30)
+                            driver.get("https://ya.ru")
+                            time.sleep(random.uniform(2, 4))
+                        except Exception as e_home:
+                            logger.warning(f"⚠️ Homepage navigation error: {e_home}")
+                            # If homepage fails too, try recovering page
+                            if 'closed' in str(e_home).lower() or 'Target' in str(e_home):
+                                if hasattr(driver, 'recover_page') and driver.recover_page():
+                                    logger.info("✅ Recovered page after homepage error")
+                                else:
+                                    logger.error("❌ Could not recover page")
+                                    break
+                        try:
+                            driver.set_page_load_timeout(40)
+                            driver.get(f"https://ya.ru/search/?text={encoded_retry}")
+                            time.sleep(random.uniform(4, 7))
+                        except TimeoutException:
+                            logger.warning("⚠️ Search page reload timed out")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Search page reload error: {e}")
+                            # Page likely died during navigation — recover
+                            if hasattr(driver, 'recover_page') and driver.recover_page():
+                                logger.info("✅ Recovered page after reload error")
+                                try:
+                                    driver.set_page_load_timeout(40)
+                                    driver.get(f"https://ya.ru/search/?text={encoded_retry}")
+                                    time.sleep(random.uniform(4, 7))
+                                except Exception as e2:
+                                    logger.warning(f"⚠️ Search reload still failed: {e2}")
+                            else:
+                                logger.error("❌ Could not recover page after reload error")
+                                break
+                        if not detect_captcha_or_block(driver):
+                            logger.info("🎉 Search page loaded without captcha on retry!")
+                            solved2 = True
+                            break
             
-            # Post-solve screenshot
-            try:
-                post_ss2 = f"screenshots/search_post_captcha2_{profile_id}_{int(time.time())}.png"
-                driver.save_screenshot(post_ss2)
-            except:
-                pass
+            # Post-captcha screenshots disabled to save time
             
             if not solved2:
                 if task_id:
@@ -2019,14 +3309,86 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         if task_id:
             _update_search_task_log(task_id, f"🔎 Результаты загружены, ищем {domain}...")
 
+        # === Mouse movement over SERP before scanning results (natural behavior) ===
+        _human_mouse_move(driver, duration=random.uniform(0.5, 1.5))
+
         # === Step 3: Find and click target ===
-        result = _find_and_click_target(driver, domain, max_pages=max_pages)
+        result = _find_and_click_target(driver, domain, max_pages=max_pages, keyword=keyword,
+                                        task_start_time=start_time)
 
         if not result['found']:
+            # Check if the browser is actually on a captcha page — reclassify as captcha error
+            _final_title = ''
+            try:
+                _final_title = (driver.title or '').lower()
+            except Exception:
+                pass
+            _captcha_title_markers = ('верификация', 'вы не робот', 'подтвердите', 'captcha', 'robot')
+            _final_url = ''
+            try:
+                _final_url = (driver.current_url or '').lower()
+            except Exception:
+                pass
+            _is_actually_captcha = any(m in _final_title for m in _captcha_title_markers) or 'showcaptcha' in _final_url
+
+            if _is_actually_captcha:
+                # This is NOT a real "not found" — the page is a captcha
+                error_msg = f"Captcha blocked search results (title: {_final_title[:60]})"
+                logger.warning(f"🚨 Reclassifying not_found → captcha: {error_msg}")
+                if task_id:
+                    _update_search_task_log(task_id, f"❌ Капча заблокировала выдачу (не not_found)", status='failed', error=error_msg)
+                _save_error_log(
+                    task_id=task_id, profile_id=profile_id,
+                    error_message=error_msg,
+                    error_category='captcha',
+                    keyword=keyword, domain=domain,
+                    proxy_host=proxy_data.get('host') if proxy_data else None,
+                    proxy_id=proxy_data.get('id') if proxy_data else None,
+                    task_duration=int(time.time() - start_time)
+                )
+                return {
+                    'status': 'error',
+                    'error': error_msg,
+                    'profile_id': profile_id,
+                    'keyword': keyword,
+                    'domain': domain,
+                }
+
+            # Save full debug dump: DOM + screenshot of final page state
+            try:
+                ts = int(time.time())
+                _nf_url = driver.current_url or ''
+                _nf_title = driver.title or ''
+                logger.info(f"  📋 [NOT_FOUND DEBUG] Final URL: {_nf_url[:200]}")
+                logger.info(f"  📋 [NOT_FOUND DEBUG] Final title: {_nf_title}")
+                html_path = f"screenshots/search_notfound_{profile_id}_{ts}.html"
+                page_src = driver.page_source or ''
+                with open(html_path, 'w', encoding='utf-8') as f:
+                    f.write(page_src)
+                logger.info(f"  📄 NOT_FOUND page source: {html_path} ({len(page_src)} bytes)")
+                try:
+                    scr_path = f"screenshots/search_notfound_{profile_id}_{ts}.png"
+                    driver.save_screenshot(scr_path)
+                    logger.info(f"  📸 NOT_FOUND screenshot: {scr_path}")
+                except Exception:
+                    pass
+            except Exception as dbg_err:
+                logger.warning(f"  ⚠️ Debug dump failed: {dbg_err}")
+
             msg = f"❌ Сайт {domain} не найден в выдаче (проверено {max_pages} стр.)"
             logger.warning(msg)
             if task_id:
                 _update_search_task_log(task_id, msg, status='not_found', error='Site not found in search results')
+            
+            _save_error_log(
+                task_id=task_id, profile_id=profile_id,
+                error_message='Site not found in search results',
+                error_category='not_found',
+                keyword=keyword, domain=domain,
+                proxy_host=proxy_data.get('host') if proxy_data else None,
+                proxy_id=proxy_data.get('id') if proxy_data else None,
+                task_duration=int(time.time() - start_time)
+            )
             
             # Update target stats
             with get_db_session() as db:
@@ -2044,14 +3406,12 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             _save_position_history(
                 search_target_id=target_id, keyword=keyword, domain=domain,
                 found=False, page=max_pages, position=0,
-                profile_id=profile_id, task_id=task_id, clicked=False
+                profile_id=profile_id, task_id=task_id, clicked=False,
+                referrer_used=_referrer_used
             )
             
-            # Auto-disable keyword after 3 consecutive not_found
-            try:
-                _check_and_disable_keyword(target_id, keyword, domain, consecutive_threshold=3)
-            except Exception as disable_err:
-                logger.warning(f"Error checking auto-disable for keyword '{keyword}': {disable_err}")
+            # Auto-disable keyword if it keeps failing
+            _check_and_disable_keyword(target_id, keyword, domain, consecutive_threshold=10)
             
             return {
                 'status': 'not_found',
@@ -2066,18 +3426,29 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             logger.warning(msg)
             if task_id:
                 _update_search_task_log(task_id, msg, status='failed', error='Click failed')
+            
+            _save_error_log(
+                task_id=task_id, profile_id=profile_id,
+                error_message=f'Click failed at page {result["page"]}, position {result["position"]}',
+                error_category='click_failed',
+                keyword=keyword, domain=domain,
+                proxy_host=proxy_data.get('host') if proxy_data else None,
+                proxy_id=proxy_data.get('id') if proxy_data else None,
+                task_duration=int(time.time() - start_time)
+            )
             # Save position history: found but click failed
             _save_position_history(
                 search_target_id=target_id, keyword=keyword, domain=domain,
                 found=True, page=result['page'], position=result['position'],
                 profile_id=profile_id, task_id=task_id, clicked=False,
-                serp_position=result.get('serp_position')
+                serp_position=result.get('serp_position'),
+                referrer_used=_referrer_used
             )
             return {'status': 'click_failed', **result}
 
-        # === Step 4: Click completed — finish immediately (no site browsing) ===
+        # === Step 4: Click completed — finish immediately ===
         total_time = time.time() - start_time
-        actual_browse_time = 0  # No site browsing in this mode
+        actual_browse_time = 0
 
         if task_id:
             _update_search_task_log(task_id,
@@ -2092,6 +3463,13 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     'total_time': round(total_time, 1)
                 },
                 exec_time=total_time)
+
+        # Update proxy stats — success
+        try:
+            if proxy_data and proxy_data.get('id'):
+                proxy_manager.update_proxy_stats(proxy_data['id'], True, response_time=total_time * 1000)
+        except Exception:
+            pass
 
         # Update target stats — success
         with get_db_session() as db:
@@ -2129,13 +3507,17 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             f"(page {result['page']}, pos {result['position']}, {actual_browse_time:.0f}s on site)"
         )
 
+        # Retire profile after successful click on target site (1 profile = 1 successful click)
+        _retire_profile_after_search(profile_id)
+
         # Save position history: success
         _save_position_history(
             search_target_id=target_id, keyword=keyword, domain=domain,
             found=True, page=result['page'], position=result['position'],
             profile_id=profile_id, task_id=task_id, clicked=True,
             browse_time=round(actual_browse_time, 1),
-            serp_position=result.get('serp_position')
+            serp_position=result.get('serp_position'),
+            referrer_used=_referrer_used
         )
 
         return {
@@ -2153,17 +3535,59 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         logger.error(f"⏰ Soft time limit exceeded for search task profile {profile_id}, cleaning up Chrome...")
         if task_id:
             _update_search_task_log(task_id, "⏰ Превышено время выполнения задачи", status='failed', error='SoftTimeLimitExceeded')
+        _save_error_log(
+            task_id=task_id, profile_id=profile_id,
+            error_message='SoftTimeLimitExceeded',
+            error_category='timeout',
+            keyword=keyword, domain=domain,
+            proxy_host=proxy_data.get('host') if proxy_data else None,
+            proxy_id=proxy_data.get('id') if proxy_data else None,
+            task_duration=int(time.time() - start_time)
+        )
         raise
 
     except Exception as e:
         error_str = str(e)
         logger.error(f"Error in search click-through for profile {profile_id}: {e}")
         
-        # Retry on browser session crashes (invalid session id / browser window not found)
-        if 'invalid session id' in error_str or 'Browser window not found' in error_str or 'Browser crashed during profile setup' in error_str:
-            logger.warning(f"🔄 Browser session crashed — will retry (profile {profile_id})")
+        # Save error debug dump (screenshot + URL)
+        try:
+            if browser_manager and browser_id:
+                _err_driver = browser_manager.get_driver(browser_id)
+                if _err_driver:
+                    ts = int(time.time())
+                    _err_url = _err_driver.current_url or ''
+                    _err_title = _err_driver.title or ''
+                    logger.info(f"  📋 [ERROR DEBUG] URL: {_err_url[:200]}, Title: {_err_title}")
+                    try:
+                        _err_driver.save_screenshot(f"screenshots/search_error_{profile_id}_{ts}.png")
+                        logger.info(f"  📸 Error screenshot saved")
+                    except Exception:
+                        pass
+                    try:
+                        with open(f"screenshots/search_error_{profile_id}_{ts}.html", 'w', encoding='utf-8') as f:
+                            f.write(_err_driver.page_source or '')
+                        logger.info(f"  📄 Error DOM saved")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        
+        # Retry on browser session crashes (invalid session id / browser window not found / renderer dead / browser died)
+        _browser_dead = (
+            'invalid session id' in error_str
+            or 'Browser window not found' in error_str
+            or 'Browser crashed during profile setup' in error_str
+            or 'Browser renderer dead' in error_str
+            or 'Browser died' in error_str
+            or 'Browser dead' in error_str
+            or 'Target page, context or browser has been closed' in error_str
+            or 'cannot recover' in error_str
+        )
+        if _browser_dead:
+            logger.warning(f"🔄 Browser session crashed/dead — will retry (profile {profile_id})")
             if task_id:
-                _update_search_task_log(task_id, f"🔄 Браузер упал при запуске, повторяем...")
+                _update_search_task_log(task_id, f"🔄 Браузер/прокси не работает, повторяем с другим прокси...")
             # Close current browser before retry
             if browser_manager and browser_id:
                 try:
@@ -2171,16 +3595,50 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     browser_id = None
                 except Exception:
                     pass
+            # Exclude failed proxy on retry
+            retry_params = dict(params) if params else {}
+            failed_proxy_id = proxy_data.get('id') if proxy_data else None
+            if failed_proxy_id:
+                retry_params['exclude_proxy_ids'] = list(set(exclude_proxy_ids + [failed_proxy_id]))
             try:
-                raise self.retry(exc=e, countdown=15, max_retries=2)
+                raise self.retry(exc=e, countdown=15, max_retries=2,
+                                 args=[profile_id, target_id, keyword, task_id, retry_params])
             except self.MaxRetriesExceededError:
                 logger.error(f"Max retries exceeded for browser crash (profile {profile_id})")
+
+        # Retry on captcha failures with different proxy (captcha = proxy/fingerprint flagged)
+        _captcha_fail = (
+            'Captcha not solved' in error_str
+            or 'Captcha blocked' in error_str
+            or 'Captcha reappeared' in error_str
+        )
+        if _captcha_fail:
+            logger.warning(f"🔄 Captcha failure — will retry with different proxy (profile {profile_id})")
+            if task_id:
+                _update_search_task_log(task_id, f"🔄 Капча не решена, повтор с другим прокси через 60с...")
+            # Close current browser before retry
+            if browser_manager and browser_id:
+                try:
+                    browser_manager.close_browser_session(browser_id)
+                    browser_id = None
+                except Exception:
+                    pass
+            # Exclude current proxy on retry
+            retry_params = dict(params) if params else {}
+            failed_proxy_id = proxy_data.get('id') if proxy_data else None
+            if failed_proxy_id:
+                retry_params['exclude_proxy_ids'] = list(set(exclude_proxy_ids + [failed_proxy_id]))
+            try:
+                raise self.retry(exc=e, countdown=60, max_retries=2,
+                                 args=[profile_id, target_id, keyword, task_id, retry_params])
+            except self.MaxRetriesExceededError:
+                logger.error(f"Max retries exceeded for captcha failure (profile {profile_id})")
 
         # Retry on proxy tunnel failures (ERR_TUNNEL_CONNECTION_FAILED)
         if 'ERR_TUNNEL_CONNECTION_FAILED' in error_str or 'ERR_PROXY_CONNECTION_FAILED' in error_str:
             logger.warning("🔄 Proxy tunnel failed — will retry with different proxy")
             if task_id:
-                _update_search_task_log(task_id, f"🔄 Прокси не работает, повторяем...")
+                _update_search_task_log(task_id, f"🔄 Прокси не работает, повторяем с другим прокси...")
             # Close current browser before retry
             if browser_manager and browser_id:
                 try:
@@ -2188,14 +3646,27 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     browser_id = None
                 except Exception:
                     pass
+            # Exclude failed proxy on retry
+            retry_params = dict(params) if params else {}
+            failed_proxy_id = proxy_data.get('id') if proxy_data else None
+            if failed_proxy_id:
+                retry_params['exclude_proxy_ids'] = list(set(exclude_proxy_ids + [failed_proxy_id]))
             try:
-                raise self.retry(exc=e, countdown=10, max_retries=2)
+                raise self.retry(exc=e, countdown=10, max_retries=2,
+                                 args=[profile_id, target_id, keyword, task_id, retry_params])
             except self.MaxRetriesExceededError:
                 logger.error("Max retries exceeded for proxy tunnel failure")
         
         if task_id:
             _update_search_task_log(task_id, f"❌ Ошибка: {error_str[:200]}", status='failed', error=error_str[:500])
         
+        # Update proxy stats — failure
+        try:
+            if proxy_data and proxy_data.get('id'):
+                proxy_manager.update_proxy_stats(proxy_data['id'], False, error_message=error_str[:200])
+        except Exception:
+            pass
+
         # Update target stats — failure
         try:
             with get_db_session() as db:
@@ -2210,6 +3681,15 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         except Exception:
             pass
 
+        _save_error_log(
+            task_id=task_id, profile_id=profile_id,
+            error_message=error_str[:500],
+            error_detail=error_str,
+            keyword=keyword, domain=domain,
+            proxy_host=proxy_data.get('host') if proxy_data else None,
+            proxy_id=proxy_data.get('id') if proxy_data else None,
+            task_duration=int(time.time() - start_time)
+        )
         return {'status': 'error', 'error': str(e), 'profile_id': profile_id}
 
     finally:
@@ -2230,6 +3710,9 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             except Exception as cleanup_err:
                 logger.warning(f"Cleanup by profile dir failed: {cleanup_err}")
 
+        # Profile reuse: don't retire after each click, profiles are reusable
+        # _retire_profile_after_search(profile_id)
+
 
 # ======================== SCHEDULER ========================
 
@@ -2243,13 +3726,14 @@ def schedule_search_visits():
     scheduler_logger = logging.getLogger(__name__ + '.scheduler')
     scheduler_logger.info("🔄 Starting Yandex Search visit scheduler")
 
-    # Distributed lock
+    # Distributed lock — variables at function scope for cleanup in finally
+    r = None
+    lock_key = 'scheduler:schedule_search_visits:lock'
     try:
         import redis as _redis
         from app.config import settings as _s
         r = _redis.Redis(host=_s.redis_host, port=_s.redis_port)
-        lock_key = 'scheduler:schedule_search_visits:lock'
-        if not r.set(lock_key, '1', nx=True, ex=240):
+        if not r.set(lock_key, '1', nx=True, ex=60):
             scheduler_logger.info("⏭️ Another search scheduler already running, skipping")
             return {'status': 'skipped', 'reason': 'duplicate', 'scheduled': 0}
     except Exception as le:
@@ -2265,10 +3749,10 @@ def schedule_search_visits():
         scheduler_logger.warning(f"Could not check queue length: {qe}")
 
     # ── Limit total concurrent tasks to avoid overloading proxies ──
-    # concurrency=6 in docker-compose limits actual simultaneous workers (2 per proxy)
+    # concurrency=10 in docker-compose limits actual simultaneous workers
     # This limit controls how many tasks sit in queue (pending+in_progress)
     # Keep slightly above concurrency so workers always have work ready
-    MAX_CONCURRENT_SEARCH_TASKS = 10
+    MAX_CONCURRENT_SEARCH_TASKS = 50
     try:
         with get_db_session() as db:
             active_count = db.query(Task).filter(
@@ -2296,7 +3780,7 @@ def schedule_search_visits():
 
             # If a task is truly running, started_at must exist.
             # Give it a grace period slightly above the task soft time limit.
-            in_progress_cutoff = now - timedelta(minutes=12)
+            in_progress_cutoff = now - timedelta(minutes=25)
             stale_in_progress = db.query(Task).filter(
                 Task.task_type == 'yandex_search',
                 Task.status == 'in_progress',
@@ -2314,10 +3798,21 @@ def schedule_search_visits():
             ).all()
 
             stale_tasks = list(stale_in_progress) + list(stale_pending)
+
+            # Retry tasks that Celery never picked up again — clean after 2 hours
+            retry_cutoff = now - timedelta(hours=2)
+            stale_retry = db.query(Task).filter(
+                Task.task_type == 'yandex_search',
+                Task.status == 'retry',
+                Task.created_at < retry_cutoff,
+            ).all()
+            stale_tasks.extend(stale_retry)
+
             if stale_tasks:
                 scheduler_logger.info(
                     f"🧹 Cleaning up stale tasks: in_progress>{in_progress_cutoff.isoformat()} ({len(stale_in_progress)}), "
-                    f"pending>{pending_cutoff.isoformat()} ({len(stale_pending)})"
+                    f"pending>{pending_cutoff.isoformat()} ({len(stale_pending)}), "
+                    f"retry>{retry_cutoff.isoformat()} ({len(stale_retry)})"
                 )
                 for st in stale_tasks:
                     old_status = st.status
@@ -2325,6 +3820,9 @@ def schedule_search_visits():
                     if old_status == 'pending':
                         st.error_message = st.error_message or 'Task stuck in pending (auto-cleanup)'
                         st.add_log("🧹 Auto-cleaned: stuck in 'pending' for too long")
+                    elif old_status == 'retry':
+                        st.error_message = (st.error_message or '') + ' [auto-cleanup: stale retry]'
+                        st.add_log("🧹 Auto-cleaned: stuck in 'retry' — Celery never retried")
                     else:
                         st.error_message = st.error_message or 'Task timed out or worker restarted (auto-cleanup)'
                         st.add_log("🧹 Auto-cleaned: stuck in 'in_progress' past expected runtime")
@@ -2405,10 +3903,39 @@ def schedule_search_visits():
 
                     # Calculate click budget for each keyword based on position history
                     sr = target.success_rate if target.total_visits >= 10 else 100.0
+                    
+                    # Load exact frequency data for frequency-based priority
+                    freq_weights = {}
+                    try:
+                        from app.models.keyword_frequency import KeywordFrequency
+                        freq_records = db.query(KeywordFrequency).filter(
+                            KeywordFrequency.target_id == target.id
+                        ).all()
+                        exact_freqs = {}
+                        for fr in freq_records:
+                            if fr.freq_exact is not None and fr.freq_exact > 0:
+                                exact_freqs[fr.keyword] = fr.freq_exact
+                        if exact_freqs:
+                            # Normalize: weight = freq / avg_freq
+                            # High-freq gets > 1.0, low-freq gets < 1.0
+                            # Subtle range: 0.7 .. 1.5 to keep clicks natural
+                            avg_freq = sum(exact_freqs.values()) / len(exact_freqs)
+                            if avg_freq > 0:
+                                for fkw, fval in exact_freqs.items():
+                                    raw_weight = fval / avg_freq
+                                    freq_weights[fkw] = max(0.7, min(1.5, raw_weight))
+                                scheduler_logger.info(
+                                    f"📊 {target.domain}: freq weights loaded for {len(freq_weights)} keywords "
+                                    f"(avg_exact={avg_freq:.0f})"
+                                )
+                    except Exception as fe:
+                        scheduler_logger.warning(f"Could not load frequency weights for {target.domain}: {fe}")
+                    
                     keyword_budgets = []
                     total_budget = 0
                     for kw in keywords:
-                        kw_calc = _calculate_keyword_clicks(db, target.id, kw, target_success_rate=sr)
+                        fw = freq_weights.get(kw, 1.0)
+                        kw_calc = _calculate_keyword_clicks(db, target.id, kw, target_success_rate=sr, freq_weight=fw)
                         remaining = max(0, kw_calc["clicks_per_day"] - kw_calc["today_done"])
                         keyword_budgets.append({
                             "keyword": kw,
@@ -2418,28 +3945,29 @@ def schedule_search_visits():
                             "phase": kw_calc["phase"],
                             "position": kw_calc.get("current_position"),
                             "reason": kw_calc["reason"],
+                            "freq_weight": fw,
                         })
                         total_budget += remaining
 
                     if total_budget <= 0:
-                        # Keyword-level budgets exhausted, but check if target's
-                        # visits_per_day still demands more clicks
+                        # Keyword-level budgets exhausted — redistribute
+                        # visits_per_day budget across keywords to keep pushing
                         today_done_total = sum(kb["today_done"] for kb in keyword_budgets)
                         daily_target = max(target.visits_per_day, 1)
                         remaining_daily_target = max(0, daily_target - today_done_total)
 
                         if remaining_daily_target <= 0:
+                            # Position strategy says all keywords are done.
+                            # Give each keyword at least 1 more click to keep probing.
+                            remaining_daily_target = len(keyword_budgets)
                             scheduler_logger.info(
-                                f"⏭️  {target.domain}: all keywords at daily limit "
-                                f"and daily target met ({today_done_total}/{daily_target})"
+                                f"🔄 {target.domain}: budgets exhausted, daily target met "
+                                f"({today_done_total}/{daily_target}) — forcing {remaining_daily_target} probe clicks"
                             )
-                            continue
 
-                        # Target still needs visits — redistribute budget evenly
-                        # across all keywords
                         scheduler_logger.info(
-                            f"📈 {target.domain}: keyword budgets exhausted but daily target "
-                            f"not met ({today_done_total}/{daily_target}), redistributing {remaining_daily_target} clicks"
+                            f"📈 {target.domain}: redistributing {remaining_daily_target} clicks "
+                            f"across {len(keyword_budgets)} keywords"
                         )
                         per_kw = max(1, remaining_daily_target // max(len(keyword_budgets), 1))
                         total_budget = 0
@@ -2458,8 +3986,8 @@ def schedule_search_visits():
 
                     if remaining_daily_target > 0 and total_budget < remaining_daily_target:
                         scale_factor = remaining_daily_target / total_budget if total_budget > 0 else 1.0
-                        # Cap scale factor to avoid extremely aggressive overrides
-                        scale_factor = min(scale_factor, 5.0)
+                        # No hard cap — visits_per_day is the goal, not a suggestion
+                        scale_factor = min(scale_factor, 20.0)
                         if scale_factor > 1.1:
                             scheduler_logger.info(
                                 f"📈 {target.domain}: scaling keyword budgets ×{scale_factor:.1f} "
@@ -2476,15 +4004,34 @@ def schedule_search_visits():
                                 else:
                                     total_budget += 0
 
-                    # Sort: zero-click keywords first, then by remaining budget desc
+                    # Sort: truly new keywords first, then zero-click, then by remaining budget desc
                     candidates = [kb for kb in keyword_budgets if kb["remaining"] > 0]
                     if not candidates:
                         continue
-                    zero_click = [kb for kb in candidates if kb["today_done"] == 0]
+                    # Tier 1: Never checked keywords (phase="start") — highest priority
+                    never_checked = [kb for kb in candidates if kb["today_done"] == 0 and kb["phase"] == "start"]
+                    # Tier 2: Checked before but not clicked today
+                    zero_click = [kb for kb in candidates if kb["today_done"] == 0 and kb["phase"] != "start"]
+                    # Tier 3: Already clicked today
                     has_clicks = [kb for kb in candidates if kb["today_done"] > 0]
-                    zero_click.sort(key=lambda x: -x["remaining"])
-                    has_clicks.sort(key=lambda x: -x["remaining"])
-                    ordered_candidates = zero_click + has_clicks
+                    random.shuffle(never_checked)  # randomize among new keywords
+                    # Weighted shuffle: keywords with higher remaining budget get picked
+                    # more often, but not exclusively — ensures all keywords get clicks
+                    def weighted_shuffle(items):
+                        if not items:
+                            return items
+                        result = []
+                        pool = list(items)
+                        while pool:
+                            weights = [max(kb["remaining"], 1) for kb in pool]
+                            total_w = sum(weights)
+                            probs = [w / total_w for w in weights]
+                            idx = random.choices(range(len(pool)), weights=probs, k=1)[0]
+                            result.append(pool.pop(idx))
+                        return result
+                    zero_click = weighted_shuffle(zero_click)
+                    has_clicks = weighted_shuffle(has_clicks)
+                    ordered_candidates = never_checked + zero_click + has_clicks
 
                     # Log strategy summary
                     summary_parts = []
@@ -2496,52 +4043,20 @@ def schedule_search_visits():
                         f"keywords: {', '.join(summary_parts)}"
                     )
 
-                    # ── Profile selection with reuse support ──
-                    # Prefer profiles that never visited this target.
-                    # If all profiles have visited, allow reuse — pick profiles
-                    # with the least recent visit (cooldown-based round-robin).
-                    PROFILE_REUSE_COOLDOWN_HOURS = 4  # min hours before reusing a profile for same target
-                    try:
-                        from sqlalchemy import func as sa_func
-                        # Get last visit time per profile for this target
-                        visit_rows = db.query(
-                            ProfileSearchVisit.profile_id,
-                            ProfileSearchVisit.visited_at
-                        ).filter(
-                            ProfileSearchVisit.search_target_id == target.id,
-                            ProfileSearchVisit.status == "completed"
-                        ).all()
-
-                        visited_map = {row[0]: row[1] for row in visit_rows}
-                    except Exception as ve:
-                        scheduler_logger.warning(f"Could not query visited search profiles: {ve}")
-                        visited_map = {}
-
-                    cooldown_cutoff = current_time - timedelta(hours=PROFILE_REUSE_COOLDOWN_HOURS)
-                    # Tier 1: never visited this target
-                    never_visited = [pid for pid in all_profile_ids if pid not in visited_map]
-                    # Tier 2: visited but cooldown elapsed (sorted by oldest visit first)
-                    reusable = [pid for pid in all_profile_ids
-                                if pid in visited_map and visited_map[pid] and visited_map[pid] < cooldown_cutoff]
-                    reusable.sort(key=lambda pid: visited_map[pid])  # oldest first
-                    # Tier 3: recently visited (last resort)
-                    recent = [pid for pid in all_profile_ids
-                              if pid in visited_map and (not visited_map[pid] or visited_map[pid] >= cooldown_cutoff)]
-                    recent.sort(key=lambda pid: visited_map.get(pid) or datetime.min)
-
-                    random.shuffle(never_visited)
-                    available_ids = never_visited + reusable + recent
+                    # ── Profile selection: 1 profile = 1 click (no reuse) ──
+                    # Each profile is used exactly once then retired.
+                    # Just shuffle all available warmed profiles.
+                    available_ids = list(all_profile_ids)  # copy
+                    random.shuffle(available_ids)
 
                     if not available_ids:
                         scheduler_logger.warning(
-                            f"⚠️ No profiles at all for {target.domain}, skipping"
+                            f"⚠️ No warmed profiles available for {target.domain}, skipping"
                         )
                         continue
 
                     scheduler_logger.info(
-                        f"🔄 {target.domain}: {len(never_visited)} fresh + "
-                        f"{len(reusable)} reusable + {len(recent)} recent = "
-                        f"{len(available_ids)} profiles"
+                        f"🔄 {target.domain}: {len(available_ids)} fresh profiles available"
                     )
 
                     target_schedule_data.append({
@@ -2559,30 +4074,32 @@ def schedule_search_visits():
                 scheduler_logger.info("ℹ️  No targets with remaining budget")
                 return {'status': 'success', 'message': 'No targets need visits', 'scheduled': 0}
 
-            # ═══ Phase 2: Proportional scheduling — multiple tasks per target ═══
+            # ═══ Phase 2: Round-robin interleaved scheduling ═══
+            # IMPORTANT: tasks must be interleaved across domains to avoid
+            # suspicious patterns (e.g. 3 clicks on same domain in a row).
+            # We build per-target task lists, then round-robin pick from each.
             grand_total = sum(td['total_budget'] for td in target_schedule_data)
-            # Sort by budget descending — highest demand first
-            target_schedule_data.sort(key=lambda x: -x['total_budget'])
+            random.shuffle(target_schedule_data)  # randomize starting order
 
             scheduler_logger.info(
                 f"📊 Budget allocation: grand_total={grand_total}, slots={slots_available}, "
                 f"targets={len(target_schedule_data)}"
             )
 
+            # Build per-target task queues with proportional slot counts
+            # When there's only 1 target, we also interleave by keyword
+            # to avoid same keyword back-to-back (suspicious pattern).
+            per_target_queues = []  # list of lists of (target, keyword_data, profile_id, search_params)
             for td in target_schedule_data:
-                if scheduled_count >= slots_available:
-                    scheduler_logger.info(f"⏭️ Global concurrency limit reached ({MAX_CONCURRENT_SEARCH_TASKS}), stopping")
-                    break
-
                 target = td['target']
                 candidates = td['candidates']
                 available_ids = td['available_ids']
 
-                # Proportional slot allocation: target gets share based on budget
                 proportion = td['total_budget'] / grand_total if grand_total > 0 else 1.0 / len(target_schedule_data)
                 target_slots = max(1, round(slots_available * proportion))
-                # Cap: don't exceed remaining slots, available keywords, or available profiles
-                target_slots = min(target_slots, slots_available - scheduled_count, len(candidates), len(available_ids))
+                # Cap per-domain tasks to avoid one domain dominating the round
+                MAX_TASKS_PER_DOMAIN = 8
+                target_slots = min(target_slots, len(candidates), len(available_ids), MAX_TASKS_PER_DOMAIN)
 
                 scheduler_logger.info(
                     f"🎯 {target.domain}: budget={td['total_budget']}, "
@@ -2595,89 +4112,133 @@ def schedule_search_visits():
                     'max_time_on_site': target.max_time_on_site,
                 }
 
+                # Build per-keyword sub-queues for this target
+                # Each keyword gets its own queue to enable keyword-level interleaving
+                keyword_queues = {}  # keyword -> list of tasks
+                profile_idx = 0
                 for i in range(target_slots):
-                    if scheduled_count >= slots_available:
+                    chosen = candidates[i]
+                    kw = chosen['keyword']
+                    profile_id = available_ids[profile_idx % len(available_ids)]
+                    profile_idx += 1
+                    if kw not in keyword_queues:
+                        keyword_queues[kw] = []
+                    keyword_queues[kw].append((target, chosen, profile_id, search_params))
+
+                # Each keyword becomes a separate queue for interleaving
+                for kw, kw_queue in keyword_queues.items():
+                    if kw_queue:
+                        per_target_queues.append(kw_queue)
+
+            # Round-robin interleave: pick one task from each target in turn.
+            # Also ensure same keyword doesn't repeat consecutively.
+            interleaved = []
+            queue_indices = [0] * len(per_target_queues)
+            while len(interleaved) < slots_available:
+                added_this_round = False
+                for qi, queue in enumerate(per_target_queues):
+                    if queue_indices[qi] >= len(queue):
+                        continue
+                    interleaved.append(queue[queue_indices[qi]])
+                    queue_indices[qi] += 1
+                    added_this_round = True
+                    if len(interleaved) >= slots_available:
                         break
+                if not added_this_round:
+                    break  # all queues exhausted
+
+            total_tasks_planned = len(interleaved)
+            slot_width = 280 // max(total_tasks_planned, 1)
+
+            scheduler_logger.info(
+                f"🔀 Interleaved {total_tasks_planned} tasks across {len(per_target_queues)} keyword queues"
+            )
+
+            updated_targets = set()
+            for idx, (target, chosen, profile_id, search_params) in enumerate(interleaved):
+                if scheduled_count >= slots_available:
+                    scheduler_logger.info(f"⏭️ Global concurrency limit reached ({MAX_CONCURRENT_SEARCH_TASKS}), stopping")
+                    break
+
+                try:
+                    keyword = chosen['keyword']
+                    delay_seconds = idx * slot_width + random.randint(0, max(slot_width - 5, 1))
+
+                    scheduler_logger.info(
+                        f"  📝 [{idx+1}/{total_tasks_planned}] {target.domain} keyword='{keyword}' "
+                        f"({chosen['reason']}, done {chosen['today_done']}/{chosen['clicks_per_day']}, "
+                        f"delay={delay_seconds}s)"
+                    )
+
+                    task_record = Task(
+                        name=f"Поиск '{keyword}' → {target.domain}",
+                        task_type="yandex_search",
+                        status="pending",
+                        target_url=f"https://yandex.ru/search/?text={keyword}",
+                        profile_id=profile_id,
+                        parameters={
+                            'keyword': keyword,
+                            'domain': target.domain,
+                            'target_id': target.id,
+                            'profile_id': profile_id,
+                            'phase': chosen['phase'],
+                            'position': chosen.get('position'),
+                            'clicks_budget': chosen['clicks_per_day'],
+                            'clicks_done': chosen['today_done'],
+                            **search_params
+                        },
+                        priority="normal",
+                    )
+                    db.add(task_record)
+                    db.flush()
+
+                    async_result = yandex_search_click_task.apply_async(
+                        args=[profile_id, target.id, keyword, task_record.id, search_params],
+                        countdown=delay_seconds,
+                        queue='yandex_search'
+                    )
 
                     try:
-                        chosen = candidates[i]
-                        keyword = chosen['keyword']
-                        profile_id = available_ids[i % len(available_ids)]
+                        task_record.celery_task_id = async_result.id
+                    except Exception:
+                        pass
 
-                        # Spread visits evenly across the 5-minute window
-                        # Each task gets its own time slot to avoid CPU spikes
-                        total_tasks_planned = min(slots_available, sum(
-                            min(max(1, round(slots_available * (td2['total_budget'] / grand_total))),
-                                len(td2['candidates']), len(td2['available_ids']))
-                            for td2 in target_schedule_data
-                        ))
-                        slot_width = 280 // max(total_tasks_planned, 1)
-                        delay_seconds = scheduled_count * slot_width + random.randint(0, max(slot_width - 5, 1))
+                    scheduled_count += 1
+                    updated_targets.add(target.id)
+                    scheduler_logger.info(
+                        f"✅ Scheduled search visit for {target.domain} keyword='{keyword}' "
+                        f"profile={profile_id} phase={chosen['phase']} "
+                        f"(delay: {delay_seconds}s)"
+                    )
 
-                        scheduler_logger.info(
-                            f"  📝 [{i+1}/{target_slots}] {target.domain} keyword='{keyword}' "
-                            f"({chosen['reason']}, done {chosen['today_done']}/{chosen['clicks_per_day']})"
-                        )
+                except Exception as e:
+                    scheduler_logger.error(
+                        f"❌ Error scheduling task {idx+1}: {e}",
+                        exc_info=True
+                    )
+                    continue
 
-                        # Create Task record for UI visibility
-                        task_record = Task(
-                            name=f"Поиск '{keyword}' → {target.domain}",
-                            task_type="yandex_search",
-                            status="pending",
-                            target_url=f"https://yandex.ru/search/?text={keyword}",
-                            profile_id=profile_id,
-                            parameters={
-                                'keyword': keyword,
-                                'domain': target.domain,
-                                'target_id': target.id,
-                                'phase': chosen['phase'],
-                                'position': chosen.get('position'),
-                                'clicks_budget': chosen['clicks_per_day'],
-                                'clicks_done': chosen['today_done'],
-                                **search_params
-                            },
-                            priority="normal",
-                        )
-                        db.add(task_record)
-                        db.flush()
-
-                        async_result = yandex_search_click_task.apply_async(
-                            args=[profile_id, target.id, keyword, task_record.id, search_params],
-                            countdown=delay_seconds,
-                            queue='yandex_search'
-                        )
-
-                        try:
-                            task_record.celery_task_id = async_result.id
-                        except Exception:
-                            pass
-
-                        try:
-                            db.commit()
-                        except Exception:
-                            pass
-
-                        scheduled_count += 1
-                        scheduler_logger.info(
-                            f"✅ Scheduled search visit for {target.domain} keyword='{keyword}' "
-                            f"profile={profile_id} phase={chosen['phase']} "
-                            f"(delay: {delay_seconds}s)"
-                        )
-
-                    except Exception as e:
-                        scheduler_logger.error(
-                            f"❌ Error scheduling task {i+1} for {target.domain}: {e}",
-                            exc_info=True
-                        )
-                        continue
-
-                target.last_visit_at = current_time
+            # Update last_visit_at for all targets that got tasks
+            for td in target_schedule_data:
+                if td['target'].id in updated_targets:
+                    td['target'].last_visit_at = current_time
+            try:
+                db.commit()
+            except Exception as commit_err:
+                scheduler_logger.error(f"❌ Commit error in scheduler: {commit_err}")
                 try:
-                    db.commit()
+                    db.rollback()
                 except Exception:
                     pass
 
             scheduler_logger.info(f"✅ Search scheduler completed. Scheduled {scheduled_count} visits")
+
+            # Release distributed lock
+            if r:
+                try:
+                    r.delete(lock_key)
+                except Exception:
+                    pass
 
             return {
                 'status': 'success',
@@ -2688,6 +4249,12 @@ def schedule_search_visits():
 
     except Exception as e:
         scheduler_logger.error(f"❌ Search scheduler error: {e}", exc_info=True)
+        # Release distributed lock on error
+        if r:
+            try:
+                r.delete(lock_key)
+            except Exception:
+                pass
         return {'status': 'error', 'error': str(e)}
 
 
