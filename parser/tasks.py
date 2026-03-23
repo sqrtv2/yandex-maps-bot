@@ -22,7 +22,7 @@ def parse_yandex_maps_task(self, parse_task_id: int):
     Celery task: open Yandex Maps, search for companies, collect their data.
     """
     from core.browser_manager import BrowserManager
-    from parser import parse_yandex_maps_search, build_search_url
+    from parser import parse_yandex_maps_search, build_search_url, extract_emails_from_websites
     
     browser_manager = None
     browser_id = None
@@ -93,6 +93,17 @@ def parse_yandex_maps_task(self, parse_task_id: int):
             driver, search_url, max_items=max_items, on_progress=on_progress
         )
         
+        # Extract emails from company websites (for those without email)
+        with get_db_session() as db:
+            task = db.query(ParseTask).filter(ParseTask.id == parse_task_id).first()
+            task.add_log(f"📧 Извлечение email с сайтов компаний...")
+            db.commit()
+        
+        try:
+            companies = extract_emails_from_websites(driver, companies)
+        except Exception as e:
+            logger.warning(f"⚠️ Email extraction from websites failed: {e}")
+        
         # Save to database
         saved_count = 0
         with get_db_session() as db:
@@ -145,18 +156,26 @@ def parse_yandex_maps_task(self, parse_task_id: int):
     
     except Exception as e:
         logger.error(f"❌ Parse task {parse_task_id} failed: {e}")
-        with get_db_session() as db:
-            task = db.query(ParseTask).filter(ParseTask.id == parse_task_id).first()
-            if task:
-                task.status = ParseTaskStatus.FAILED
-                task.error_message = str(e)[:1000]
-                task.completed_at = datetime.utcnow()
-                task.add_log(f"❌ Ошибка: {str(e)[:500]}")
-                db.commit()
         
+        # Try to retry first
         try:
+            with get_db_session() as db:
+                task = db.query(ParseTask).filter(ParseTask.id == parse_task_id).first()
+                if task:
+                    task.error_message = str(e)[:1000]
+                    task.add_log(f"❌ Ошибка: {str(e)[:500]}")
+                    db.commit()
             raise self.retry(exc=e)
         except self.MaxRetriesExceededError:
+            # All retries exhausted — mark as failed
+            with get_db_session() as db:
+                task = db.query(ParseTask).filter(ParseTask.id == parse_task_id).first()
+                if task:
+                    task.status = ParseTaskStatus.FAILED
+                    task.error_message = str(e)[:1000]
+                    task.completed_at = datetime.utcnow()
+                    task.add_log(f"❌ Все попытки исчерпаны. Финальная ошибка: {str(e)[:500]}")
+                    db.commit()
             return {'status': 'failed', 'error': str(e)}
     
     finally:
@@ -189,3 +208,62 @@ def _get_random_proxy():
     except Exception as e:
         logger.warning(f"Could not get proxy: {e}")
     return None
+
+
+@celery_app.task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=60,
+                 soft_time_limit=1800, time_limit=2100,
+                 name='tasks.parser.extract_emails_task')
+def extract_emails_task(self, search_query: str = None):
+    """
+    Celery task: fetch company websites via HTTP and extract emails
+    for parsed companies that have a website but no email.
+    No browser needed — uses fast HTTP requests.
+    """
+    from parser import extract_emails_from_websites
+
+    try:
+        with get_db_session() as db:
+            query = db.query(ParsedCompany).filter(
+                ParsedCompany.website.isnot(None),
+                ParsedCompany.website != '',
+                (ParsedCompany.email.is_(None)) | (ParsedCompany.email == ''),
+            )
+            if search_query:
+                query = query.filter(ParsedCompany.search_query == search_query)
+
+            companies_db = query.all()
+            if not companies_db:
+                logger.info("📧 No companies need email extraction")
+                return {'status': 'completed', 'found': 0, 'total': 0}
+
+            companies = []
+            company_ids = []
+            for c in companies_db:
+                companies.append({'website': c.website, 'name': c.name or ''})
+                company_ids.append(c.id)
+
+        logger.info(f"📧 Starting email extraction for {len(companies)} companies")
+
+        # Extract emails via HTTP (no browser needed)
+        companies = extract_emails_from_websites(None, companies)
+
+        # Save results
+        found_count = 0
+        with get_db_session() as db:
+            for i, comp in enumerate(companies):
+                if comp.get('email'):
+                    company_record = db.query(ParsedCompany).filter(
+                        ParsedCompany.id == company_ids[i]
+                    ).first()
+                    if company_record and not company_record.email:
+                        company_record.email = comp['email']
+                        company_record.updated_at = datetime.utcnow()
+                        found_count += 1
+            db.commit()
+
+        logger.info(f"📧 Email extraction complete: {found_count}/{len(companies)} emails found")
+        return {'status': 'completed', 'found': found_count, 'total': len(companies)}
+
+    except Exception as e:
+        logger.error(f"❌ Email extraction failed: {e}")
+        return {'status': 'failed', 'error': str(e)}

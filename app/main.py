@@ -584,9 +584,16 @@ async def create_profile(profile_data: Dict[str, Any], db: Session = Depends(get
         # Extract auto_start_warmup parameter (default: True for automatic warmup)
         auto_start_warmup = profile_data.get("auto_start_warmup", True)
 
+        # Generate proper Chrome UA if not provided
+        ua = profile_data.get("user_agent", "")
+        if not ua or not any(f"Chrome/{v}" in ua for v in ("143", "144", "145")):
+            from core.profile_generator import ProfileGenerator
+            _pg = ProfileGenerator()
+            ua = _pg._generate_user_agent(is_mobile=False)
+
         profile = BrowserProfile(
             name=profile_data.get("name", "New Profile"),
-            user_agent=profile_data.get("user_agent", ""),
+            user_agent=ua,
             viewport_width=profile_data.get("viewport_width", 1366),
             viewport_height=profile_data.get("viewport_height", 768),
             timezone=profile_data.get("timezone", "Europe/Moscow"),
@@ -796,10 +803,16 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
         config = request_data.get("config", {})
         auto_start_warmup = request_data.get("auto_start_warmup", False)
         randomize_all = request_data.get("randomize_all", True)
+        mobile_percentage = request_data.get("mobile_percentage", 0)
 
         # Validate count
         if count < 1 or count > 10000:
             raise HTTPException(status_code=400, detail="Count must be between 1 and 10 000")
+
+        # Validate mobile_percentage
+        mobile_percentage = max(0, min(100, int(mobile_percentage)))
+        mobile_count = round(count * mobile_percentage / 100)
+        desktop_count = count - mobile_count
 
         # Predefined options for randomization — only Russian locales for Yandex
         viewports = [
@@ -819,13 +832,14 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
 
         platforms = ["Win32", "MacIntel", "Linux x86_64"]
 
-        # Pre-generate a pool of user-agents (much faster than calling ua per profile)
-        ua = UserAgent()
+        # Pre-generate a pool of Chrome user-agents matching installed Chromium version
+        from core.profile_generator import ProfileGenerator as _PG
+        _pg_for_ua = _PG()
         UA_POOL_SIZE = min(count, 200)
         ua_pool = []
         for _ in range(UA_POOL_SIZE):
             try:
-                ua_pool.append(ua.random)
+                ua_pool.append(_pg_for_ua._generate_user_agent(is_mobile=False))
             except Exception:
                 ua_pool.append(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -841,6 +855,17 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
         fixed_tz = config.get("timezone") if config.get("timezone") != "random" else None
         fixed_lang = config.get("language") if config.get("language") != "random" else None
         fixed_plat = config.get("platform") if config.get("platform") != "random" else None
+
+        # Initialize ProfileGenerator for mobile profiles
+        from core.profile_generator import ProfileGenerator
+        profile_gen = ProfileGenerator() if mobile_count > 0 else None
+
+        # Pre-decide which indices will be mobile (spread evenly)
+        mobile_indices = set()
+        if mobile_count > 0 and count > 0:
+            step = count / mobile_count
+            for mi in range(mobile_count):
+                mobile_indices.add(int(mi * step))
 
         BATCH_SIZE = 500
         total_created = 0
@@ -876,20 +901,33 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
 
             for i in range(batch_start + 1, batch_end + 1):
                 profile_name = f"{name_prefix}{existing_max + i}"
+                global_idx = i - 1  # 0-based index
+                is_mobile = global_idx in mobile_indices
 
-                if randomize_all:
-                    w, h = random.choice(viewports)
-                    tz = random.choice(timezones)
-                    lang = random.choice(languages)
-                    plat = random.choice(platforms)
+                if is_mobile and profile_gen:
+                    # Use ProfileGenerator for proper mobile fingerprints
+                    gen_profile = profile_gen.generate_profile(profile_name=profile_name, is_mobile=True)
+                    vp = gen_profile.get("viewport", {})
+                    w = vp.get("width", 412)
+                    h = vp.get("height", 915)
+                    tz = gen_profile.get("timezone", "Europe/Moscow")
+                    lang = gen_profile.get("language", "ru-RU")
+                    plat = gen_profile.get("platform", "Linux armv81")
+                    ua_str = gen_profile.get("user_agent", random.choice(ua_pool))
                 else:
-                    w = fixed_width or random.choice(viewports)[0]
-                    h = fixed_height or random.choice(viewports)[1]
-                    tz = fixed_tz or random.choice(timezones)
-                    lang = fixed_lang or random.choice(languages)
-                    plat = fixed_plat or random.choice(platforms)
-
-                ua_str = random.choice(ua_pool)
+                    # Desktop profile — original logic
+                    if randomize_all:
+                        w, h = random.choice(viewports)
+                        tz = random.choice(timezones)
+                        lang = random.choice(languages)
+                        plat = random.choice(platforms)
+                    else:
+                        w = fixed_width or random.choice(viewports)[0]
+                        h = fixed_height or random.choice(viewports)[1]
+                        tz = fixed_tz or random.choice(timezones)
+                        lang = fixed_lang or random.choice(languages)
+                        plat = fixed_plat or random.choice(platforms)
+                    ua_str = random.choice(ua_pool)
 
                 # Assign AI persona if available
                 persona = None
@@ -909,6 +947,7 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
                     "timezone": tz,
                     "language": lang,
                     "platform": plat,
+                    "is_mobile": is_mobile,
                     "status": "created",
                     "is_active": True,
                     "warmup_completed": False,
@@ -947,8 +986,8 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
         last_id_row = db.query(func.max(BrowserProfile.id)).scalar()
         first_id_row = last_id_row - total_created + 1 if last_id_row else None
 
-        logger.info(f"Bulk created {total_created} profiles (ids {first_id_row}-{last_id_row})")
-        await manager.broadcast(f"Bulk created {total_created} profiles")
+        logger.info(f"Bulk created {total_created} profiles (ids {first_id_row}-{last_id_row}, desktop={desktop_count}, mobile={mobile_count})")
+        await manager.broadcast(f"Bulk created {total_created} profiles ({mobile_count} mobile)")
 
         # Trigger async warmup sites generation for profiles with personas
         warmup_sites_task_id = None
@@ -1010,6 +1049,8 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
         return {
             "message": "Profiles created successfully",
             "created_count": total_created,
+            "desktop_count": desktop_count,
+            "mobile_count": mobile_count,
             "first_id": first_id_row,
             "last_id": last_id_row,
             "warmup_started": warmup_started,

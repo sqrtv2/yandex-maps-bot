@@ -468,10 +468,35 @@
                         </div>
                     </div>
 
+                    <hr class="my-3">
+                    <h6>📱 Mobile Profiles</h6>
+                    <div class="row align-items-center">
+                        <div class="col-md-8">
+                            <label for="mobilePercentage" class="form-label">
+                                Mobile percentage: <strong id="mobilePercentageLabel">30%</strong>
+                            </label>
+                            <input type="range" class="form-range" id="mobilePercentage" min="0" max="100" step="5" value="30"
+                                oninput="updateMobileLabel(this.value)">
+                            <div class="d-flex justify-content-between text-muted" style="font-size: 0.75rem;">
+                                <span>0% (all desktop)</span>
+                                <span>100% (all mobile)</span>
+                            </div>
+                        </div>
+                        <div class="col-md-4">
+                            <div class="card bg-light">
+                                <div class="card-body py-2 px-3">
+                                    <small class="text-muted">Preview:</small><br>
+                                    <span id="mobilePreviewDesktop">🖥️ 70 desktop</span><br>
+                                    <span id="mobilePreviewMobile">📱 30 mobile</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="mt-3">
                         <div class="alert alert-info">
                             <i class="bi bi-info-circle"></i>
-                            <strong>Note:</strong> Profiles are created in batches of 500. Each profile gets unique fingerprints. Creating 10 000 profiles takes ~15-30 seconds.
+                            <strong>Note:</strong> Profiles are created in batches of 500. Each profile gets unique fingerprints. Mobile profiles get Android user agents, mobile viewports, and touch emulation.
                         </div>
                     </div>
 
@@ -626,7 +651,16 @@ function updateProfilesTable(profiles) {
             <td><strong>${profile.name}</strong></td>
             <td><span class="badge bg-${getStatusColor(profile.status)}">${profile.status}</span></td>
             <td><small title="${profile.user_agent || 'Auto-generated'}">${
-                profile.user_agent ? profile.user_agent.substring(0, 25) + '...' : 'Auto'
+                profile.user_agent ? (() => {
+                    const ua = profile.user_agent;
+                    const chrome = ua.match(/Chrome\/(\d+)/);
+                    const ff = ua.match(/Firefox\/(\d+)/);
+                    const safari = ua.match(/Version\/[\d.]+\s+Safari/);
+                    const mobile = ua.includes('Mobile');
+                    const os = ua.includes('Windows') ? 'Win' : ua.includes('Mac') ? 'Mac' : ua.includes('Android') ? 'Android' : 'Linux';
+                    const browser = chrome ? 'Chrome/' + chrome[1] : ff ? 'Firefox/' + ff[1] : safari ? 'Safari' : '?';
+                    return (mobile ? '📱 ' : '') + os + ' ' + browser;
+                })() : 'Auto'
             }</small></td>
             <td><small>${profile.viewport_width}x${profile.viewport_height}</small></td>
             <td>
@@ -1211,6 +1245,7 @@ function bulkCreateProfiles() {
     const namePrefix = document.getElementById('profileNamePrefix').value;
     const autoStartWarmup = document.getElementById('autoStartWarmup').checked;
     const randomizeAll = document.getElementById('randomizeAll').checked;
+    const mobilePercentage = parseInt(document.getElementById('mobilePercentage').value) || 0;
 
     if (count < 1 || count > 10000) {
         alert('Enter a number between 1 and 10 000');
@@ -1236,7 +1271,8 @@ function bulkCreateProfiles() {
         name_prefix: namePrefix,
         config: config,
         auto_start_warmup: autoStartWarmup,
-        randomize_all: randomizeAll
+        randomize_all: randomizeAll,
+        mobile_percentage: mobilePercentage
     };
 
     // Show progress UI
@@ -1291,8 +1327,13 @@ function bulkCreateProfiles() {
             document.getElementById('profileCount').value = 100;
             document.getElementById('profileNamePrefix').value = 'Profile-';
             document.getElementById('randomizeAll').checked = true;
+            document.getElementById('mobilePercentage').value = 30;
+            updateMobileLabel(30);
 
             let msg = `Создано ${result.created_count.toLocaleString()} профилей (ID ${result.first_id}–${result.last_id})`;
+            if (result.mobile_count > 0) {
+                msg += `\n🖥️ Десктоп: ${result.desktop_count}  📱 Мобильных: ${result.mobile_count}`;
+            }
             if (result.warmup_sites_task_id) {
                 msg += '\n🌐 Генерация сайтов нагула (50 шт/профиль) запущена в фоне.';
             }
@@ -1315,6 +1356,31 @@ function bulkCreateProfiles() {
         if (cancelBtn) cancelBtn.disabled = false;
     });
 }
+
+// Mobile percentage helpers
+function updateMobileLabel(val) {
+    document.getElementById('mobilePercentageLabel').textContent = val + '%';
+    const count = parseInt(document.getElementById('profileCount').value) || 100;
+    updateMobilePreview(count, val);
+}
+
+function updateMobilePreview(count, pct) {
+    const mobile = Math.round(count * pct / 100);
+    const desktop = count - mobile;
+    document.getElementById('mobilePreviewDesktop').textContent = '🖥️ ' + desktop + ' desktop';
+    document.getElementById('mobilePreviewMobile').textContent = '📱 ' + mobile + ' mobile';
+}
+
+// Update preview when count changes
+document.addEventListener('DOMContentLoaded', function() {
+    const countInput = document.getElementById('profileCount');
+    if (countInput) {
+        countInput.addEventListener('input', function() {
+            const pct = parseInt(document.getElementById('mobilePercentage').value) || 0;
+            updateMobilePreview(parseInt(this.value) || 0, pct);
+        });
+    }
+});
 
 // Helper functions for random generation
 function getRandomViewportWidth() {

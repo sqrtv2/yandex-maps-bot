@@ -40,6 +40,7 @@ class SearchPositionHistory(Base):
     task_id = Column(Integer, nullable=True)  # Related task ID
     clicked = Column(Boolean, default=False)  # Was link actually clicked?
     browse_time = Column(Float, nullable=True)  # Time spent on site (seconds)
+    referrer_used = Column(Boolean, default=False)  # Was referrer site visited before search?
     
     # Timestamp
     checked_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -62,5 +63,6 @@ class SearchPositionHistory(Base):
             "task_id": self.task_id,
             "clicked": self.clicked,
             "browse_time": self.browse_time,
+            "referrer_used": self.referrer_used,
             "checked_at": self.checked_at.isoformat() if self.checked_at else None,
         }

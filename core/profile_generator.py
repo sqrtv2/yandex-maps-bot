@@ -94,14 +94,19 @@ class ProfileGenerator:
             "QuickTime Plug-in", "VLC Web Plugin", "Adobe Acrobat"
         ]
 
-        # WebGL vendor/renderer combinations
+        # WebGL vendor/renderer combinations (must match ANGLE format on Chrome)
         self.webgl_vendors = [
-            ("Google Inc.", "ANGLE (Intel HD Graphics 4000 Direct3D11 vs_5_0 ps_5_0)"),
-            ("Google Inc.", "ANGLE (NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0)"),
-            ("Google Inc.", "ANGLE (AMD Radeon R9 200 Series Direct3D11 vs_5_0 ps_5_0)"),
-            ("Mozilla", "Intel Open Source Technology Center Mesa DRI Intel(R) HD Graphics"),
-            ("WebKit", "AMD Radeon Pro 560X OpenGL Engine"),
-            ("WebKit", "Intel(R) Iris(TM) Plus Graphics 640"),
+            ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) HD Graphics 4000 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+            ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+            ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+            ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+            ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+            ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+            ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+            ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+            ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 XT Direct3D11 vs_5_0 ps_5_0, D3D11)"),
+            ("Google Inc. (Apple)", "ANGLE (Apple, Apple M1, OpenGL 4.1)"),
+            ("Google Inc. (Apple)", "ANGLE (Apple, Apple M2, OpenGL 4.1)"),
         ]
 
     def generate_profile(self, profile_name: str = None, is_mobile: bool = False) -> Dict:
@@ -369,17 +374,10 @@ class ProfileGenerator:
     def _generate_chrome_flags(self) -> List[str]:
         """Generate Chrome command line flags for stealth.
         
-        Only include flags that a normal Chrome user would have.
-        Avoid automation-revealing flags like --disable-web-security,
-        --metrics-recording-only, etc.
+        Only include flags that a normal Chrome user might have.
         """
-        # These are safe flags that don't reveal automation
         flags = [
-            "--no-first-run",
-            "--no-default-browser-check",
             "--disable-features=TranslateUI",
-            "--disable-popup-blocking",
-            "--disable-prompt-on-repost",
         ]
         return flags
 

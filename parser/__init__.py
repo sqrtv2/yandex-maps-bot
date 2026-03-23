@@ -10,12 +10,11 @@ import logging
 from typing import Dict, List, Optional
 from urllib.parse import quote, unquote
 
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
+from core.playwright_driver import (
+    By, EC, expected_conditions,
+    PlaywrightWait as WebDriverWait,
     TimeoutException, NoSuchElementException, WebDriverException,
-    StaleElementReferenceException
+    StaleElementReferenceException,
 )
 
 logger = logging.getLogger(__name__)
@@ -396,15 +395,62 @@ def _classify_social(href: str, link, result: dict):
 
 
 def _extract_email(driver) -> Optional[str]:
-    """Extract email from the card."""
+    """Extract email from the card (mailto links + text-based search)."""
+    # 1. mailto: links
     try:
         elements = driver.find_elements(By.CSS_SELECTOR, 'a[href^="mailto:"]')
         for el in elements:
             email = (el.get_attribute('href') or '').replace('mailto:', '').strip()
-            if email and '@' in email:
+            if email and '@' in email and _is_valid_company_email(email):
                 return email
     except Exception:
         pass
+
+    # 2. Text in contact blocks that looks like email
+    try:
+        contact_selectors = [
+            '.business-contacts-view',
+            '.orgpage-contacts-view',
+            '.card-feature-view',
+        ]
+        for sel in contact_selectors:
+            elements = driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in elements:
+                text = el.text or ''
+                found = _find_email_in_text(text)
+                if found:
+                    return found
+    except Exception:
+        pass
+
+    return None
+
+
+# Email patterns to exclude (Yandex service emails, single-char local parts)
+_EMAIL_BLACKLIST = {'support@maps.yandex.ru', 'webmaps-revolution@yandex-team.ru',
+                    'm-maps@support.yandex.ru'}
+_EMAIL_REGEX = re.compile(r'[a-zA-Z0-9_.+-]{2,}@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}')
+
+
+def _is_valid_company_email(email: str) -> bool:
+    """Check if email looks like a real company email (not Yandex service)."""
+    email_lower = email.lower().strip()
+    if email_lower in _EMAIL_BLACKLIST:
+        return False
+    if any(x in email_lower for x in ['yandex-team', 'maps.yandex', 'support.yandex']):
+        return False
+    local = email_lower.split('@')[0]
+    if len(local) < 2:
+        return False
+    return True
+
+
+def _find_email_in_text(text: str) -> Optional[str]:
+    """Find a valid company email in a block of text."""
+    matches = _EMAIL_REGEX.findall(text)
+    for m in matches:
+        if _is_valid_company_email(m):
+            return m
     return None
 
 
@@ -425,3 +471,99 @@ def build_search_url(query: str, region: str = "Москва") -> str:
     base = "https://yandex.ru/maps/"
     search_text = f"{query} {region}" if region else query
     return f"{base}?text={quote(search_text)}"
+
+
+# ---------------------------------------------------------------------------
+# Website email extraction — fast HTTP-based (no browser needed)
+# ---------------------------------------------------------------------------
+
+def extract_emails_from_websites(driver, companies: List[Dict],
+                                  on_progress=None) -> List[Dict]:
+    """
+    For companies that have a website but no email, fetch the website via HTTP
+    and extract email from the HTML. Uses requests (fast) instead of Selenium.
+    Returns the updated list of companies.
+    """
+    need_email = [c for c in companies if c.get('website') and not c.get('email')]
+    if not need_email:
+        logger.info("📧 All companies already have email or no website — skipping")
+        return companies
+
+    logger.info(f"📧 Extracting emails from {len(need_email)} company websites...")
+    found_count = 0
+
+    for i, company in enumerate(need_email):
+        website = company['website']
+        name = company.get('name', '?')
+
+        try:
+            email = _extract_email_from_website_http(website)
+            if email:
+                company['email'] = email
+                found_count += 1
+                logger.info(f"  📧 [{i+1}/{len(need_email)}] {name}: {email}")
+        except Exception as e:
+            logger.debug(f"  ⚠️ [{i+1}/{len(need_email)}] {name}: {e}")
+
+        if on_progress:
+            on_progress(i + 1, found_count)
+
+    logger.info(f"📧 Email extraction complete: found {found_count}/{len(need_email)}")
+    return companies
+
+
+def _extract_email_from_website_http(website_url: str, timeout: int = 8) -> Optional[str]:
+    """Fetch company website via HTTP and extract email from HTML."""
+    import requests as req
+    from urllib.parse import urlparse
+
+    if not website_url.startswith(('http://', 'https://')):
+        website_url = 'https://' + website_url
+
+    parsed = urlparse(website_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.3',
+    }
+
+    pages = [website_url, base_url + '/contacts', base_url + '/kontakty']
+    seen = set()
+
+    for page_url in pages:
+        normalized = page_url.rstrip('/')
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+
+        try:
+            resp = req.get(page_url, headers=headers, timeout=timeout,
+                          allow_redirects=True, verify=False)
+            if resp.status_code != 200:
+                continue
+
+            html = resp.text[:200000]  # Limit to 200KB
+
+            # 1. mailto: links in HTML
+            mailto_matches = re.findall(r'href=["\']mailto:([^"\'?]+)', html, re.IGNORECASE)
+            for m in mailto_matches:
+                email = m.strip()
+                if _is_valid_company_email(email):
+                    return email
+
+            # 2. Email patterns in visible text (strip tags roughly)
+            text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<[^>]+>', ' ', text)
+            found = _find_email_in_text(text)
+            if found:
+                return found
+
+        except req.exceptions.RequestException:
+            continue
+        except Exception:
+            continue
+
+    return None

@@ -12,14 +12,12 @@ from datetime import datetime
 
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
+from core.playwright_driver import (
+    By, Keys, EC, expected_conditions,
+    PlaywrightActionChains as ActionChains,
+    PlaywrightWait as WebDriverWait,
     TimeoutException, NoSuchElementException, WebDriverException,
-    ElementClickInterceptedException
+    ElementClickInterceptedException,
 )
 
 from app.database import get_db_session, get_setting
@@ -473,7 +471,18 @@ def _url_path_has_captcha(url: str) -> bool:
 def detect_captcha_or_block(driver) -> bool:
     """Detect if we've been blocked or shown a captcha."""
     try:
-        # First check URL path — most reliable indicator
+        # First check if page is alive — page.url is cached and works on dead pages
+        try:
+            driver.execute_script("1")
+        except Exception as _alive_err:
+            _alive_str = str(_alive_err).lower()
+            if 'closed' in _alive_str or 'target' in _alive_str:
+                logger.warning("⚠️ Page is dead in detect_captcha_or_block — returning True (page not usable)")
+                return True  # Dead page = problem exists, don't treat as "no captcha"
+            # Timeout or other error — continue with URL check
+            pass
+
+        # Check URL path — most reliable indicator
         # IMPORTANT: Only check path, NOT query params (utm_referrer contains 'showcaptcha' on normal pages)
         try:
             current_url = driver.current_url.lower()
@@ -553,18 +562,9 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidos
     try:
         logger.info("🔧 Attempting to handle Yandex protection")
         
-        # Делаем скриншот для анализа
+        # Captcha debug screenshots disabled to save time
+        # (save_screenshot can timeout for 30s)
         screenshot_path = f"screenshots/captcha_debug_{int(time.time())}.png"
-        try:
-            driver.save_screenshot(screenshot_path)
-            logger.info(f"📸 Captcha screenshot saved: {screenshot_path}")
-            # Save page source for debug
-            html_path = screenshot_path.replace('.png', '.html')
-            with open(html_path, 'w', encoding='utf-8') as f:
-                f.write(driver.page_source)
-            logger.info(f"📄 Page source saved: {html_path}")
-        except Exception as e:
-            logger.warning(f"Failed to save screenshot: {e}")
 
         # Проверяем наличие Capsola API
         logger.info(f"🔑 Capsola check: enabled={settings.capsola_enabled}, key='{settings.capsola_api_key[:8]}...' (len={len(settings.capsola_api_key)})")
@@ -587,6 +587,9 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidos
                 except Exception:
                     logger.error("❌ Renderer still dead — cannot solve captcha")
                     return False
+            elif 'closed' in _init_str.lower() or 'target' in _init_str.lower():
+                logger.error(f"❌ Page/browser closed — cannot solve captcha: {_init_str[:200]}")
+                return False
             else:
                 raise
         page_source_lower = page_source.lower()
@@ -652,6 +655,32 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidos
         logger.info(f"🔍 Captcha detection: url_match={is_captcha_page}, source_match={is_smartcaptcha_in_source}")
         
         if is_captcha_page or is_smartcaptcha_in_source:
+            # === showcaptchaFAST: JS-only captcha, no checkbox/form ===
+            # Detect by URL path containing 'captchafast' OR page having tmgrdfrend (fingerprint JS)
+            # with no checkbox elements
+            is_captcha_fast = 'captchafast' in url_path_for_check
+            if not is_captcha_fast and 'tmgrdfrend' in page_source_lower:
+                # tmgrdfrend.fp.js is the fingerprint script unique to showcaptchaFAST
+                has_checkbox = any(kw in page_source_lower for kw in [
+                    'checkboxcaptcha', 'checkbox-captcha', 'smartcaptcha'
+                ])
+                if not has_checkbox:
+                    is_captcha_fast = True
+            
+            if is_captcha_fast:
+                logger.info(f"🚀 showcaptchaFAST detected in handle_yandex_protection — routing to fast handler")
+                try:
+                    result = _solve_showcaptcha_fast(driver)
+                except Exception as fast_err:
+                    logger.error(f"💀 showcaptchaFAST handler raised: {fast_err}")
+                    raise
+                try:
+                    driver.set_page_load_timeout(60)
+                    driver.set_script_timeout(30)
+                except Exception:
+                    pass
+                return result
+            
             logger.info(f"🎯 SmartCaptcha detected (url={is_captcha_page}, source={is_smartcaptcha_in_source})")
             result = _solve_yandex_showcaptcha(driver, screenshot_path, max_kaleidoscope_attempts=max_kaleidoscope_attempts)
             # Restore normal timeout after captcha solving (captcha sets 120s)
@@ -714,11 +743,103 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidos
         # Fallback: простое обновление
         return _try_simple_refresh(driver)
 
+    except SoftTimeLimitExceeded:
+        logger.error("⏰ SoftTimeLimitExceeded in handle_yandex_protection — re-raising")
+        raise
     except Exception as e:
+        err_str = str(e)
+        # Re-raise browser death exceptions so caller can retry with new proxy
+        if ('closed' in err_str.lower() or 'Target page' in err_str 
+            or 'Browser died' in err_str or 'PoW' in err_str):
+            logger.error(f"💀 Browser death in handle_yandex_protection — re-raising: {err_str[:200]}")
+            raise
         logger.error(f"Error handling Yandex protection: {e}")
         import traceback
         traceback.print_exc()
         return False
+
+
+def _solve_showcaptcha_fast(driver, max_wait: int = 45) -> bool:
+    """Handle Yandex showcaptchaFAST — a JS-only captcha with no checkbox/form.
+    
+    showcaptchaFAST pages have NO <body>, NO form, NO checkbox. They load
+    tmgrdfrend.fp.js which collects browser fingerprint, computes PoW, and
+    auto-submits a form via JS. The page auto-redirects to the original search
+    results after PoW completes (typically 5-40 seconds).
+    
+    Strategy: Just wait for the JS to complete and redirect. No interaction needed.
+    """
+    logger.info("🚀 showcaptchaFAST detected — waiting for JS auto-redirect (no checkbox needed)...")
+    
+    try:
+        pre_url = driver.current_url
+    except Exception as e:
+        logger.error(f"💀 Browser already dead before showcaptchaFAST wait: {e}")
+        raise Exception("Browser died before showcaptchaFAST handling")
+    
+    for i in range(max_wait):
+        time.sleep(1)
+        try:
+            new_url = driver.current_url
+            new_path = new_url.lower().split('?')[0]
+            
+            # Check if redirected away from captcha
+            if 'showcaptcha' not in new_path and 'checkcaptcha' not in new_path and '/captcha' not in new_path:
+                logger.info(f"🎉 showcaptchaFAST auto-redirect after {i+1}s! New URL: {new_url[:120]}")
+                time.sleep(2)
+                if not detect_captcha_or_block(driver):
+                    logger.info("🎉 showcaptchaFAST passed — page is clean!")
+                    return True
+                else:
+                    logger.warning("⚠️ Redirected but still captcha detected — continuing wait...")
+            
+            # checkcaptcha means PoW submitted, waiting for final redirect
+            if 'checkcaptcha' in new_path:
+                logger.info(f"⏳ showcaptchaFAST PoW submitted ({i+1}s), waiting for final redirect...")
+                continue
+            
+            if i > 0 and i % 10 == 0:
+                logger.info(f"⏳ showcaptchaFAST still waiting... ({i+1}s/{max_wait}s)")
+                
+        except Exception as e:
+            err_str = str(e).lower()
+            # Navigation errors ("Execution context was destroyed", "navigation") are NORMAL
+            # during PoW — the captcha JS does sub-navigations. Wait and retry.
+            is_navigation = 'navigation' in err_str or 'context was destroyed' in err_str
+            is_hard_death = any(kw in err_str for kw in [
+                'connection refused', 'remotedisconnected', 'connectionreseterror',
+            ])
+            if is_navigation and not is_hard_death:
+                logger.info(f"🔄 showcaptchaFAST navigation at {i+1}s (PoW sub-submit) — continuing wait...")
+                time.sleep(1)  # Brief pause for navigation to settle
+                continue
+            if is_hard_death:
+                logger.error(f"💀 Browser DIED at {i+1}s during showcaptchaFAST PoW: {str(e)[:200]}")
+                raise Exception(f"Browser died during showcaptchaFAST PoW ({i+1}s)")
+            # For ambiguous errors (e.g. 'closed', 'target page') — try one more read
+            if 'closed' in err_str or 'target page' in err_str or 'browser has been closed' in err_str:
+                logger.warning(f"⚠️ showcaptchaFAST ambiguous error at {i+1}s, retrying once: {str(e)[:150]}")
+                time.sleep(1)
+                try:
+                    _ = driver.current_url
+                    logger.info(f"✅ Browser still alive after ambiguous error at {i+1}s — was navigation")
+                    continue
+                except Exception:
+                    logger.error(f"💀 Browser confirmed DEAD at {i+1}s during showcaptchaFAST PoW")
+                    raise Exception(f"Browser died during showcaptchaFAST PoW ({i+1}s)")
+            logger.warning(f"⚠️ showcaptchaFAST URL check error at {i+1}s: {type(e).__name__}: {str(e)[:200]}")
+    
+    # Timeout — check final state
+    try:
+        final_url = driver.current_url
+        if not detect_captcha_or_block(driver):
+            logger.info("🎉 showcaptchaFAST passed after full wait!")
+            return True
+    except Exception:
+        raise Exception("Browser died after showcaptchaFAST timeout")
+    
+    logger.warning(f"❌ showcaptchaFAST did not redirect after {max_wait}s")
+    return False
 
 
 def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_attempts: int = 7) -> bool:
@@ -732,8 +853,7 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
     """
     from app.config import settings
     from core.capsola_solver import create_capsola_solver
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
+    from core.playwright_driver import PlaywrightWait as WebDriverWait, EC
     
     try:
         capsola = create_capsola_solver(settings.capsola_api_key)
@@ -790,6 +910,22 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
                 break
         
         if not checkbox_clicked:
+            # Check if this is showcaptchaFAST (no checkbox exists at all)
+            try:
+                current_captcha_url = driver.current_url.lower()
+                current_captcha_path = current_captcha_url.split('?')[0]
+                current_source = driver.page_source.lower()
+                is_fast_captcha = (
+                    'captchafast' in current_captcha_path or
+                    ('tmgrdfrend' in current_source and 'checkboxcaptcha' not in current_source)
+                )
+            except Exception:
+                is_fast_captcha = False
+            
+            if is_fast_captcha:
+                logger.info("🚀 No checkbox because this is showcaptchaFAST — delegating to fast handler")
+                return _solve_showcaptcha_fast(driver)
+            
             # Try submitting the form directly via JS  
             logger.info("⚠️ No checkbox found, trying form submit via JS...")
             try:
@@ -810,27 +946,27 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
         logger.info("⏳ Waiting for SmartCaptcha PoW + redirect...")
         
         # Set moderate timeouts for captcha solving. Don't go too high (300s) because
-        # it blocks the worker if Chrome dies. 120s is enough for PoW + proxy latency.
+        # it blocks the worker if Chrome dies. 60s is enough for PoW + proxy latency.
         # IMPORTANT: caller (handle_yandex_protection) MUST restore timeout to 60 after return.
         try:
-            driver.set_page_load_timeout(120)
+            driver.set_page_load_timeout(60)
         except Exception as e:
             logger.warning(f"Could not set page_load_timeout: {e}")
         try:
-            driver.set_script_timeout(120)
+            driver.set_script_timeout(60)
         except Exception as e:
             logger.warning(f"Could not set script_timeout: {e}")
         
         # Save pre-click URL to detect redirect
         pre_click_url = driver.current_url
         
-        # Wait up to 25 seconds for URL change (reduced from 60).
-        # SmartCaptcha checkbox PoW has ~2% success rate — if it works, it works within 15-20s.
-        # Don't waste 60s waiting — better to refresh and try kaleidoscope (100% solvable).
+        # Wait up to 45 seconds for URL change.
+        # PoW + fingerprint check takes 5-40 seconds (confirmed by visual tests).
+        # Navigation errors during this wait are NORMAL (PoW sub-submits).
         redirected = False
         driver_alive = True
         image_grid_appeared = False
-        for i in range(25):
+        for i in range(45):
             time.sleep(1)
             try:
                 new_url = driver.current_url
@@ -872,17 +1008,35 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
                 if i > 0 and i % 10 == 0:
                     logger.info(f"⏳ Still waiting for PoW... ({i}s elapsed, URL unchanged)")
             except Exception as e:
-                err_str = str(e)
-                if 'Connection refused' in err_str or 'RemoteDisconnected' in err_str or 'ConnectionResetError' in err_str:
-                    logger.error(f"💀 Chrome/chromedriver DIED at {i}s after checkbox click: {err_str[:200]}")
+                err_str = str(e).lower()
+                # Navigation errors are NORMAL during PoW — captcha JS does sub-navigations
+                is_navigation = 'navigation' in err_str or 'context was destroyed' in err_str
+                is_hard_death = 'connection refused' in err_str or 'remotedisconnected' in err_str or 'connectionreseterror' in err_str
+                if is_navigation and not is_hard_death:
+                    logger.info(f"🔄 SmartCaptcha navigation at {i}s (PoW sub-submit) — continuing wait...")
+                    time.sleep(1)
+                    continue
+                if is_hard_death:
+                    logger.error(f"💀 Chrome/browser DIED at {i}s after checkbox click: {str(e)[:200]}")
                     driver_alive = False
                     break
-                else:
-                    logger.warning(f"⚠️ current_url error at {i}s: {type(e).__name__}: {err_str[:200]}")
+                # Ambiguous errors ('closed', 'target page') — verify with one more read
+                if 'closed' in err_str or 'target page' in err_str or 'browser has been closed' in err_str:
+                    logger.warning(f"⚠️ Ambiguous error at {i}s, retrying once: {str(e)[:150]}")
+                    time.sleep(1)
+                    try:
+                        _ = driver.current_url
+                        logger.info(f"✅ Browser still alive at {i}s — was navigation, not crash")
+                        continue
+                    except Exception:
+                        logger.error(f"💀 Browser confirmed DEAD at {i}s after checkbox click")
+                        driver_alive = False
+                        break
+                logger.warning(f"⚠️ current_url error at {i}s: {type(e).__name__}: {str(e)[:200]}")
         
         if not driver_alive:
-            logger.error("💀 Browser died during SmartCaptcha PoW wait — cannot continue")
-            return False
+            logger.error("💀 Browser died during SmartCaptcha PoW wait — raising exception for retry with new proxy")
+            raise Exception(f"Browser died during SmartCaptcha PoW (captcha killed Chrome process)")
         
         if redirected:
             time.sleep(2)
@@ -965,12 +1119,12 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
                 return True
             
             # No image grid — checkbox-only captcha didn't pass (SmartCaptcha has ~2% success rate).
-            # Strategy: Refresh page up to 3 times hoping Yandex switches to Kaleidoscope
-            # (which we solve at 100% rate via PazlCaptchaV2).
-            logger.info("⚠️ Checkbox captcha failed. Refreshing to try getting Kaleidoscope...")
+            # Strategy: Refresh page hoping Yandex switches to Kaleidoscope or Silhouette.
+            # 2 refreshes max — they usually give the same checkbox back, wasting time.
+            logger.info("⚠️ Checkbox captcha failed. Refreshing to try getting different captcha type...")
             
-            for refresh_attempt in range(1, 4):
-                logger.info(f"🔄 Refresh attempt {refresh_attempt}/3 — looking for kaleidoscope...")
+            for refresh_attempt in range(1, 3):
+                logger.info(f"🔄 Refresh attempt {refresh_attempt}/2 — looking for kaleidoscope/silhouette...")
                 try:
                     driver.refresh()
                 except Exception as ref_err:
@@ -1074,7 +1228,7 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
             if not grid_found:
                 if not detect_captcha_or_block(driver):
                     return True
-                logger.warning("❌ Checkbox captcha failed after 3 refresh attempts — no kaleidoscope appeared")
+                logger.warning("❌ Checkbox captcha failed after refresh — no kaleidoscope/silhouette appeared")
                 return False
         
         # ШАГ 4: Detect captcha subtype (Kaleidoscope / Silhouette / Image grid)
@@ -1182,14 +1336,23 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
                 pass
         
         if not click_image_data or not task_image_data:
-            # Last resort: use full page screenshot approach
-            logger.info("📸 Falling back to full screenshot split for Capsola")
-            return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
+            # Full-page screenshot split consistently fails (Capsola returns CAPCHA_NOT_AVAILABLE
+            # because the arbitrary crop regions don't match actual captcha images).
+            # Skip Capsola call entirely — it wastes 30-60s and never succeeds.
+            logger.warning("❌ Could not extract captcha images for Capsola — no grid elements found, skipping")
+            return False
         
         # ШАГ 5: Send to Capsola
         return _send_to_capsola_and_click(driver, capsola, click_image_data, task_image_data, grid_element)
         
+    except SoftTimeLimitExceeded:
+        logger.error("⏰ SoftTimeLimitExceeded in _solve_yandex_showcaptcha — re-raising")
+        raise
     except Exception as e:
+        err_str = str(e)
+        if 'closed' in err_str.lower() or 'Target page' in err_str or 'Browser died' in err_str or 'PoW' in err_str:
+            logger.error(f"💀 Browser death in SmartCaptcha — re-raising: {err_str[:200]}")
+            raise
         logger.error(f"❌ Error solving SmartCaptcha: {e}")
         import traceback
         traceback.print_exc()
@@ -1220,11 +1383,11 @@ def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str, max_attempt
     try:
         capsola = create_capsola_solver(settings.capsola_api_key)
         
-        # Set moderate timeouts for captcha solving (120s, not 300).
+        # Set moderate timeouts for captcha solving (60s, not 300).
         # IMPORTANT: caller (handle_yandex_protection) MUST restore timeout to 60 after return.
         try:
-            driver.set_page_load_timeout(120)
-            driver.set_script_timeout(120)
+            driver.set_page_load_timeout(60)
+            driver.set_script_timeout(60)
         except Exception as e:
             logger.warning(f"Could not set timeouts: {e}")
         
@@ -1344,6 +1507,9 @@ def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str, max_attempt
         logger.error(f"❌ All {MAX_ATTEMPTS} kaleidoscope attempts failed")
         return False
         
+    except SoftTimeLimitExceeded:
+        logger.error("⏰ SoftTimeLimitExceeded in _solve_yandex_kaleidoscope_captcha — re-raising")
+        raise
     except Exception as e:
         err_str = str(e)
         if 'Timed out' in err_str or 'timeout' in err_str.lower():
@@ -1868,6 +2034,8 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
         logger.warning(f"⚠️ Still on captcha after 20s wait")
         return False
         
+    except SoftTimeLimitExceeded:
+        raise
     except Exception as e:
         logger.error(f"❌ Error in slider submission: {e}")
         import traceback
@@ -1968,7 +2136,7 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
         if not click_image_data:
             try:
                 for sel in ["[data-testid='silhouette-container'] img", ".AdvancedCaptcha-ImageWrapper img",
-                            ".AdvancedCaptcha-View img[alt='Image challenge']"]:
+                            "img[alt='Задание с картинкой']", ".AdvancedCaptcha_silhouette img"]:
                     try:
                         el = driver.find_element(By.CSS_SELECTOR, sel)
                         if el.is_displayed():
@@ -2001,34 +2169,64 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
             # Fallback to full screenshot approach
             return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
         
-        # ШАГ 2: Solve with retries (up to 3 attempts)
-        for solve_attempt in range(1, 4):
+        # ШАГ 2: Solve with retries (up to 5 attempts — Yandex may require 3+ correct rounds)
+        for solve_attempt in range(1, 6):
             # For SmartCaptcha: click = main image (silhouette), task = task description icons
-            logger.info(f"🔄 [{solve_attempt}/3] Sending Silhouette as SmartCaptcha to Capsola (click={len(click_image_data)}b, task={len(task_image_data)}b)...")
+            logger.info(f"🔄 [{solve_attempt}/5] Sending Silhouette as SmartCaptcha to Capsola (click={len(click_image_data)}b, task={len(task_image_data)}b)...")
             result = capsola.solve_smart_captcha(click_image_data, task_image_data, max_wait=120)
             
             if not result or result.get('status') != 1:
-                logger.warning(f"⚠️ [{solve_attempt}/3] SmartCaptcha failed for silhouette: {result}")
-                if solve_attempt < 3:
+                logger.warning(f"⚠️ [{solve_attempt}/5] SmartCaptcha failed for silhouette: {result}")
+                if solve_attempt < 5:
                     time.sleep(2)
                     continue
                 # Final attempt failed → fallback to full screenshot
                 return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
             
             answer = result.get('response', '')
-            logger.info(f"✅ [{solve_attempt}/3] SmartCaptcha silhouette answer: {answer}")
+            logger.info(f"✅ [{solve_attempt}/5] SmartCaptcha silhouette answer: {answer}")
             
             # ШАГ 3: Apply coordinate-based answer
             solved = _apply_silhouette_answer(driver, answer, click_image_data)
             if solved:
                 return True
             
-            if solve_attempt < 3:
-                logger.info(f"🔄 [{solve_attempt}/3] Silhouette answer didn't work, retrying...")
-                # Re-extract images for next attempt (captcha may have refreshed)
-                time.sleep(2)
+            if solve_attempt < 5:
+                logger.info(f"🔄 [{solve_attempt}/5] Silhouette answer didn't work, retrying...")
+                # Check if browser/page is still alive before retrying (use execute_script, not current_url which is cached)
                 try:
-                    for sel in ["[data-testid='silhouette-container'] img", ".AdvancedCaptcha-ImageWrapper img"]:
+                    driver.execute_script("1")
+                    current_url = driver.current_url
+                except Exception as alive_err:
+                    err_msg = str(alive_err).lower()
+                    if 'target page' in err_msg or 'browser has been closed' in err_msg or 'target closed' in err_msg or 'page.evaluate' in err_msg:
+                        logger.error(f"💀 Browser/page died after silhouette attempt {solve_attempt} — re-raising for task retry")
+                        raise Exception(f"Browser died during silhouette captcha solving (attempt {solve_attempt}): {alive_err}")
+                    logger.error(f"❌ Browser/page closed, cannot retry silhouette captcha")
+                    return False
+                
+                # Check if still on a captcha page
+                if current_url and 'showcaptcha' not in current_url and 'captcha' not in current_url.lower():
+                    logger.info(f"🎉 Redirected away from captcha after submit: {current_url[:100]}")
+                    return True
+                
+                # Check if captcha is still silhouette type
+                try:
+                    is_silhouette = driver.execute_script(
+                        "return !!document.querySelector('.AdvancedCaptcha_silhouette, .AdvancedCaptcha-SilhouetteTask')"
+                    )
+                    if not is_silhouette:
+                        logger.warning(f"⚠️ Captcha type changed (no longer silhouette), stopping retries")
+                        return False
+                except:
+                    pass
+                
+                # Re-extract images for next attempt (captcha may have refreshed)
+                # Wait longer for page to stabilize after failed submit (page reload)
+                time.sleep(4)
+                try:
+                    for sel in ["[data-testid='silhouette-container'] img", ".AdvancedCaptcha-ImageWrapper img",
+                                "img[alt='Задание с картинкой']"]:
                         try:
                             el = driver.find_element(By.CSS_SELECTOR, sel)
                             if el.is_displayed():
@@ -2067,7 +2265,14 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
         
         return False
         
+    except SoftTimeLimitExceeded:
+        logger.error("⏰ SoftTimeLimitExceeded in _solve_yandex_silhouette_captcha — re-raising")
+        raise
     except Exception as e:
+        err_str = str(e)
+        if 'closed' in err_str.lower() or 'Target page' in err_str or 'Browser died' in err_str:
+            logger.error(f"💀 Browser death in silhouette captcha — re-raising: {err_str[:200]}")
+            raise
         logger.error(f"❌ Error solving Silhouette captcha: {e}")
         import traceback
         traceback.print_exc()
@@ -2169,34 +2374,73 @@ def _apply_silhouette_answer(driver, answer, source_image_data=None) -> bool:
     try:
         logger.info(f"🎯 Applying silhouette answer: {answer}")
         
-        # Find the clickable image container
+        page_closed = False
+        
+        # Find the clickable image container — retry up to 5 times (DOM may be rebuilding after page transition)
         image_element = None
         image_selectors = [
             "[data-testid='silhouette-container'] img",
             ".AdvancedCaptcha-ImageWrapper img",
-            ".AdvancedCaptcha_silhouette img[alt='Image challenge']",
-            ".AdvancedCaptcha img[alt='Image challenge']",
+            "img[alt='Задание с картинкой']",
+            ".AdvancedCaptcha_silhouette img",
         ]
         
-        for selector in image_selectors:
-            try:
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                for el in elements:
-                    if el.is_displayed():
-                        image_element = el
-                        break
-            except:
-                continue
+        for find_retry in range(5):
+            for selector in image_selectors:
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    for el in elements:
+                        if el.is_displayed():
+                            image_element = el
+                            break
+                except:
+                    continue
+                if image_element:
+                    break
+            
+            # If is_displayed() filtered out elements, try without the check
+            if not image_element:
+                for selector in image_selectors:
+                    try:
+                        elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                        if elements:
+                            image_element = elements[0]
+                            logger.info(f"⚠️ Using image element without visibility check (selector: {selector})")
+                            break
+                    except:
+                        continue
+            
+            if not image_element:
+                # Try the container instead
+                try:
+                    image_element = driver.find_element(By.CSS_SELECTOR, ".AdvancedCaptcha-ImageWrapper, [data-testid='silhouette-container']")
+                except:
+                    pass
+            
             if image_element:
                 break
+            
+            if find_retry < 4:
+                # Diagnostic: check what's on the page
+                try:
+                    url = driver.current_url[:80] if driver.current_url else 'unknown'
+                    has_captcha = driver.execute_script(
+                        "return !!document.querySelector('.AdvancedCaptcha')"
+                    )
+                    logger.info(f"⏳ Image element not found (retry {find_retry+1}/5) url={url} captcha_div={has_captcha}")
+                except:
+                    logger.info(f"⏳ Image element not found (retry {find_retry+1}/5, page may be loading)")
+                time.sleep(2)
         
         if not image_element:
-            # Try the container instead
+            # Final diagnostic
             try:
-                image_element = driver.find_element(By.CSS_SELECTOR, ".AdvancedCaptcha-ImageWrapper, [data-testid='silhouette-container']")
+                url = driver.current_url[:100] if driver.current_url else 'unknown'
+                page_html_len = len(driver.page_source) if driver.page_source else 0
+                logger.error(f"❌ Could not find silhouette image element for clicking. url={url}, html_len={page_html_len}")
             except:
-                logger.error("❌ Could not find silhouette image element for clicking")
-                return False
+                logger.error("❌ Could not find silhouette image element for clicking (page may be dead)")
+            return False
         
         # Parse answer
         if isinstance(answer, str):
@@ -2243,7 +2487,11 @@ def _apply_silhouette_answer(driver, answer, source_image_data=None) -> bool:
                 cy = displayed_h / 2
                 logger.info(f"📐 Scale: x={scale_x:.3f}, y={scale_y:.3f}, center: ({cx:.0f}, {cy:.0f})")
                 
+                page_closed = False
                 for i, (x_str, y_str) in enumerate(coord_pairs):
+                    if page_closed:
+                        logger.warning(f"⚠️ Skipping click {i+1}/{len(coord_pairs)}: page/browser already closed")
+                        continue
                     try:
                         x, y = float(x_str), float(y_str)
                         
@@ -2262,7 +2510,12 @@ def _apply_silhouette_answer(driver, answer, source_image_data=None) -> bool:
                         logger.info(f"✅ Silhouette click {i+1}: raw=({x:.1f}, {y:.1f}), scaled=({scaled_x:.1f}, {scaled_y:.1f}), offset=({offset_x}, {offset_y})")
                         time.sleep(random.uniform(0.3, 0.8))
                     except Exception as e:
-                        logger.warning(f"Click error at ({x_str}, {y_str}): {e}")
+                        err_msg = str(e).lower()
+                        if 'target page' in err_msg or 'browser has been closed' in err_msg or 'target closed' in err_msg:
+                            logger.error(f"❌ Browser/page closed during click {i+1}: {e}")
+                            page_closed = True
+                        else:
+                            logger.warning(f"Click error at ({x_str}, {y_str}): {e}")
             else:
                 # Try "x1,y1;x2,y2" format or "x1,y1,x2,y2" format
                 parts = coords_str.replace(';', ',').split(',')
@@ -2333,6 +2586,16 @@ def _apply_silhouette_answer(driver, answer, source_image_data=None) -> bool:
             """)
         
         # ШАГ: Submit the form
+        # Check if browser/page is still alive (page_closed flag from click loop)
+        if page_closed:
+            logger.error("❌ Browser/page closed during clicks, cannot submit")
+            return False
+        try:
+            driver.execute_script("1")
+        except Exception:
+            logger.error("❌ Browser/page closed before submit, cannot continue")
+            return False
+
         time.sleep(random.uniform(0.5, 1.5))
         
         submit_clicked = False
@@ -2408,6 +2671,8 @@ def _apply_silhouette_answer(driver, answer, source_image_data=None) -> bool:
         logger.warning("❌ Silhouette captcha still present after submitting answer")
         return False
         
+    except SoftTimeLimitExceeded:
+        raise
     except Exception as e:
         logger.error(f"❌ Error applying silhouette answer: {e}")
         import traceback
@@ -2451,6 +2716,8 @@ def _try_capsola_full_screenshot(driver, capsola, screenshot_path: str) -> bool:
         
         return _send_to_capsola_and_click(driver, capsola, click_image_data, task_image_data, None)
         
+    except SoftTimeLimitExceeded:
+        raise
     except Exception as e:
         logger.error(f"❌ Full screenshot approach failed: {e}")
         return _try_simple_refresh(driver)
@@ -2570,6 +2837,8 @@ def _send_to_capsola_and_click(driver, capsola, click_image_data: bytes, task_im
         logger.warning("❌ SmartCaptcha still present after Capsola solution")
         return False
         
+    except SoftTimeLimitExceeded:
+        raise
     except Exception as e:
         logger.error(f"❌ Capsola click flow error: {e}")
         return False

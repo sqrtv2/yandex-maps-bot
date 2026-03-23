@@ -12,6 +12,8 @@ services:
       - YANDEX_BOT_REDIS_PORT=6379
       - YANDEX_BOT_DEBUG=false
       - YANDEX_BOT_BROWSER_HEADLESS=true
+      - YANDEX_BOT_YANDEX_SEARCH_API_KEY=${YANDEX_SEARCH_API_KEY:-}
+      - YANDEX_BOT_YANDEX_SEARCH_FOLDER_ID=${YANDEX_SEARCH_FOLDER_ID:-}
       - AUTH_USERNAME=admin
       - AUTH_PASSWORD=admin123
     volumes:
@@ -44,8 +46,8 @@ services:
   celery_warmup:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=15 -Q default,warmup,proxy,maintenance -n warmup@%h --max-memory-per-child=1500000
-    shm_size: '4gb'
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=50 -Q default,warmup,proxy,maintenance -n warmup@%h --max-memory-per-child=2000000 --max-tasks-per-child=5
+    shm_size: '8gb'
     healthcheck:
       test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d warmup@$$HOSTNAME --timeout=10 || exit 1"]
       interval: 30s
@@ -133,7 +135,7 @@ services:
   celery_yandex_search:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=6 -Q yandex_search -n yandex_search@%h --max-memory-per-child=4000000
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=10 -Q yandex_search -n yandex_search@%h --max-memory-per-child=8000000 --max-tasks-per-child=2
     shm_size: '8gb'
     healthcheck:
       test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d yandex_search@$$HOSTNAME --timeout=10 || exit 1"]
@@ -169,8 +171,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 32G
-          cpus: '6'
+          memory: 48G
+          cpus: '8'
     networks:
       - yandex_maps_network
 

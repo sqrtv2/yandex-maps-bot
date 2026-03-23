@@ -87,41 +87,81 @@ class ProxyManager:
         }
 
     def get_available_proxy(self, exclude_ids: List[int] = None) -> Optional[Dict]:
-        """Get next available proxy using round-robin with health checks."""
+        """Get next available proxy using least-used strategy from DB.
+        
+        Each Celery worker forks its own process with a fresh ProxyManager,
+        so in-memory LRU doesn't work across workers. Instead we read
+        `times_used` from the database and pick the least-used proxy
+        (with random tie-breaking) — true round-robin across all workers.
+        """
         try:
             exclude_ids = exclude_ids or []
-            available_proxies = []
 
+            # Read fresh usage stats from DB for smart rotation
+            try:
+                with get_db_session() as db:
+                    db_proxies = db.query(ProxyServer).filter(
+                        ProxyServer.is_active == True,
+                        ProxyServer.id.notin_(exclude_ids) if exclude_ids else True,
+                    ).all()
+                    if db_proxies:
+                        # Sort by times_used ASC, then randomize ties
+                        min_used = min(p.times_used or 0 for p in db_proxies)
+                        # Tier 1: least-used proxies (within 5 uses of minimum)
+                        least_used = [p for p in db_proxies if (p.times_used or 0) <= min_used + 5]
+                        random.shuffle(least_used)
+                        chosen = least_used[0]
+                        
+                        # Increment times_used atomically
+                        chosen.times_used = (chosen.times_used or 0) + 1
+                        chosen.last_used_at = datetime.utcnow()
+                        db.commit()
+                        
+                        proxy_data = {
+                            'id': chosen.id,
+                            'host': chosen.host,
+                            'port': chosen.port,
+                            'username': chosen.username,
+                            'password': chosen.password,
+                            'proxy_type': chosen.proxy_type,
+                            'country': chosen.country,
+                            'city': chosen.city,
+                            'is_working': chosen.is_working,
+                            'response_time_ms': chosen.response_time_ms,
+                            'success_rate': chosen.success_rate,
+                            'last_check_at': chosen.last_check_at,
+                        }
+                        logger.info(
+                            f"Selected proxy {chosen.id}: {chosen.host}:{chosen.port} "
+                            f"(used {chosen.times_used}x, least-used rotation)"
+                        )
+                        return proxy_data
+            except Exception as db_err:
+                logger.warning(f"DB-based proxy selection failed, falling back to in-memory: {db_err}")
+
+            # Fallback: in-memory selection
+            available_proxies = []
             current_time = time.time()
 
             for proxy_id, proxy_data in self.active_proxies.items():
-                # Skip excluded proxies
                 if proxy_id in exclude_ids:
                     continue
-
-                # All active proxies are always available
                 available_proxies.append((proxy_id, proxy_data))
 
             if not available_proxies:
                 logger.warning("No available proxies found — auto-resetting all proxies")
                 self._auto_reset_all_proxies()
-                # Retry once after reset
                 for proxy_id, proxy_data in self.active_proxies.items():
                     if proxy_id not in (exclude_ids or []):
                         available_proxies.append((proxy_id, proxy_data))
                 if not available_proxies:
                     return None
 
-            # Shuffle for true round-robin across forked workers
-            # (each worker has its own ProxyManager with empty last_used,
-            # so LRU alone always picks the same proxy)
             random.shuffle(available_proxies)
-
-            # Get a random proxy from available ones
             proxy_id, proxy_data = available_proxies[0]
             self.last_used[proxy_id] = current_time
 
-            logger.debug(f"Selected proxy {proxy_id}: {proxy_data['host']}:{proxy_data['port']}")
+            logger.debug(f"Selected proxy {proxy_id}: {proxy_data['host']}:{proxy_data['port']} (fallback random)")
             return proxy_data
 
         except Exception as e:

@@ -173,7 +173,7 @@
 
 <!-- New Task Modal -->
 <div class="modal fade" id="newTaskModal" tabindex="-1">
-    <div class="modal-dialog">
+    <div class="modal-dialog modal-lg">
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title"><i class="bi bi-plus-circle"></i> Новый парсинг</h5>
@@ -185,6 +185,15 @@
                     <input type="text" class="form-control" id="taskQuery" placeholder="Например: медцентр">
                 </div>
                 <div class="mb-3">
+                    <label class="form-label">Режим региона</label>
+                    <div class="btn-group w-100" role="group">
+                        <input type="radio" class="btn-check" name="regionMode" id="regionModeSingle" value="single" checked onchange="toggleRegionMode()">
+                        <label class="btn btn-outline-primary" for="regionModeSingle"><i class="bi bi-geo-alt"></i> Один город</label>
+                        <input type="radio" class="btn-check" name="regionMode" id="regionModeMO" value="mo" onchange="toggleRegionMode()">
+                        <label class="btn btn-outline-primary" for="regionModeMO"><i class="bi bi-map"></i> Московская область (все города)</label>
+                    </div>
+                </div>
+                <div id="singleRegionBlock" class="mb-3">
                     <label class="form-label">Регион</label>
                     <select class="form-select" id="taskRegion">
                         <option value="Москва" selected>Москва</option>
@@ -192,7 +201,32 @@
                         <option value="Новосибирск">Новосибирск</option>
                         <option value="Екатеринбург">Екатеринбург</option>
                         <option value="Казань">Казань</option>
+                        <option value="Нижний Новгород">Нижний Новгород</option>
+                        <option value="Челябинск">Челябинск</option>
+                        <option value="Самара">Самара</option>
+                        <option value="Ростов-на-Дону">Ростов-на-Дону</option>
+                        <option value="Уфа">Уфа</option>
+                        <option value="Красноярск">Красноярск</option>
+                        <option value="Воронеж">Воронеж</option>
+                        <option value="Пермь">Пермь</option>
+                        <option value="Волгоград">Волгоград</option>
+                        <option value="Краснодар">Краснодар</option>
+                        <option value="Тюмень">Тюмень</option>
+                        <option value="Омск">Омск</option>
+                        <option value="Саратов">Саратов</option>
+                        <option value="Тольятти">Тольятти</option>
                     </select>
+                </div>
+                <div id="moRegionBlock" class="mb-3" style="display:none;">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <label class="form-label mb-0 fw-bold">Города МО <span class="badge bg-info" id="moCitiesCount">0 выбрано</span></label>
+                        <div class="btn-group btn-group-sm">
+                            <button class="btn btn-outline-success" onclick="moSelectAll(true)"><i class="bi bi-check-all"></i> Все</button>
+                            <button class="btn btn-outline-secondary" onclick="moSelectAll(false)"><i class="bi bi-x-lg"></i> Снять</button>
+                            <button class="btn btn-outline-primary" onclick="moSelectTop()"><i class="bi bi-star"></i> Крупные</button>
+                        </div>
+                    </div>
+                    <div class="border rounded p-2" style="max-height:300px; overflow-y:auto;" id="moCitiesList"></div>
                 </div>
                 <div class="mb-3">
                     <label class="form-label">Ссылка Яндекс.Карт (необязательно)</label>
@@ -200,7 +234,7 @@
                     <div class="form-text">Если указана — парсер откроет именно эту ссылку вместо поиска по запросу</div>
                 </div>
                 <div class="mb-3">
-                    <label class="form-label">Максимум компаний</label>
+                    <label class="form-label">Максимум компаний <span id="maxItemsNote" class="text-muted small">(на город)</span></label>
                     <input type="number" class="form-control" id="taskMaxItems" value="100" min="1" max="500">
                 </div>
             </div>
@@ -339,29 +373,123 @@ function getStatusBadge(status) {
 async function createTask() {
     const query = document.getElementById('taskQuery').value.trim();
     if (!query) { alert('Введите поисковый запрос'); return; }
-    
-    try {
-        const resp = await fetch('/api/parser/tasks', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                search_query: query,
-                region: document.getElementById('taskRegion').value,
-                yandex_maps_url: document.getElementById('taskUrl').value.trim(),
-                max_items: parseInt(document.getElementById('taskMaxItems').value) || 100,
-            })
-        });
-        
-        if (!resp.ok) { const err = await resp.json(); alert(err.detail || 'Ошибка'); return; }
-        
-        bootstrap.Modal.getInstance(document.getElementById('newTaskModal')).hide();
-        document.getElementById('taskQuery').value = '';
-        document.getElementById('taskUrl').value = '';
-        loadAll();
-        showToast('Задача парсинга запущена!', 'success');
-    } catch (e) {
-        alert('Ошибка: ' + e.message);
+
+    const mode = document.querySelector('input[name="regionMode"]:checked').value;
+    const maxItems = parseInt(document.getElementById('taskMaxItems').value) || 100;
+    const url = document.getElementById('taskUrl').value.trim();
+
+    if (mode === 'mo') {
+        // Batch mode — create tasks for each selected MO city
+        const checked = document.querySelectorAll('.mo-city-cb:checked');
+        if (checked.length === 0) { alert('Выберите хотя бы один город МО'); return; }
+
+        const cities = Array.from(checked).map(cb => cb.value);
+        if (!confirm(`Запустить парсинг "${query}" по ${cities.length} городам МО?\nЗадачи будут выполняться последовательно.`)) return;
+
+        try {
+            const resp = await fetch('/api/parser/tasks/batch', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    search_query: query,
+                    regions: cities,
+                    max_items: maxItems,
+                })
+            });
+            if (!resp.ok) { const err = await resp.json(); alert(err.detail || 'Ошибка'); return; }
+            const result = await resp.json();
+            bootstrap.Modal.getInstance(document.getElementById('newTaskModal')).hide();
+            document.getElementById('taskQuery').value = '';
+            loadAll();
+            showToast(`Создано ${result.created} задач по городам МО!`, 'success');
+        } catch (e) {
+            alert('Ошибка: ' + e.message);
+        }
+    } else {
+        // Single city mode
+        try {
+            const resp = await fetch('/api/parser/tasks', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    search_query: query,
+                    region: document.getElementById('taskRegion').value,
+                    yandex_maps_url: url,
+                    max_items: maxItems,
+                })
+            });
+
+            if (!resp.ok) { const err = await resp.json(); alert(err.detail || 'Ошибка'); return; }
+
+            bootstrap.Modal.getInstance(document.getElementById('newTaskModal')).hide();
+            document.getElementById('taskQuery').value = '';
+            document.getElementById('taskUrl').value = '';
+            loadAll();
+            showToast('Задача парсинга запущена!', 'success');
+        } catch (e) {
+            alert('Ошибка: ' + e.message);
+        }
     }
+}
+
+// === MO Cities ===
+const MO_CITIES = [
+    // Крупные (population > 100k)
+    'Балашиха', 'Подольск', 'Химки', 'Мытищи', 'Королёв', 'Люберцы', 'Красногорск',
+    'Электросталь', 'Коломна', 'Одинцово', 'Домодедово', 'Серпухов', 'Щёлково',
+    'Орехово-Зуево', 'Раменское', 'Долгопрудный', 'Пушкино', 'Жуковский', 'Сергиев Посад',
+    'Ногинск', 'Клин',
+    // Средние
+    'Воскресенск', 'Реутов', 'Дубна', 'Ивантеевка', 'Лобня', 'Фрязино',
+    'Наро-Фоминск', 'Егорьевск', 'Чехов', 'Видное', 'Дмитров', 'Ступино',
+    'Павловский Посад', 'Лыткарино', 'Дзержинский', 'Котельники', 'Кашира',
+    'Протвино', 'Можайск', 'Луховицы', 'Шатура', 'Солнечногорск', 'Истра',
+    'Волоколамск', 'Озёры', 'Талдом', 'Зарайск', 'Рошаль', 'Серебряные Пруды',
+    'Лотошино',
+    // Крупные микрорайоны / присоединённые
+    'Железнодорожный', 'Троицк', 'Щербинка', 'Московский', 'Апрелевка',
+    'Голицыно', 'Кубинка', 'Старая Купавна', 'Электроугли', 'Хотьково',
+    'Пересвет', 'Краснознаменск', 'Звенигород', 'Черноголовка',
+    'Высоковск', 'Яхрома', 'Дедовск', 'Нахабино', 'Красноармейск',
+    'Пущино', 'Лосино-Петровский', 'Куровское',
+];
+const MO_TOP_CITIES = new Set([
+    'Балашиха', 'Подольск', 'Химки', 'Мытищи', 'Королёв', 'Люберцы', 'Красногорск',
+    'Электросталь', 'Коломна', 'Одинцово', 'Домодедово', 'Серпухов', 'Щёлково',
+    'Орехово-Зуево', 'Раменское', 'Долгопрудный', 'Пушкино', 'Жуковский', 'Сергиев Посад',
+    'Ногинск', 'Клин',
+]);
+
+function initMOCities() {
+    const container = document.getElementById('moCitiesList');
+    container.innerHTML = MO_CITIES.map((city, i) => `
+        <div class="form-check form-check-inline" style="width:200px;">
+            <input class="form-check-input mo-city-cb" type="checkbox" value="${city}" id="moCity${i}" checked onchange="updateMOCount()">
+            <label class="form-check-label small" for="moCity${i}">${city}</label>
+        </div>
+    `).join('');
+    updateMOCount();
+}
+function updateMOCount() {
+    const count = document.querySelectorAll('.mo-city-cb:checked').length;
+    document.getElementById('moCitiesCount').textContent = count + ' выбрано';
+}
+function moSelectAll(val) {
+    document.querySelectorAll('.mo-city-cb').forEach(cb => cb.checked = val);
+    updateMOCount();
+}
+function moSelectTop() {
+    document.querySelectorAll('.mo-city-cb').forEach(cb => {
+        cb.checked = MO_TOP_CITIES.has(cb.value);
+    });
+    updateMOCount();
+}
+function toggleRegionMode() {
+    const mode = document.querySelector('input[name="regionMode"]:checked').value;
+    document.getElementById('singleRegionBlock').style.display = mode === 'single' ? '' : 'none';
+    document.getElementById('moRegionBlock').style.display = mode === 'mo' ? '' : 'none';
+    document.getElementById('maxItemsNote').textContent = mode === 'mo' ? '(на каждый город)' : '';
+    if (mode === 'mo' && !document.querySelector('.mo-city-cb')) initMOCities();
 }
 
 async function cancelTask(id) {
@@ -523,7 +651,7 @@ function exportXls() {
     const queryFilter = document.getElementById('queryFilter').value;
     let url = '/api/parser/export';
     if (queryFilter) url += `?search_query=${encodeURIComponent(queryFilter)}`;
-    window.open(url, '_blank');
+    window.location.href = url;
 }
 
 // ─── Helpers ─────────────────────────────────────────

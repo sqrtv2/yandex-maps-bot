@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from app.database import get_db
 from app.models import BrowserProfile, ProxyServer, Task, UserSettings, YandexMapTarget, ProfileTargetVisit
 from app.models.yandex_search_target import YandexSearchTarget
+from app.models.error_log import ErrorLog
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,15 @@ async def search_analytics_page(request: Request):
     return templates.TemplateResponse("search_analytics.html", {"request": request})
 
 
+@router.get("/referrer-analytics", response_class=HTMLResponse)
+async def referrer_analytics_page(request: Request):
+    """Referrer analytics page."""
+    if not templates:
+        return HTMLResponse("<h1>Templates not found</h1>")
+
+    return templates.TemplateResponse("referrer_analytics.html", {"request": request})
+
+
 @router.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
     """Worker and system settings page."""
@@ -111,6 +121,15 @@ async def settings_page(request: Request):
         return HTMLResponse("<h1>Templates not found</h1>")
 
     return templates.TemplateResponse("settings.html", {"request": request})
+
+
+@router.get("/error-logs", response_class=HTMLResponse)
+async def error_logs_page(request: Request):
+    """Error logs analysis page."""
+    if not templates:
+        return HTMLResponse("<h1>Templates not found</h1>")
+
+    return templates.TemplateResponse("error_logs.html", {"request": request})
 
 
 # Worker Management API
@@ -2147,7 +2166,26 @@ async def get_yandex_search_targets(db: Session = Depends(get_db)):
     """Get all Yandex Search click-through targets."""
     try:
         targets = db.query(YandexSearchTarget).order_by(YandexSearchTarget.created_at.desc()).all()
-        return [t.to_dict() for t in targets]
+        result = []
+        # Load keyword frequencies for all targets in one query
+        try:
+            from app.models.keyword_frequency import KeywordFrequency
+            all_freqs = db.query(KeywordFrequency).all()
+            freq_map = {}  # target_id -> {keyword: {broad, phrase, exact}}
+            for f in all_freqs:
+                freq_map.setdefault(f.target_id, {})[f.keyword.lower()] = {
+                    "broad": f.freq_broad,
+                    "phrase": f.freq_phrase,
+                    "exact": f.freq_exact,
+                }
+        except Exception:
+            freq_map = {}
+
+        for t in targets:
+            d = t.to_dict()
+            d["keyword_frequencies"] = freq_map.get(t.id, {})
+            result.append(d)
+        return result
     except Exception as e:
         logger.error(f"Error getting search targets: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -2410,11 +2448,18 @@ async def get_not_found_keywords(target_id: int, db: Session = Depends(get_db), 
 
         since = datetime.utcnow() - timedelta(days=days)
 
+        # Only show active keywords (exclude disabled)
+        active_keywords = set(k.strip().lower() for k in target.get_active_keywords_list())
+
         # Get all position history records for this period
         records = db.query(SearchPositionHistory).filter(
             SearchPositionHistory.search_target_id == target_id,
             SearchPositionHistory.checked_at >= since
         ).all()
+
+        # Filter to active keywords only
+        if active_keywords:
+            records = [r for r in records if r.keyword.strip().lower() in active_keywords]
 
         # Group by keyword
         keyword_stats = {}
@@ -2543,6 +2588,106 @@ async def enable_disabled_keywords(target_id: int, body: Dict[str, Any], db: Ses
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/api/yandex-search-targets/{target_id}/toggle-keyword")
+async def toggle_keyword(target_id: int, body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Enable or disable a keyword for click boosting. Body: {keyword: str, enabled: bool}"""
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+
+        keyword = (body.get("keyword") or "").strip()
+        enabled = body.get("enabled", True)
+        if not keyword:
+            raise HTTPException(status_code=400, detail="Не указано ключевое слово")
+
+        # Check keyword exists in target
+        all_kws_lower = {k.lower() for k in target.get_keywords_list()}
+        if keyword.lower() not in all_kws_lower:
+            raise HTTPException(status_code=400, detail="Ключевое слово не найдено в цели")
+
+        disabled = target.get_disabled_keywords_set()
+
+        if enabled:
+            # Remove from disabled
+            if keyword.lower() in disabled:
+                original = [k.strip() for k in (target.disabled_keywords or '').split('\n') if k.strip()]
+                remaining = [k for k in original if k.strip().lower() != keyword.lower()]
+                target.disabled_keywords = '\n'.join(remaining) if remaining else None
+        else:
+            # Add to disabled
+            if keyword.lower() not in disabled:
+                existing = target.disabled_keywords.strip() if target.disabled_keywords else ''
+                target.disabled_keywords = (existing + '\n' + keyword).strip()
+
+        db.commit()
+        db.refresh(target)
+
+        return {
+            "keyword": keyword,
+            "enabled": enabled,
+            "disabled_count": len(target.get_disabled_keywords_set()),
+            "active_count": len(target.get_active_keywords_list()),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error toggling keyword: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/yandex-search-targets/{target_id}/toggle-keywords-batch")
+async def toggle_keywords_batch(target_id: int, body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Enable or disable multiple keywords at once. Body: {keywords: [str], enabled: bool}"""
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+
+        keywords = [k.strip() for k in body.get("keywords", []) if k.strip()]
+        enabled = body.get("enabled", True)
+        if not keywords:
+            raise HTTPException(status_code=400, detail="Не указаны ключевые слова")
+
+        all_kws_lower = {k.lower() for k in target.get_keywords_list()}
+        disabled = target.get_disabled_keywords_set()
+
+        if enabled:
+            # Remove from disabled
+            to_enable = {k.lower() for k in keywords if k.lower() in disabled and k.lower() in all_kws_lower}
+            if to_enable:
+                original = [k.strip() for k in (target.disabled_keywords or '').split('\n') if k.strip()]
+                remaining = [k for k in original if k.strip().lower() not in to_enable]
+                target.disabled_keywords = '\n'.join(remaining) if remaining else None
+            changed = len(to_enable)
+        else:
+            # Add to disabled
+            changed = 0
+            for kw in keywords:
+                if kw.lower() in all_kws_lower and kw.lower() not in disabled:
+                    existing = target.disabled_keywords.strip() if target.disabled_keywords else ''
+                    target.disabled_keywords = (existing + '\n' + kw).strip()
+                    disabled.add(kw.lower())
+                    changed += 1
+
+        db.commit()
+        db.refresh(target)
+
+        return {
+            "changed": changed,
+            "enabled": enabled,
+            "disabled_count": len(target.get_disabled_keywords_set()),
+            "active_count": len(target.get_active_keywords_list()),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error batch toggling keywords: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/yandex-search-logs")
 async def get_yandex_search_logs(db: Session = Depends(get_db), limit: int = 50):
     """Get recent search click-through task logs."""
@@ -2557,25 +2702,159 @@ async def get_yandex_search_logs(db: Session = Depends(get_db), limit: int = 50)
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/api/yandex-search-stats")
+async def get_yandex_search_real_stats(db: Session = Depends(get_db)):
+    """Get real click statistics from tasks table (not from target counters).
+    
+    Returns: today clicks (completed/failed/total), yesterday clicks,
+    captcha encounters, per-domain breakdown.
+    """
+    try:
+        from sqlalchemy import func as sqla_func, case, cast, Date
+
+        now = datetime.utcnow()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_start = today_start - timedelta(days=1)
+
+        # --- Today's stats from tasks table ---
+        today_tasks = db.query(
+            sqla_func.count().label('total'),
+            sqla_func.sum(case((Task.status == 'completed', 1), else_=0)).label('completed'),
+            sqla_func.sum(case((Task.status == 'failed', 1), else_=0)).label('failed'),
+            sqla_func.sum(case((Task.status == 'not_found', 1), else_=0)).label('not_found'),
+            sqla_func.sum(case((Task.status == 'in_progress', 1), else_=0)).label('in_progress'),
+            sqla_func.sum(case((Task.status == 'pending', 1), else_=0)).label('pending'),
+        ).filter(
+            Task.task_type == "yandex_search",
+            Task.created_at >= today_start,
+        ).first()
+
+        # --- Yesterday's stats ---
+        yesterday_tasks = db.query(
+            sqla_func.count().label('total'),
+            sqla_func.sum(case((Task.status == 'completed', 1), else_=0)).label('completed'),
+            sqla_func.sum(case((Task.status == 'failed', 1), else_=0)).label('failed'),
+            sqla_func.sum(case((Task.status == 'not_found', 1), else_=0)).label('not_found'),
+        ).filter(
+            Task.task_type == "yandex_search",
+            Task.created_at >= yesterday_start,
+            Task.created_at < today_start,
+        ).first()
+
+        # --- Captcha stats (from task logs containing captcha mentions) ---
+        captcha_today = db.query(sqla_func.count()).filter(
+            Task.task_type == "yandex_search",
+            Task.created_at >= today_start,
+            Task.execution_logs.ilike('%капч%'),
+        ).scalar() or 0
+
+        captcha_yesterday = db.query(sqla_func.count()).filter(
+            Task.task_type == "yandex_search",
+            Task.created_at >= yesterday_start,
+            Task.created_at < today_start,
+            Task.execution_logs.ilike('%капч%'),
+        ).scalar() or 0
+
+        # --- Per-domain breakdown (today) ---
+        # We need to join with parameters to get the domain
+        all_today = db.query(Task).filter(
+            Task.task_type == "yandex_search",
+            Task.created_at >= today_start,
+        ).all()
+
+        domain_stats = {}
+        for t in all_today:
+            domain = (t.parameters or {}).get('domain', 'unknown')
+            if domain not in domain_stats:
+                domain_stats[domain] = {'completed': 0, 'failed': 0, 'not_found': 0, 'total': 0, 'in_progress': 0, 'pending': 0}
+            domain_stats[domain]['total'] += 1
+            if t.status == 'completed':
+                domain_stats[domain]['completed'] += 1
+            elif t.status == 'failed':
+                domain_stats[domain]['failed'] += 1
+            elif t.status == 'not_found':
+                domain_stats[domain]['not_found'] += 1
+            elif t.status == 'in_progress':
+                domain_stats[domain]['in_progress'] += 1
+            elif t.status == 'pending':
+                domain_stats[domain]['pending'] += 1
+
+        # --- Per-domain breakdown (yesterday) ---
+        all_yesterday = db.query(Task).filter(
+            Task.task_type == "yandex_search",
+            Task.created_at >= yesterday_start,
+            Task.created_at < today_start,
+        ).all()
+
+        domain_stats_yesterday = {}
+        for t in all_yesterday:
+            domain = (t.parameters or {}).get('domain', 'unknown')
+            if domain not in domain_stats_yesterday:
+                domain_stats_yesterday[domain] = {'completed': 0, 'failed': 0, 'not_found': 0, 'total': 0}
+            domain_stats_yesterday[domain]['total'] += 1
+            if t.status == 'completed':
+                domain_stats_yesterday[domain]['completed'] += 1
+            elif t.status == 'failed':
+                domain_stats_yesterday[domain]['failed'] += 1
+            elif t.status == 'not_found':
+                domain_stats_yesterday[domain]['not_found'] += 1
+
+        return {
+            "today": {
+                "total": today_tasks.total or 0,
+                "completed": int(today_tasks.completed or 0),
+                "failed": int(today_tasks.failed or 0),
+                "not_found": int(today_tasks.not_found or 0),
+                "in_progress": int(today_tasks.in_progress or 0),
+                "pending": int(today_tasks.pending or 0),
+            },
+            "yesterday": {
+                "total": yesterday_tasks.total or 0,
+                "completed": int(yesterday_tasks.completed or 0),
+                "failed": int(yesterday_tasks.failed or 0),
+                "not_found": int(yesterday_tasks.not_found or 0),
+            },
+            "captcha": {
+                "today": captcha_today,
+                "yesterday": captcha_yesterday,
+            },
+            "per_domain_today": domain_stats,
+            "per_domain_yesterday": domain_stats_yesterday,
+        }
+    except Exception as e:
+        logger.error(f"Error getting real search stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ===== Search Position Analytics =====
 
 @router.get("/api/yandex-search-targets/{target_id}/positions-pivot")
 async def get_positions_pivot(target_id: int, db: Session = Depends(get_db), days: int = 30):
     """Get keyword × date pivot table with positions. Dates sorted latest first."""
     from app.models.search_position_history import SearchPositionHistory
+    from app.models.keyword_frequency import KeywordFrequency
     try:
         target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
         if not target:
             raise HTTPException(status_code=404, detail="Target not found")
 
         since = datetime.utcnow() - timedelta(days=days)
+        
+        # Only show active keywords (exclude disabled)
+        active_keywords = set(k.strip().lower() for k in target.get_active_keywords_list())
+        
         records = db.query(SearchPositionHistory).filter(
             SearchPositionHistory.search_target_id == target_id,
             SearchPositionHistory.checked_at >= since
         ).order_by(SearchPositionHistory.checked_at.asc()).all()
 
+        # Filter to active keywords only
+        if active_keywords:
+            records = [r for r in records if r.keyword.strip().lower() in active_keywords]
+
         if not records:
-            return {"target_id": target_id, "domain": target.domain, "dates": [], "keywords": [], "pivot": {}}
+            return {"target_id": target_id, "domain": target.domain, "dates": [],
+                    "keywords": target.get_active_keywords_list(), "pivot": {k: {} for k in target.get_active_keywords_list()}}
 
         # Collect all dates and keywords, build pivot
         all_dates = set()
@@ -2621,6 +2900,11 @@ async def get_positions_pivot(target_id: int, db: Session = Depends(get_db), day
                 else:
                     pivot[kw][d] = None
 
+        # Add active keywords that have no history records yet
+        for ak in target.get_active_keywords_list():
+            if ak not in pivot:
+                pivot[ak] = {d: None for d in dates_sorted}
+
         # Sort keywords by their latest average position (best first)
         def kw_sort_key(kw_name):
             for d in dates_sorted:
@@ -2631,12 +2915,25 @@ async def get_positions_pivot(target_id: int, db: Session = Depends(get_db), day
 
         keywords_sorted = sorted(pivot.keys(), key=kw_sort_key)
 
+        # Load keyword frequencies from DB
+        freq_records = db.query(KeywordFrequency).filter(
+            KeywordFrequency.target_id == target_id
+        ).all()
+        keyword_frequencies = {}
+        for fr in freq_records:
+            keyword_frequencies[fr.keyword] = {
+                "broad": fr.freq_broad,
+                "phrase": fr.freq_phrase,
+                "exact": fr.freq_exact,
+            }
+
         return {
             "target_id": target_id,
             "domain": target.domain,
             "dates": dates_sorted,
             "keywords": keywords_sorted,
-            "pivot": pivot
+            "pivot": pivot,
+            "keyword_frequencies": keyword_frequencies,
         }
     except HTTPException:
         raise
@@ -2678,20 +2975,36 @@ async def get_search_analytics(target_id: int, db: Session = Depends(get_db), da
         
         since = datetime.utcnow() - timedelta(days=days)
         
+        # Only show active keywords (exclude disabled)
+        active_keywords = set(k.strip().lower() for k in target.get_active_keywords_list())
+        
         # Get all records for the period
         records = db.query(SearchPositionHistory).filter(
             SearchPositionHistory.search_target_id == target_id,
             SearchPositionHistory.checked_at >= since
         ).order_by(SearchPositionHistory.checked_at.asc()).all()
         
+        # Filter to active keywords only
+        if active_keywords:
+            records = [r for r in records if r.keyword.strip().lower() in active_keywords]
+        
+        active_keywords_list = target.get_active_keywords_list()
+        
         if not records:
+            # Still return all active keywords with empty data
+            empty_keywords = [{
+                "keyword": ak,
+                "total_checks": 0, "found_count": 0, "not_found_count": 0, "found_rate": 0,
+                "avg_position": None, "current_avg": None, "best_position": None, "worst_position": None,
+                "trend": "no_data", "trend_value": 0, "chart_data": []
+            } for ak in active_keywords_list]
             return {
                 "target_id": target_id,
                 "domain": target.domain,
                 "period_days": days,
                 "total_checks": 0,
-                "keywords": [],
-                "summary": {"avg_position": None, "found_rate": 0, "trend": "no_data"}
+                "keywords": empty_keywords,
+                "summary": {"avg_position": None, "found_rate": 0, "trend": "no_data", "keywords_count": len(active_keywords_list)}
             }
         
         # Group by keyword
@@ -2781,6 +3094,25 @@ async def get_search_analytics(target_id: int, db: Session = Depends(get_db), da
                 "chart_data": chart_data
             })
         
+        # Add active keywords that have no history records yet
+        seen_keywords = {ka["keyword"].strip().lower() for ka in keyword_analytics}
+        for ak in target.get_active_keywords_list():
+            if ak.strip().lower() not in seen_keywords:
+                keyword_analytics.append({
+                    "keyword": ak,
+                    "total_checks": 0,
+                    "found_count": 0,
+                    "not_found_count": 0,
+                    "found_rate": 0,
+                    "avg_position": None,
+                    "current_avg": None,
+                    "best_position": None,
+                    "worst_position": None,
+                    "trend": "no_data",
+                    "trend_value": 0,
+                    "chart_data": []
+                })
+        
         # Sort by avg position (best first), keywords not found go last
         keyword_analytics.sort(key=lambda x: (x["avg_position"] is None, x["avg_position"] or 999))
         
@@ -2857,10 +3189,150 @@ async def get_search_analytics(target_id: int, db: Session = Depends(get_db), da
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/api/referrer-analytics")
+async def get_referrer_analytics(db: Session = Depends(get_db), days: int = 30):
+    """Compare position data for visits with referrer vs without referrer."""
+    from app.models.search_position_history import SearchPositionHistory
+    try:
+        since = datetime.utcnow() - timedelta(days=days)
+        
+        records = db.query(SearchPositionHistory).filter(
+            SearchPositionHistory.checked_at >= since
+        ).order_by(SearchPositionHistory.checked_at.asc()).all()
+        
+        if not records:
+            return {"has_data": False, "message": "Нет данных за выбранный период"}
+        
+        # Split into referrer / no-referrer groups
+        with_ref = [r for r in records if r.referrer_used]
+        without_ref = [r for r in records if not r.referrer_used]
+        
+        def analyze_group(group_records):
+            """Compute stats for a group of position records."""
+            total = len(group_records)
+            found = [r for r in group_records if r.found]
+            found_with_pos = [r for r in found if r.absolute_position]
+            positions = [r.absolute_position for r in found_with_pos]
+            clicked = [r for r in group_records if r.clicked]
+            
+            avg_pos = round(sum(positions) / len(positions), 1) if positions else None
+            
+            # Trend: first half vs second half
+            trend_value = 0
+            trend = "no_data"
+            if len(positions) >= 4:
+                mid = len(positions) // 2
+                first_avg = sum(positions[:mid]) / mid
+                second_avg = sum(positions[mid:]) / (len(positions) - mid)
+                trend_value = round(first_avg - second_avg, 1)
+                if trend_value > 2:
+                    trend = "improving"
+                elif trend_value < -2:
+                    trend = "declining"
+                else:
+                    trend = "stable"
+            
+            # TOP distribution
+            top3 = sum(1 for p in positions if p <= 3)
+            top5 = sum(1 for p in positions if p <= 5)
+            top10 = sum(1 for p in positions if p <= 10)
+            
+            # Daily average positions for chart
+            daily = {}
+            for r in group_records:
+                if not r.checked_at:
+                    continue
+                day = r.checked_at.strftime("%Y-%m-%d")
+                if day not in daily:
+                    daily[day] = {"positions": [], "found": 0, "not_found": 0, "clicked": 0}
+                if r.found and r.absolute_position:
+                    daily[day]["positions"].append(r.absolute_position)
+                    daily[day]["found"] += 1
+                else:
+                    daily[day]["not_found"] += 1
+                if r.clicked:
+                    daily[day]["clicked"] += 1
+            
+            chart_data = []
+            for day in sorted(daily.keys()):
+                d = daily[day]
+                avg = round(sum(d["positions"]) / len(d["positions"]), 1) if d["positions"] else None
+                chart_data.append({
+                    "date": day,
+                    "avg_position": avg,
+                    "found": d["found"],
+                    "not_found": d["not_found"],
+                    "clicked": d["clicked"],
+                    "total": d["found"] + d["not_found"],
+                })
+            
+            return {
+                "total": total,
+                "found": len(found),
+                "not_found": total - len(found),
+                "found_rate": round(len(found) / total * 100, 1) if total else 0,
+                "clicked": len(clicked),
+                "avg_position": avg_pos,
+                "trend": trend,
+                "trend_value": trend_value,
+                "top3": top3,
+                "top5": top5,
+                "top10": top10,
+                "chart_data": chart_data,
+            }
+        
+        # Per-keyword breakdown
+        keyword_comparison = {}
+        for r in records:
+            kw = r.keyword
+            if kw not in keyword_comparison:
+                keyword_comparison[kw] = {"with_ref": [], "without_ref": []}
+            if r.referrer_used:
+                keyword_comparison[kw]["with_ref"].append(r)
+            else:
+                keyword_comparison[kw]["without_ref"].append(r)
+        
+        keywords_data = []
+        for kw, groups in keyword_comparison.items():
+            wr = groups["with_ref"]
+            wor = groups["without_ref"]
+            wr_positions = [r.absolute_position for r in wr if r.found and r.absolute_position]
+            wor_positions = [r.absolute_position for r in wor if r.found and r.absolute_position]
+            wr_avg = round(sum(wr_positions) / len(wr_positions), 1) if wr_positions else None
+            wor_avg = round(sum(wor_positions) / len(wor_positions), 1) if wor_positions else None
+            keywords_data.append({
+                "keyword": kw,
+                "with_ref_count": len(wr),
+                "without_ref_count": len(wor),
+                "with_ref_avg": wr_avg,
+                "without_ref_avg": wor_avg,
+                "diff": round(wor_avg - wr_avg, 1) if wr_avg and wor_avg else None,
+            })
+        
+        keywords_data.sort(key=lambda x: (x["diff"] is None, -(x["diff"] or 0)))
+        
+        # Count records that have referrer_used data (non-null / not all False from old data)
+        has_referrer_data = len(with_ref) > 0
+        
+        return {
+            "has_data": True,
+            "has_referrer_data": has_referrer_data,
+            "period_days": days,
+            "total_records": len(records),
+            "with_referrer": analyze_group(with_ref),
+            "without_referrer": analyze_group(without_ref),
+            "keywords": keywords_data,
+        }
+    except Exception as e:
+        logger.error(f"Error getting referrer analytics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/yandex-search-targets/{target_id}/strategy")
 async def get_search_strategy(target_id: int, db: Session = Depends(get_db)):
     """Generate strategy recommendations using the position-adaptive click algorithm."""
     from app.models.search_position_history import SearchPositionHistory
+    from app.models.keyword_frequency import KeywordFrequency
     from tasks.yandex_search import _calculate_keyword_clicks
     try:
         target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
@@ -2872,12 +3344,33 @@ async def get_search_strategy(target_id: int, db: Session = Depends(get_db)):
         # Use success rate for correction (if enough data)
         sr = target.success_rate if target.total_visits >= 10 else 100.0
         
+        # Load exact frequency data for priority weighting
+        freq_weights = {}
+        freq_values = {}
+        try:
+            freq_records = db.query(KeywordFrequency).filter(
+                KeywordFrequency.target_id == target_id
+            ).all()
+            exact_freqs = {}
+            for fr in freq_records:
+                freq_values[fr.keyword] = fr.freq_exact or 0
+                if fr.freq_exact and fr.freq_exact > 0:
+                    exact_freqs[fr.keyword] = fr.freq_exact
+            if exact_freqs:
+                avg_freq = sum(exact_freqs.values()) / len(exact_freqs)
+                if avg_freq > 0:
+                    for fkw, fval in exact_freqs.items():
+                        freq_weights[fkw] = max(0.7, min(1.5, fval / avg_freq))
+        except Exception:
+            pass
+        
         recommendations = []
         total_budget = 0
         total_done = 0
         
         for kw in keywords_list:
-            calc = _calculate_keyword_clicks(db, target.id, kw, target_success_rate=sr)
+            fw = freq_weights.get(kw, 1.0)
+            calc = _calculate_keyword_clicks(db, target.id, kw, target_success_rate=sr, freq_weight=fw)
             remaining = max(0, calc["clicks_per_day"] - calc["today_done"])
             total_budget += calc["clicks_per_day"]
             total_done += calc["today_done"]
@@ -2917,6 +3410,8 @@ async def get_search_strategy(target_id: int, db: Session = Depends(get_db)):
                 "suggested_clicks": calc["clicks_per_day"],
                 "today_done": calc["today_done"],
                 "remaining": remaining,
+                "freq_exact": freq_values.get(kw),
+                "freq_weight": round(fw, 2),
             })
         
         # Sort: high priority first, then by remaining budget desc
@@ -2960,4 +3455,214 @@ async def get_search_strategy(target_id: int, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         logger.error(f"Error generating strategy: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# Wordstat (keyword frequency)
+# ============================================================
+
+@router.post("/api/yandex-search-targets/{target_id}/wordstat")
+async def get_wordstat_frequency(target_id: int, body: Dict[str, Any] = {}, db: Session = Depends(get_db)):
+    """
+    Fetch Yandex Wordstat frequency for all keywords of a target.
+    If fresh=true in body, force re-fetch from API; otherwise return cached data from DB.
+    """
+    from core.wordstat_manager import get_keywords_frequency_batch
+    from app.config import settings as _ws_settings
+    from app.models.keyword_frequency import KeywordFrequency
+    from datetime import datetime
+
+    force_refresh = body.get("fresh", False) if body else False
+
+    try:
+        target = db.query(YandexSearchTarget).filter(YandexSearchTarget.id == target_id).first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Target not found")
+
+        keywords = target.get_keywords_list()
+        if not keywords:
+            return {"target_id": target_id, "frequencies": [], "cached": False}
+
+        # Check if we have cached data
+        cached = db.query(KeywordFrequency).filter(
+            KeywordFrequency.target_id == target_id
+        ).all()
+        cached_map = {c.keyword: c for c in cached}
+
+        # If have cached data for all keywords and not forcing refresh → return cache
+        if not force_refresh and cached_map and all(kw in cached_map for kw in keywords):
+            result = []
+            for kw in keywords:
+                c = cached_map[kw]
+                result.append(c.to_dict())
+            return {"target_id": target_id, "domain": target.domain, "frequencies": result, "cached": True}
+
+        # Fetch from API
+        api_key = _ws_settings.yandex_search_api_key
+        if not api_key:
+            raise HTTPException(status_code=400, detail="Yandex Search API key не настроен (YANDEX_BOT_YANDEX_SEARCH_API_KEY)")
+
+        folder_id = _ws_settings.yandex_search_folder_id
+        freq_map = get_keywords_frequency_batch(keywords, api_key, folder_id, delay=0.15)
+
+        # Save to DB
+        now = datetime.utcnow()
+        for kw, (broad, phrase, exact) in freq_map.items():
+            existing = cached_map.get(kw)
+            if existing:
+                existing.freq_broad = broad
+                existing.freq_phrase = phrase
+                existing.freq_exact = exact
+                existing.updated_at = now
+            else:
+                db.add(KeywordFrequency(
+                    target_id=target_id,
+                    keyword=kw,
+                    freq_broad=broad,
+                    freq_phrase=phrase,
+                    freq_exact=exact,
+                    updated_at=now,
+                ))
+        # Remove deleted keywords
+        for old_kw in cached_map:
+            if old_kw not in keywords:
+                db.delete(cached_map[old_kw])
+        db.commit()
+
+        # Build response
+        result = []
+        for kw in keywords:
+            broad, phrase, exact = freq_map.get(kw, (None, None, None))
+            result.append({
+                "keyword": kw,
+                "freq_broad": broad,
+                "freq_phrase": phrase,
+                "freq_exact": exact,
+                "updated_at": now.isoformat(),
+            })
+
+        return {
+            "target_id": target_id,
+            "domain": target.domain,
+            "frequencies": result,
+            "cached": False,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Wordstat error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Error Logs API
+# ============================================================================
+
+@router.get("/api/error-logs")
+async def get_error_logs(
+    db: Session = Depends(get_db),
+    category: str = None,
+    domain: str = None,
+    days: int = 7,
+    limit: int = 200,
+):
+    """Get error logs with optional filtering."""
+    try:
+        from sqlalchemy import func as sqla_func
+
+        query = db.query(ErrorLog)
+
+        # Time filter
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        query = query.filter(ErrorLog.created_at >= cutoff)
+
+        if category:
+            query = query.filter(ErrorLog.error_category == category)
+        if domain:
+            query = query.filter(ErrorLog.domain == domain)
+
+        logs = query.order_by(ErrorLog.created_at.desc()).limit(min(limit, 1000)).all()
+        return [log.to_dict() for log in logs]
+    except Exception as e:
+        logger.error(f"Error getting error logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/error-logs/stats")
+async def get_error_logs_stats(
+    db: Session = Depends(get_db),
+    days: int = 7,
+):
+    """Get aggregated error statistics."""
+    try:
+        from sqlalchemy import func as sqla_func
+
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # By category (total for period)
+        by_category = db.query(
+            ErrorLog.error_category,
+            sqla_func.count().label('count')
+        ).filter(
+            ErrorLog.created_at >= cutoff
+        ).group_by(ErrorLog.error_category).all()
+
+        # By category (today only)
+        by_category_today = db.query(
+            ErrorLog.error_category,
+            sqla_func.count().label('count')
+        ).filter(
+            ErrorLog.created_at >= today_start
+        ).group_by(ErrorLog.error_category).all()
+
+        # By domain (top 20 for period)
+        by_domain = db.query(
+            ErrorLog.domain,
+            sqla_func.count().label('count')
+        ).filter(
+            ErrorLog.created_at >= cutoff,
+            ErrorLog.domain.isnot(None)
+        ).group_by(ErrorLog.domain).order_by(sqla_func.count().desc()).limit(20).all()
+
+        # By proxy (top 10 for period)
+        by_proxy = db.query(
+            ErrorLog.proxy_host,
+            sqla_func.count().label('count')
+        ).filter(
+            ErrorLog.created_at >= cutoff,
+            ErrorLog.proxy_host.isnot(None)
+        ).group_by(ErrorLog.proxy_host).order_by(sqla_func.count().desc()).limit(10).all()
+
+        # Daily trend (last N days)
+        from sqlalchemy import cast, Date
+        daily_trend = db.query(
+            cast(ErrorLog.created_at, Date).label('date'),
+            sqla_func.count().label('count')
+        ).filter(
+            ErrorLog.created_at >= cutoff
+        ).group_by(cast(ErrorLog.created_at, Date)).order_by(cast(ErrorLog.created_at, Date)).all()
+
+        # Avg duration by category
+        avg_duration = db.query(
+            ErrorLog.error_category,
+            sqla_func.avg(ErrorLog.task_duration_seconds).label('avg_duration')
+        ).filter(
+            ErrorLog.created_at >= cutoff,
+            ErrorLog.task_duration_seconds.isnot(None)
+        ).group_by(ErrorLog.error_category).all()
+
+        return {
+            "by_category": {r.error_category: r.count for r in by_category},
+            "by_category_today": {r.error_category: r.count for r in by_category_today},
+            "by_domain": {r.domain: r.count for r in by_domain},
+            "by_proxy": {r.proxy_host: r.count for r in by_proxy},
+            "daily_trend": [{"date": str(r.date), "count": r.count} for r in daily_trend],
+            "avg_duration": {r.error_category: round(r.avg_duration, 1) if r.avg_duration else None for r in avg_duration},
+            "total": sum(r.count for r in by_category),
+            "total_today": sum(r.count for r in by_category_today),
+        }
+    except Exception as e:
+        logger.error(f"Error getting error stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -28,7 +28,11 @@ celery_app.conf.update(
     enable_utc=True,
 
     # Task routing — each task type gets its own dedicated queue
+    # Schedulers & watchdogs go to 'yandex_search' — search worker always has free slots when scheduler needs to run
     task_routes={
+        'tasks.yandex_search.schedule_search_visits': {'queue': 'yandex_search'},
+        'tasks.yandex_search.daily_search_stats_reset': {'queue': 'yandex_search'},
+        'tasks.yandex_scheduler.queue_watchdog': {'queue': 'yandex_search'},
         'tasks.warmup.*': {'queue': 'warmup'},
         'tasks.yandex_maps.*': {'queue': 'yandex_maps'},
         'tasks.yandex_search.*': {'queue': 'yandex_search'},
@@ -39,8 +43,8 @@ celery_app.conf.update(
 
     # Worker settings
     worker_prefetch_multiplier=1,
-    task_acks_late=False,
-    worker_max_tasks_per_child=1000,
+    task_acks_late=True,
+    worker_max_tasks_per_child=10,
 
     # Task settings
     task_soft_time_limit=1800,  # 30 minutes
@@ -115,6 +119,14 @@ celery_app.conf.update(
             'task': 'tasks.warmup.auto_schedule_initial_warmup',
             'schedule': crontab(minute='*/5'),
         },
+        'cleanup-orphaned-chrome': {
+            'task': 'tasks.warmup.cleanup_orphaned_chrome_processes',
+            'schedule': crontab(minute='*/10'),
+        },
+        'auto-maintain-profile-pool': {
+            'task': 'tasks.warmup.auto_maintain_profile_pool',
+            'schedule': crontab(minute='*/5'),
+        },
     }
 )
 
@@ -128,20 +140,6 @@ celery_app.autodiscover_tasks([
     'tasks.maintenance',
     'parser',
 ])
-
-
-# Pre-patch chromedriver once BEFORE any task is dispatched to workers.
-# This avoids the race condition where multiple ForkPoolWorkers try to
-# patch the same binary simultaneously.
-@signals.worker_init.connect
-def _pre_patch_chromedriver_on_worker_init(**kwargs):
-    """Eagerly patch chromedriver when the Celery worker process starts."""
-    try:
-        from core.browser_manager import _ensure_patched_chromedriver
-        path = _ensure_patched_chromedriver()
-        logger.info(f"🔧 Chromedriver pre-patched at worker init: {path}")
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to pre-patch chromedriver at worker init: {e}")
 
 
 # Reap zombie Chrome processes periodically and on worker shutdown.
@@ -177,23 +175,64 @@ def _reap_zombie_chrome():
 
 @signals.worker_process_init.connect
 def _reseed_random_on_fork(**kwargs):
-    """Re-seed random module after fork to avoid all workers sharing the same sequence."""
+    """Re-seed random on fork. Do NOT kill Chrome here — other workers may be using them!"""
     import random
     import os
     random.seed(os.urandom(32))
     logger.info("🎲 Random re-seeded in forked worker (pid=%d)", os.getpid())
 
+    # Only reap zombie children of THIS process (safe, targeted)
+    try:
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+            except ChildProcessError:
+                break
+    except Exception:
+        pass
+
+    # NOTE: Do NOT clean SingletonLock files here — other workers may have active browsers.
+    # Lock files are cleaned per-profile in BrowserManager.create_browser_session() instead.
+
+
+@signals.worker_process_shutdown.connect
+def _cleanup_playwright_on_process_exit(**kwargs):
+    """Clean up Playwright instance when this worker process is being replaced.
+    
+    Called when max-tasks-per-child triggers. Properly closes this process's
+    Playwright Node.js driver and its Chrome children without affecting other workers.
+    """
+    import os
+    logger.info("🔄 Worker process %d shutting down — cleaning up Playwright...", os.getpid())
+    try:
+        from core.browser_manager import _playwright_instance
+        if _playwright_instance is not None:
+            try:
+                _playwright_instance.stop()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 @signals.worker_shutdown.connect
 def _cleanup_chrome_on_worker_shutdown(**kwargs):
-    """Kill all Chrome processes when Celery worker shuts down."""
-    logger.info("🛑 Worker shutting down — cleaning up Chrome processes...")
-    _reap_zombie_chrome()
+    """Kill all Chrome processes when the entire Celery worker shuts down.
+    Safe here because ALL worker processes are shutting down."""
+    logger.info("🛑 Worker shutting down — cleaning up ALL Chrome processes...")
+    try:
+        from core.browser_manager import cleanup_all_chrome
+        cleanup_all_chrome()
+    except Exception:
+        pass
 
 
 @signals.task_postrun.connect
 def _reap_zombies_after_task(**kwargs):
-    """Reap zombie children after every task completes."""
+    """Reap zombie children after every task completes.
+    SAFE: Only reaps zombies of THIS process, does NOT kill other workers' Chrome."""
     import os
     try:
         while True:
@@ -204,38 +243,27 @@ def _reap_zombies_after_task(**kwargs):
         pass
     except Exception:
         pass
+    # Periodically clean up truly orphaned Chrome (every ~20 tasks)
+    # Uses the SAFE version that only kills Chrome with no live parent worker
+    import random
+    if random.random() < 0.05:
+        try:
+            from core.browser_manager import cleanup_orphaned_chrome
+            cleanup_orphaned_chrome()
+        except Exception:
+            pass
 
 
 @signals.task_failure.connect
 def _cleanup_chrome_after_task_failure(**kwargs):
-    """Clean up stale Chrome processes after a task fails.
+    """Clean up truly orphaned Chrome after task failure.
     
-    When uc.Chrome() fails with 'session not created', Chrome/chromedriver
-    processes leak because browser_id is never returned. This targeted
-    cleanup kills Chrome processes that have been running longer than the
-    task time limit, which are certainly orphans.
+    Uses the SAFE orphan detection (checks parent chain) instead of
+    killing by age, since active tasks can run up to 18 minutes.
     """
-    import os, subprocess
     try:
-        # Kill chromedriver processes that have no parent (orphaned)
-        # Use ps to find chrome processes older than 5 minutes
-        result = subprocess.run(
-            ['sh', '-c',
-             "ps -eo pid,etimes,comm | grep -E 'chrome|chromedriver' | awk '$2 > 300 {print $1}'"],
-            capture_output=True, text=True, timeout=5
-        )
-        stale_pids = result.stdout.strip().split('\n')
-        killed = 0
-        for pid_str in stale_pids:
-            pid_str = pid_str.strip()
-            if pid_str and pid_str.isdigit():
-                try:
-                    os.kill(int(pid_str), 9)
-                    killed += 1
-                except (ProcessLookupError, PermissionError):
-                    pass
-        if killed:
-            logger.info(f"🧹 Killed {killed} stale Chrome processes (>5min old) after task failure")
+        from core.browser_manager import cleanup_orphaned_chrome
+        cleanup_orphaned_chrome()
     except Exception:
         pass
 
@@ -272,7 +300,7 @@ class BaseTask(celery_app.Task):
     def on_success(self, retval, task_id, args, kwargs):
         """Called when task succeeds."""
         # Check if the task returned an error status (caught exception, returned dict with status='error')
-        is_logical_error = isinstance(retval, dict) and retval.get('status') in ('error', 'not_found')
+        is_logical_error = isinstance(retval, dict) and retval.get('status') in ('error', 'not_found', 'click_failed')
 
         if is_logical_error:
             logger.info(f"Task {task_id} finished with logical error: {retval.get('error', retval.get('status', 'unknown'))[:120]}")

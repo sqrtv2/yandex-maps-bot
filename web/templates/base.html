@@ -163,6 +163,18 @@
                             </a>
                         </li>
                         <li class="nav-item">
+                            <a class="nav-link {% if 'referrer-analytics' in request.url.path %}active{% endif %}" href="/referrer-analytics">
+                                <i class="bi bi-link-45deg"></i>
+                                Аналитика реферера
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if 'error-logs' in request.url.path %}active{% endif %}" href="/error-logs">
+                                <i class="bi bi-exclamation-triangle"></i>
+                                Журнал ошибок
+                            </a>
+                        </li>
+                        <li class="nav-item">
                             <a class="nav-link {% if 'domains' in request.url.path %}active{% endif %}" href="/domains">
                                 <i class="bi bi-globe"></i>
                                 Domain Management

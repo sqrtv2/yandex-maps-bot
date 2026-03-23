@@ -172,6 +172,16 @@ class Settings(BaseSettings):
         description="Referrer site URL to visit before ya.ru"
     )
 
+    # Yandex Search API / Wordstat
+    yandex_search_api_key: str = Field(
+        default="",
+        description="Yandex Search API key for Wordstat"
+    )
+    yandex_search_folder_id: str = Field(
+        default="",
+        description="Yandex Cloud folder ID for Wordstat API"
+    )
+
     # AI Persona Generator (Gemini / Vertex AI)
     gemini_api_key: str = Field(
         default="",

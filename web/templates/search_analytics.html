@@ -196,6 +196,12 @@
     <div class="card-header d-flex justify-content-between align-items-center">
         <h5 class="mb-0"><i class="bi bi-table"></i> Позиции по дням</h5>
         <div class="d-flex align-items-center gap-2">
+            <select class="form-select form-select-sm" style="width: 160px;" id="freqTypeSelect" onchange="rerenderPivot()">
+                <option value="">Без частотности</option>
+                <option value="exact" selected>!Точная</option>
+                <option value="phrase">"Фраза"</option>
+                <option value="broad">Общая</option>
+            </select>
             <small class="text-muted" id="pivotInfo">—</small>
             <button class="btn btn-sm btn-outline-secondary" onclick="loadPivot()">
                 <i class="bi bi-arrow-clockwise"></i>
@@ -260,6 +266,7 @@ let currentTargetId = null;
 let currentPeriod = 14;
 let positionChart = null;
 let analyticsData = null;
+let pivotData = null;
 let currentSort = 'position';
 
 const chartColors = [
@@ -750,7 +757,7 @@ async function loadStrategy() {
         // Recommendations table
         if (data.recommendations && data.recommendations.length) {
             html += '<div class="table-responsive"><table class="table table-sm table-hover mb-0">';
-            html += '<thead class="table-light"><tr><th>Ключ</th><th class="text-center">Поз.</th><th class="text-center">Фаза</th><th class="text-center">Сегодня</th></tr></thead><tbody>';
+            html += '<thead class="table-light"><tr><th>Ключ</th><th class="text-center">Поз.</th><th class="text-center">Фаза</th><th class="text-center">!Частота</th><th class="text-center">Сегодня</th></tr></thead><tbody>';
 
             const phaseLabels = {
                 'start': { text: 'Старт', cls: 'bg-secondary' },
@@ -783,6 +790,10 @@ async function loadStrategy() {
                     <td><small><strong>${r.keyword}</strong></small> ${trendArrow}</td>
                     <td class="text-center">${posText}</td>
                     <td class="text-center"><span class="badge ${phase.cls}" style="font-size:0.65rem;">${phase.text}</span></td>
+                    <td class="text-center">
+                        ${r.freq_exact != null ? `<small class="text-muted">${r.freq_exact.toLocaleString('ru-RU')}</small>` : '<small class="text-muted">—</small>'}
+                        ${r.freq_weight && r.freq_weight !== 1.0 ? `<br><span class="badge ${r.freq_weight > 1 ? 'bg-success' : 'bg-secondary'}" style="font-size:0.55rem;">×${r.freq_weight}</span>` : ''}
+                    </td>
                     <td class="text-center" style="min-width:80px;">
                         <div class="d-flex align-items-center justify-content-center gap-1">
                             <small class="fw-bold">${done}/${budget}</small>
@@ -818,11 +829,15 @@ async function loadStrategy() {
 async function loadPivot() {
     if (!currentTargetId) return;
     try {
-        const data = await apiCall(`/yandex-search-targets/${currentTargetId}/positions-pivot?days=${currentPeriod}`);
-        renderPivot(data);
+        pivotData = await apiCall(`/yandex-search-targets/${currentTargetId}/positions-pivot?days=${currentPeriod}`);
+        renderPivot(pivotData);
     } catch (err) {
         console.error('Pivot load failed:', err);
     }
+}
+
+function rerenderPivot() {
+    if (pivotData) renderPivot(pivotData);
 }
 
 function renderPivot(data) {
@@ -837,6 +852,10 @@ function renderPivot(data) {
         return;
     }
 
+    const freqType = document.getElementById('freqTypeSelect').value;
+    const freqMap = data.keyword_frequencies || {};
+    const showFreq = !!freqType;
+
     info.textContent = `${data.keywords.length} ключей × ${data.dates.length} дней`;
 
     // Format dates for display (DD.MM)
@@ -845,24 +864,58 @@ function renderPivot(data) {
         return parts[2] + '.' + parts[1];
     };
 
-    // Header row: keyword column + date columns (latest first)
+    // Header row
     let headHtml = '<tr><th class="sticky-start bg-light" style="min-width:200px; position:sticky; left:0; z-index:2;">Ключевое слово</th>';
+    if (showFreq) {
+        const freqLabels = { exact: '!Точная', phrase: '"Фраза"', broad: 'Общая' };
+        headHtml += `<th class="text-center bg-light" style="min-width:65px; position:sticky; left:200px; z-index:2; font-size:0.75rem;">${freqLabels[freqType]}</th>`;
+    }
     data.dates.forEach(d => {
         headHtml += `<th class="text-center text-nowrap" style="min-width:55px; font-size:0.75rem;">${fmtDate(d)}</th>`;
     });
     headHtml += '</tr>';
     thead.innerHTML = headHtml;
 
+    // Find max frequency for color scaling
+    let maxFreq = 0;
+    if (showFreq) {
+        data.keywords.forEach(kw => {
+            const f = freqMap[kw];
+            if (f) {
+                const val = f[freqType] || 0;
+                if (val > maxFreq) maxFreq = val;
+            }
+        });
+    }
+
     // Body: one row per keyword
     let bodyHtml = '';
     data.keywords.forEach(kw => {
         bodyHtml += `<tr><td class="fw-bold small bg-light" style="position:sticky; left:0; z-index:1; white-space:nowrap; max-width:250px; overflow:hidden; text-overflow:ellipsis;" title="${kw}">${kw}</td>`;
+
+        if (showFreq) {
+            const f = freqMap[kw];
+            const val = f ? (f[freqType] || 0) : null;
+            if (val !== null && val !== undefined) {
+                // Color scale: brighter for higher frequencies
+                const ratio = maxFreq > 0 ? val / maxFreq : 0;
+                let bg, fg;
+                if (ratio >= 0.7) { bg = '#198754'; fg = '#fff'; }
+                else if (ratio >= 0.4) { bg = '#ffc107'; fg = '#000'; }
+                else if (ratio >= 0.1) { bg = '#fd7e14'; fg = '#fff'; }
+                else { bg = '#e9ecef'; fg = '#666'; }
+                const fmtVal = val >= 1000 ? (val / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : val.toString();
+                bodyHtml += `<td class="text-center" style="font-size:0.7rem; background:${bg}; color:${fg}; font-weight:600; position:sticky; left:200px; z-index:1;" title="${val.toLocaleString('ru-RU')}">${fmtVal}</td>`;
+            } else {
+                bodyHtml += `<td class="text-center text-muted" style="font-size:0.7rem; position:sticky; left:200px; z-index:1;">—</td>`;
+            }
+        }
+
         data.dates.forEach(d => {
             const cell = data.pivot[kw] ? data.pivot[kw][d] : null;
             if (!cell) {
                 bodyHtml += '<td class="text-center text-muted" style="font-size:0.75rem;">—</td>';
             } else if (cell.avg_position === null) {
-                // Checks happened but not found
                 bodyHtml += `<td class="text-center" style="font-size:0.75rem; background:#fff0f0;" title="Не найден (${cell.not_found} проверок)">✗</td>`;
             } else {
                 const pos = cell.avg_position;

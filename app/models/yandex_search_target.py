@@ -30,7 +30,7 @@ class YandexSearchTarget(Base):
     max_interval_minutes = Column(Integer, default=120)
     
     # Search behavior
-    max_search_pages = Column(Integer, default=4)  # How deep to search (pages 1-N)
+    max_search_pages = Column(Integer, default=5)  # How deep to search (pages 1-N)
     min_time_on_site = Column(Integer, default=30)  # Min seconds on target site
     max_time_on_site = Column(Integer, default=120)  # Max seconds on target site
     
@@ -114,9 +114,11 @@ class YandexSearchTarget(Base):
         return {k.strip().lower() for k in self.disabled_keywords.strip().split('\n') if k.strip()}
 
     def get_active_keywords_list(self):
-        """Get all keywords (disabled_keywords filtering is turned off)."""
-        # Previously filtered out disabled keywords — now returns ALL keywords
-        return self.get_keywords_list()
+        """Get keywords excluding manually disabled ones."""
+        disabled = self.get_disabled_keywords_set()
+        if not disabled:
+            return self.get_keywords_list()
+        return [k for k in self.get_keywords_list() if k.strip().lower() not in disabled]
 
     def disable_keyword(self, keyword: str):
         """Add a keyword to the disabled list."""

@@ -79,6 +79,50 @@ async def create_parse_task(data: Dict[str, Any], db: Session = Depends(get_db))
     return task.to_dict()
 
 
+@router.post("/api/parser/tasks/batch")
+async def create_batch_parse_tasks(data: Dict[str, Any], db: Session = Depends(get_db)):
+    """Create parse tasks for multiple regions (e.g. all MO cities)."""
+    search_query = data.get('search_query', '').strip()
+    if not search_query:
+        raise HTTPException(status_code=400, detail="search_query is required")
+
+    regions = data.get('regions', [])
+    if not regions or not isinstance(regions, list):
+        raise HTTPException(status_code=400, detail="regions list is required")
+
+    max_items = min(int(data.get('max_items', 100)), 500)
+    created_tasks = []
+
+    for region in regions:
+        region = str(region).strip()
+        if not region:
+            continue
+        task = ParseTask(
+            search_query=search_query,
+            region=region,
+            max_items=max_items,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+
+        try:
+            from parser.tasks import parse_yandex_maps_task
+            result = parse_yandex_maps_task.delay(task.id)
+            task.celery_task_id = result.id
+            db.commit()
+        except Exception as e:
+            logger.error(f"Failed to launch parse task for {region}: {e}")
+            task.status = ParseTaskStatus.FAILED
+            task.error_message = f"Failed to launch: {str(e)}"
+            db.commit()
+
+        created_tasks.append(task.to_dict())
+
+    logger.info(f"🚀 Batch parse: '{search_query}' × {len(created_tasks)} cities")
+    return {"created": len(created_tasks), "tasks": created_tasks}
+
+
 @router.get("/api/parser/tasks/{task_id}")
 async def get_parse_task(task_id: int, db: Session = Depends(get_db)):
     """Get parse task details."""
@@ -222,6 +266,41 @@ async def get_parser_stats(db: Session = Depends(get_db)):
     }
 
 
+# ─── Email Extraction ───────────────────────────────────
+
+@router.post("/api/parser/extract-emails")
+async def extract_emails(data: Dict[str, Any] = {}, db: Session = Depends(get_db)):
+    """Launch email extraction task for companies without email."""
+    from parser.tasks import extract_emails_task
+
+    search_query = data.get('search_query', None)
+
+    # Count how many need email
+    query = db.query(func.count(ParsedCompany.id)).filter(
+        ParsedCompany.website.isnot(None),
+        ParsedCompany.website != '',
+        (ParsedCompany.email.is_(None)) | (ParsedCompany.email == ''),
+    )
+    if search_query:
+        query = query.filter(ParsedCompany.search_query == search_query)
+    need_email = query.scalar() or 0
+
+    if need_email == 0:
+        return {'status': 'nothing_to_do', 'message': 'Все компании уже имеют email или не имеют сайта'}
+
+    task = extract_emails_task.apply_async(
+        kwargs={'search_query': search_query},
+        queue='parser',
+    )
+
+    return {
+        'status': 'started',
+        'celery_task_id': task.id,
+        'companies_to_process': need_email,
+        'message': f'Запущено извлечение email для {need_email} компаний'
+    }
+
+
 # ─── Export XLS ──────────────────────────────────────────
 
 @router.get("/api/parser/export")
@@ -316,12 +395,16 @@ async def export_companies_xls(
     # Save to buffer
     buffer = io.BytesIO()
     wb.save(buffer)
-    buffer.seek(0)
+    content = buffer.getvalue()
     
     filename = f"companies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     
-    return StreamingResponse(
-        buffer,
+    from fastapi.responses import Response
+    return Response(
+        content=content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Content-Length": str(len(content)),
+        }
     )

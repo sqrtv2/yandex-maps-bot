@@ -17,52 +17,83 @@
 
 <!-- Stats Cards -->
 <div class="row mb-4" id="statsCards">
-    <div class="col-md-3">
+    <div class="col-md-2">
         <div class="card text-white bg-primary shadow-sm">
             <div class="card-body py-3">
                 <div class="d-flex justify-content-between align-items-center">
                     <div>
-                        <h6 class="card-title mb-0">Всего целей</h6>
-                        <h3 class="mb-0" id="statTotal">0</h3>
+                        <h6 class="card-title mb-0">Целей / Активных</h6>
+                        <h3 class="mb-0"><span id="statTotal">0</span> / <span id="statActive" class="text-warning">0</span></h3>
                     </div>
                     <i class="bi bi-bullseye fs-1 opacity-50"></i>
                 </div>
             </div>
         </div>
     </div>
-    <div class="col-md-3">
+    <div class="col-md-2">
         <div class="card text-white bg-success shadow-sm">
             <div class="card-body py-3">
                 <div class="d-flex justify-content-between align-items-center">
                     <div>
-                        <h6 class="card-title mb-0">Активных</h6>
-                        <h3 class="mb-0" id="statActive">0</h3>
+                        <h6 class="card-title mb-0">Кликов сегодня</h6>
+                        <h3 class="mb-0" id="statTodayClicks">0</h3>
+                        <small class="opacity-75" id="statTodayDetail"></small>
                     </div>
-                    <i class="bi bi-check-circle fs-1 opacity-50"></i>
+                    <i class="bi bi-cursor fs-1 opacity-50"></i>
                 </div>
             </div>
         </div>
     </div>
-    <div class="col-md-3">
+    <div class="col-md-2">
         <div class="card text-white bg-info shadow-sm">
             <div class="card-body py-3">
                 <div class="d-flex justify-content-between align-items-center">
                     <div>
-                        <h6 class="card-title mb-0">Визитов сегодня</h6>
-                        <h3 class="mb-0" id="statTodayVisits">0</h3>
+                        <h6 class="card-title mb-0">Кликов вчера</h6>
+                        <h3 class="mb-0" id="statYesterdayClicks">0</h3>
+                        <small class="opacity-75" id="statYesterdayDetail"></small>
                     </div>
-                    <i class="bi bi-graph-up fs-1 opacity-50"></i>
+                    <i class="bi bi-clock-history fs-1 opacity-50"></i>
                 </div>
             </div>
         </div>
     </div>
-    <div class="col-md-3">
+    <div class="col-md-2">
         <div class="card text-white bg-warning shadow-sm">
+            <div class="card-body py-3">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h6 class="card-title mb-0">Капча сегодня</h6>
+                        <h3 class="mb-0" id="statCaptchaToday">0</h3>
+                        <small class="opacity-75" id="statCaptchaYesterday"></small>
+                    </div>
+                    <i class="bi bi-shield-exclamation fs-1 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-white bg-danger shadow-sm">
+            <div class="card-body py-3">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <h6 class="card-title mb-0">Ошибки сегодня</h6>
+                        <h3 class="mb-0" id="statFailedToday">0</h3>
+                        <small class="opacity-75" id="statNotFoundToday"></small>
+                    </div>
+                    <i class="bi bi-x-octagon fs-1 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-white shadow-sm" style="background-color: #6f42c1;">
             <div class="card-body py-3">
                 <div class="d-flex justify-content-between align-items-center">
                     <div>
                         <h6 class="card-title mb-0">Успешность</h6>
                         <h3 class="mb-0" id="statSuccessRate">0%</h3>
+                        <small class="opacity-75" id="statInProgress"></small>
                     </div>
                     <i class="bi bi-percent fs-1 opacity-50"></i>
                 </div>
@@ -75,7 +106,12 @@
 <div class="card shadow-sm mb-4">
     <div class="card-header d-flex justify-content-between align-items-center">
         <h5 class="mb-0"><i class="bi bi-link-45deg"></i> Настройка реферера</h5>
-        <span class="badge bg-info" id="referrerStatus">Загрузка...</span>
+        <div>
+            <a href="/referrer-analytics" class="btn btn-sm btn-outline-info me-2">
+                <i class="bi bi-graph-up"></i> Аналитика реферера
+            </a>
+            <span class="badge bg-info" id="referrerStatus">Загрузка...</span>
+        </div>
     </div>
     <div class="card-body">
         <div class="row align-items-end">
@@ -185,6 +221,62 @@
                 <button type="button" class="btn btn-danger" id="mkRemoveBtn" onclick="doRemoveKeywords()" disabled>
                     <i class="bi bi-trash"></i> Удалить выбранные
                 </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Keyword Toggle Modal -->
+<div class="modal fade" id="keywordToggleModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-dark text-white">
+                <h5 class="modal-title"><i class="bi bi-toggles"></i> Управление накруткой — <span id="ktDomain"></span></h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body p-0">
+                <div class="p-3 pb-0">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <span id="ktSummary" class="text-muted small"></span>
+                        <div class="btn-group btn-group-sm">
+                            <button class="btn btn-outline-danger" onclick="ktDisableZero()" title="Отключить все ключи с !Точной = 0">
+                                <i class="bi bi-x-circle"></i> Откл. нулевые
+                            </button>
+                            <button class="btn btn-outline-success" onclick="ktSetAll(true)"><i class="bi bi-check-all"></i> Вкл. все</button>
+                            <button class="btn btn-outline-danger" onclick="ktSetAll(false)"><i class="bi bi-x-lg"></i> Выкл. все</button>
+                        </div>
+                    </div>
+                </div>
+                <div id="ktContent" style="max-height:500px; overflow-y:auto;">
+                    <div class="text-center text-muted py-4"><div class="spinner-border"></div></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Закрыть</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Wordstat Modal -->
+<div class="modal fade" id="wordstatModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-info text-white">
+                <h5 class="modal-title"><i class="bi bi-bar-chart-line"></i> Частотность (Wordstat) — <span id="wsDomain"></span></h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div id="wsContent">
+                    <div class="text-center text-muted py-4"><div class="spinner-border text-info"></div> Загрузка данных из Яндекс Wordstat...</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <small class="text-muted me-auto" id="wsCacheInfo"></small>
+                <button type="button" class="btn btn-info text-white" onclick="loadWordstat(true)" id="wsRefreshBtn">
+                    <i class="bi bi-arrow-clockwise"></i> Обновить из API
+                </button>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Закрыть</button>
             </div>
         </div>
     </div>
@@ -371,13 +463,20 @@ let targets = [];
 document.addEventListener('DOMContentLoaded', () => {
     loadTargets();
     loadLogs();
+    setInterval(loadTargets, 30000);  // refresh stats + targets every 30s
     setInterval(loadLogs, 15000);
 });
 
+let realStats = {};  // cached stats from /api/yandex-search-stats
+
 async function loadTargets() {
     try {
-        const resp = await apiCall('/yandex-search-targets');
+        const [resp, statsResp] = await Promise.all([
+            apiCall('/yandex-search-targets'),
+            apiCall('/yandex-search-stats'),
+        ]);
         targets = resp;
+        realStats = statsResp;
         renderTargets();
         updateStats();
     } catch (err) {
@@ -388,15 +487,36 @@ async function loadTargets() {
 function updateStats() {
     const total = targets.length;
     const active = targets.filter(t => t.is_active).length;
-    const todayVisits = targets.reduce((s, t) => s + (t.today_visits || 0), 0);
-    const totalVisits = targets.reduce((s, t) => s + (t.total_visits || 0), 0);
-    const successVisits = targets.reduce((s, t) => s + (t.successful_visits || 0), 0);
-    const rate = totalVisits > 0 ? Math.round(successVisits / totalVisits * 100) : 0;
 
     document.getElementById('statTotal').textContent = total;
     document.getElementById('statActive').textContent = active;
-    document.getElementById('statTodayVisits').textContent = todayVisits;
-    document.getElementById('statSuccessRate').textContent = rate + '%';
+
+    if (realStats.today) {
+        const t = realStats.today;
+        document.getElementById('statTodayClicks').textContent = t.completed;
+        document.getElementById('statTodayDetail').textContent =
+            `${t.total} всего (${t.in_progress} в работе)`;
+        document.getElementById('statFailedToday').textContent = t.failed;
+        document.getElementById('statNotFoundToday').textContent =
+            `не найден: ${t.not_found}`;
+        const rate = t.total > 0 ? Math.round(t.completed / t.total * 100) : 0;
+        document.getElementById('statSuccessRate').textContent = rate + '%';
+        document.getElementById('statInProgress').textContent =
+            t.in_progress > 0 ? `⏳ ${t.in_progress} вып.` : '';
+    }
+
+    if (realStats.yesterday) {
+        const y = realStats.yesterday;
+        document.getElementById('statYesterdayClicks').textContent = y.completed;
+        document.getElementById('statYesterdayDetail').textContent =
+            `${y.total} всего, ❌ ${y.failed}`;
+    }
+
+    if (realStats.captcha) {
+        document.getElementById('statCaptchaToday').textContent = realStats.captcha.today;
+        document.getElementById('statCaptchaYesterday').textContent =
+            `вчера: ${realStats.captcha.yesterday}`;
+    }
 }
 
 function renderTargets() {
@@ -406,10 +526,18 @@ function renderTargets() {
         return;
     }
 
+    const domainToday = realStats.per_domain_today || {};
+    const domainYesterday = realStats.per_domain_yesterday || {};
+
     tbody.innerHTML = targets.map(t => {
         const keywords = t.keywords_list || [];
         const kwPreview = keywords.slice(0, 3).join(', ') + (keywords.length > 3 ? ` (+${keywords.length - 3})` : '');
-        const successRate = t.total_visits > 0 ? Math.round(t.successful_visits / t.total_visits * 100) : 0;
+
+        // Real stats from tasks table for this domain
+        const ds = domainToday[t.domain] || {completed: 0, failed: 0, not_found: 0, total: 0, in_progress: 0, pending: 0};
+        const dsY = domainYesterday[t.domain] || {completed: 0, failed: 0, not_found: 0, total: 0};
+        const realRate = ds.total > 0 ? Math.round(ds.completed / ds.total * 100) : 0;
+
         const statusBadge = t.is_active
             ? '<span class="badge bg-success">Активна</span>'
             : '<span class="badge bg-secondary">Пауза</span>';
@@ -423,14 +551,17 @@ function renderTargets() {
                 ${(t.disabled_keywords_list && t.disabled_keywords_list.length > 0) ? `<span class="badge bg-warning text-dark ms-1" title="Отключены: ${t.disabled_keywords_list.join(', ')}">🚫 ${t.disabled_keywords_list.length}</span>` : ''}
             </td>
             <td>
-                <span class="badge bg-info">${t.today_visits || 0}/${t.visits_per_day}</span>
+                <span class="badge bg-info">${ds.completed}/${t.visits_per_day}</span>
             </td>
             <td>
                 <small>
-                    <span class="text-success">${t.successful_visits || 0}</span> /
-                    <span class="text-danger">${t.failed_visits || 0}</span> /
-                    <span class="text-muted">${t.total_visits || 0}</span>
-                    <br><span class="badge ${successRate >= 70 ? 'bg-success' : successRate >= 40 ? 'bg-warning' : 'bg-danger'}">${successRate}%</span>
+                    <span class="text-success fw-bold">${ds.completed}</span> /
+                    <span class="text-danger">${ds.failed}</span> /
+                    ${ds.not_found > 0 ? `<span class="text-warning">${ds.not_found}</span> /` : ''}
+                    <span class="text-muted">${ds.total}</span>
+                    <br><span class="badge ${realRate >= 70 ? 'bg-success' : realRate >= 40 ? 'bg-warning' : 'bg-danger'}">${realRate}%</span>
+                    ${ds.in_progress > 0 ? `<span class="badge bg-primary ms-1">⏳ ${ds.in_progress}</span>` : ''}
+                    ${dsY.total > 0 ? `<br><small class="text-muted">вчера: ✅${dsY.completed} ❌${dsY.failed} (${dsY.total})</small>` : ''}
                 </small>
             </td>
             <td>
@@ -447,6 +578,12 @@ function renderTargets() {
                     </button>
                     <button class="btn btn-outline-danger" onclick="showManageKeywords(${t.id}, '${t.domain}')" title="Управление ключами (не найдены)">
                         <i class="bi bi-key"></i>
+                    </button>
+                    <button class="btn btn-outline-dark" onclick="showKeywordToggle(${t.id}, '${t.domain}')" title="Вкл/выкл ключевых слов">
+                        <i class="bi bi-toggles"></i>
+                    </button>
+                    <button class="btn btn-outline-info" onclick="showWordstat(${t.id}, '${t.domain}')" title="Частотность Wordstat">
+                        <i class="bi bi-bar-chart-line"></i>
                     </button>
                     <button class="btn btn-outline-primary" onclick="editTarget(${t.id})" title="Редактировать">
                         <i class="bi bi-pencil"></i>
@@ -632,7 +769,7 @@ function renderLogs(logs) {
 
         return `<tr>
             <td><small>${created}</small></td>
-            <td><small>#${t.profile_id || '—'}</small></td>
+            <td><small>#${t.profile_id || (t.parameters && t.parameters.profile_id) || '—'}</small></td>
             <td><small><strong>${keyword}</strong> → ${domain}</small></td>
             <td>${statusBadge}</td>
             <td><small>${details}</small></td>
@@ -799,6 +936,148 @@ async function enableAllKeywords() {
     }
 }
 
+// ===== Keyword Toggle (Enable/Disable from Boosting) =====
+let ktTargetId = null;
+
+function showKeywordToggle(id, domain) {
+    ktTargetId = id;
+    document.getElementById('ktDomain').textContent = domain;
+    document.getElementById('ktContent').innerHTML = '<div class="text-center text-muted py-4"><div class="spinner-border"></div></div>';
+    document.getElementById('ktSummary').textContent = '';
+    new bootstrap.Modal(document.getElementById('keywordToggleModal')).show();
+    renderKeywordToggle();
+}
+
+function renderKeywordToggle() {
+    const targetData = targets.find(t => t.id === ktTargetId);
+    if (!targetData) return;
+
+    const allKws = targetData.keywords_list || [];
+    const disabledSet = new Set((targetData.disabled_keywords_list || []).map(k => k.toLowerCase()));
+    const freqs = targetData.keyword_frequencies || {};
+    const activeCount = allKws.filter(k => !disabledSet.has(k.toLowerCase())).length;
+
+    document.getElementById('ktSummary').innerHTML =
+        `<span class="text-success fw-bold">${activeCount}</span> активных / ` +
+        `<span class="text-danger fw-bold">${disabledSet.size}</span> отключённых / ` +
+        `<span class="text-muted">${allKws.length}</span> всего`;
+
+    let html = '<table class="table table-sm table-hover mb-0">';
+    html += '<thead class="table-light sticky-top"><tr>';
+    html += '<th style="width:40px;" class="text-center">#</th>';
+    html += '<th>Ключевое слово</th>';
+    html += '<th class="text-center" style="width:75px;" title="!Точная частота">!Точная</th>';
+    html += '<th class="text-center" style="width:75px;" title="Фразовая частота">&quot;Фраза&quot;</th>';
+    html += '<th class="text-center" style="width:75px;" title="Общая частота">Общая</th>';
+    html += '<th style="width:90px;" class="text-center">Накрутка</th>';
+    html += '</tr></thead><tbody>';
+
+    allKws.forEach((kw, i) => {
+        const isDisabled = disabledSet.has(kw.toLowerCase());
+        const safeKw = kw.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+        const f = freqs[kw.toLowerCase()] || {};
+        const exact = f.exact ?? null;
+        const phrase = f.phrase ?? null;
+        const broad = f.broad ?? null;
+
+        const fmtFreq = (v) => {
+            if (v === null || v === undefined) return '<span class="text-muted">—</span>';
+            if (v === 0) return '<span class="badge bg-danger">0</span>';
+            if (v < 10) return `<span class="badge bg-warning text-dark">${v}</span>`;
+            return `<span class="badge bg-success">${v.toLocaleString('ru-RU')}</span>`;
+        };
+
+        html += `<tr class="${isDisabled ? 'table-secondary' : exact === 0 ? 'table-danger bg-opacity-10' : ''}">
+            <td class="text-center text-muted">${i + 1}</td>
+            <td${isDisabled ? ' class="text-decoration-line-through text-muted"' : ''}>${safeKw}</td>
+            <td class="text-center">${fmtFreq(exact)}</td>
+            <td class="text-center">${fmtFreq(phrase)}</td>
+            <td class="text-center">${fmtFreq(broad)}</td>
+            <td class="text-center">
+                <div class="form-check form-switch d-flex justify-content-center mb-0">
+                    <input class="form-check-input" type="checkbox" role="switch"
+                        ${isDisabled ? '' : 'checked'}
+                        onchange="toggleKeyword('${safeKw.replace(/'/g, "\\'")}', this.checked)"
+                        style="cursor:pointer; width:3em; height:1.5em;">
+                </div>
+            </td>
+        </tr>`;
+    });
+
+    html += '</tbody></table>';
+    document.getElementById('ktContent').innerHTML = html;
+}
+
+async function toggleKeyword(keyword, enabled) {
+    try {
+        await apiCall(`/yandex-search-targets/${ktTargetId}/toggle-keyword`, 'POST', { keyword, enabled });
+        // Update local data
+        await loadTargets();
+        renderKeywordToggle();
+    } catch (err) {
+        alert('Ошибка: ' + (err.message || err));
+        renderKeywordToggle(); // revert UI
+    }
+}
+
+async function ktSetAll(enabled) {
+    const targetData = targets.find(t => t.id === ktTargetId);
+    if (!targetData) return;
+    const allKws = targetData.keywords_list || [];
+    const disabledSet = new Set((targetData.disabled_keywords_list || []).map(k => k.toLowerCase()));
+
+    // Filter to only keywords that actually need changing
+    const toChange = allKws.filter(k => enabled ? disabledSet.has(k.toLowerCase()) : !disabledSet.has(k.toLowerCase()));
+    if (toChange.length === 0) return;
+
+    if (!enabled && !confirm(`Отключить все ${toChange.length} ключевых слов от накрутки?`)) return;
+
+    document.getElementById('ktContent').innerHTML = '<div class="text-center py-4"><div class="spinner-border"></div><br><small class="text-muted">Обновление...</small></div>';
+
+    try {
+        await apiCall(`/yandex-search-targets/${ktTargetId}/toggle-keywords-batch`, 'POST', { keywords: toChange, enabled });
+        await loadTargets();
+        renderKeywordToggle();
+    } catch (err) {
+        alert('Ошибка: ' + (err.message || err));
+        await loadTargets();
+        renderKeywordToggle();
+    }
+}
+
+async function ktDisableZero() {
+    const targetData = targets.find(t => t.id === ktTargetId);
+    if (!targetData) return;
+    const allKws = targetData.keywords_list || [];
+    const freqs = targetData.keyword_frequencies || {};
+    const disabledSet = new Set((targetData.disabled_keywords_list || []).map(k => k.toLowerCase()));
+
+    // Find keywords with exact frequency = 0 that are currently enabled
+    const zeroKws = allKws.filter(kw => {
+        const f = freqs[kw.toLowerCase()];
+        return f && f.exact === 0 && !disabledSet.has(kw.toLowerCase());
+    });
+
+    if (zeroKws.length === 0) {
+        alert('Нет активных ключей с нулевой !Точной частотой');
+        return;
+    }
+
+    if (!confirm(`Отключить ${zeroKws.length} ключей с !Точной = 0?\n\n${zeroKws.join('\n')}`)) return;
+
+    document.getElementById('ktContent').innerHTML = '<div class="text-center py-4"><div class="spinner-border"></div><br><small class="text-muted">Отключение нулевых...</small></div>';
+
+    try {
+        await apiCall(`/yandex-search-targets/${ktTargetId}/toggle-keywords-batch`, 'POST', { keywords: zeroKws, enabled: false });
+        await loadTargets();
+        renderKeywordToggle();
+    } catch (err) {
+        alert('Ошибка: ' + (err.message || err));
+        await loadTargets();
+        renderKeywordToggle();
+    }
+}
+
 // === Referrer Settings ===
 async function loadReferrerSettings() {
     try {
@@ -843,5 +1122,92 @@ async function saveReferrerSettings() {
 
 // Load referrer settings on page load
 loadReferrerSettings();
+
+// === Wordstat (keyword frequency) ===
+let wsTargetId = null;
+
+function showWordstat(targetId, domain) {
+    wsTargetId = targetId;
+    document.getElementById('wsDomain').textContent = domain;
+    document.getElementById('wsContent').innerHTML = '<div class="text-center text-muted py-4"><div class="spinner-border text-info"></div> Загрузка...</div>';
+    document.getElementById('wsCacheInfo').textContent = '';
+    new bootstrap.Modal(document.getElementById('wordstatModal')).show();
+    loadWordstat(false);
+}
+
+function fmtFreq(v) {
+    if (v === null || v === undefined) return '<span class="badge bg-danger">—</span>';
+    const cls = v > 1000 ? 'bg-success' : v > 100 ? 'bg-info' : v > 0 ? 'bg-warning text-dark' : 'bg-secondary';
+    return `<span class="badge ${cls}">${v.toLocaleString('ru-RU')}</span>`;
+}
+
+async function loadWordstat(fresh) {
+    const btn = document.getElementById('wsRefreshBtn');
+    if (fresh) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Загрузка...';
+        document.getElementById('wsContent').innerHTML = '<div class="text-center text-muted py-4"><div class="spinner-border text-info"></div> Запрос к Яндекс Wordstat API (3 запроса на ключ)...<br><small>Это может занять некоторое время</small></div>';
+    }
+    try {
+        const payload = fresh ? {fresh: true} : {};
+        const data = await apiCall(`/yandex-search-targets/${wsTargetId}/wordstat`, 'POST', payload);
+        const freqs = data.frequencies || [];
+        if (!freqs.length) {
+            document.getElementById('wsContent').innerHTML = '<div class="text-center text-muted py-3">Нет ключевых слов</div>';
+            return;
+        }
+        // Sort by broad freq desc (null last)
+        freqs.sort((a, b) => {
+            const av = a.freq_broad, bv = b.freq_broad;
+            if (av === null && bv === null) return 0;
+            if (av === null) return 1;
+            if (bv === null) return -1;
+            return bv - av;
+        });
+        const totalBroad = freqs.reduce((s, e) => s + (e.freq_broad || 0), 0);
+        const totalPhrase = freqs.reduce((s, e) => s + (e.freq_phrase || 0), 0);
+        const totalExact = freqs.reduce((s, e) => s + (e.freq_exact || 0), 0);
+
+        let html = `<div class="mb-2 d-flex gap-3 flex-wrap">
+            <span><strong>Ключей:</strong> ${freqs.length}</span>
+            <span>Σ общая: <strong>${totalBroad.toLocaleString('ru-RU')}</strong></span>
+            <span>Σ "фраза": <strong>${totalPhrase.toLocaleString('ru-RU')}</strong></span>
+            <span>Σ "!точная": <strong>${totalExact.toLocaleString('ru-RU')}</strong></span>
+        </div>`;
+        html += `<table class="table table-sm table-hover">
+            <thead class="table-light"><tr>
+                <th>#</th>
+                <th>Ключевое слово</th>
+                <th class="text-end" title="Общая частотность (все словоформы, любой порядок)">Общая</th>
+                <th class="text-end" title="Фразовая &quot;в кавычках&quot; (точная фраза, все словоформы)">"Фраза"</th>
+                <th class="text-end" title="Точная &quot;!слово&quot; (точные словоформы)">"!Точная"</th>
+            </tr></thead><tbody>`;
+        freqs.forEach((item, i) => {
+            html += `<tr>
+                <td>${i+1}</td>
+                <td>${item.keyword}</td>
+                <td class="text-end">${fmtFreq(item.freq_broad)}</td>
+                <td class="text-end">${fmtFreq(item.freq_phrase)}</td>
+                <td class="text-end">${fmtFreq(item.freq_exact)}</td>
+            </tr>`;
+        });
+        html += '</tbody></table>';
+        document.getElementById('wsContent').innerHTML = html;
+
+        // Cache info
+        if (data.cached) {
+            const upd = freqs[0]?.updated_at;
+            const dt = upd ? new Date(upd).toLocaleString('ru-RU') : '?';
+            document.getElementById('wsCacheInfo').textContent = `Из кэша (обновлено: ${dt})`;
+        } else {
+            document.getElementById('wsCacheInfo').textContent = 'Загружено из API';
+        }
+    } catch (err) {
+        document.getElementById('wsContent').innerHTML = `<div class="alert alert-danger">${err.message || err}</div>`;
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-arrow-clockwise"></i> Обновить из API';
+    }
+}
 </script>
 {% endblock %}

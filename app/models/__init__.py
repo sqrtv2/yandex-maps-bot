@@ -13,6 +13,8 @@ from .profile_search_visit import ProfileSearchVisit
 from .search_position_history import SearchPositionHistory
 from .parsed_company import ParsedCompany
 from .parse_task import ParseTask, ParseTaskStatus
+from .keyword_frequency import KeywordFrequency
+from .error_log import ErrorLog
 
 __all__ = [
     "BrowserProfile",
@@ -30,5 +32,7 @@ __all__ = [
     "SearchPositionHistory",
     "ParsedCompany",
     "ParseTask",
-    "ParseTaskStatus"
+    "ParseTaskStatus",
+    "KeywordFrequency",
+    "ErrorLog"
 ]
