@@ -11,6 +11,7 @@ services:
       - YANDEX_BOT_REDIS_PORT=6379
       - YANDEX_BOT_DEBUG=false
       - YANDEX_BOT_BROWSER_HEADLESS=true
+      - YANDEX_BOT_YANDEX_SEARCH_API_KEY=${YANDEX_SEARCH_API_KEY:-}
       - AUTH_USERNAME=admin
       - AUTH_PASSWORD=admin123
     volumes:
