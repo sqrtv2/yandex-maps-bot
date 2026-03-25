@@ -234,7 +234,9 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
             profile_data['audio_fingerprint'] = profile_data_from_db['audio_fingerprint']
         _db_screen = profile_data_from_db.get('screen_fingerprint')
         if _db_screen and isinstance(_db_screen, dict):
-            for _key in ('css_media', 'feature_flags', 'audio_properties', 'speech_voices', 'sensor'):
+            for _key in ('css_media', 'feature_flags', 'audio_properties', 'speech_voices', 'sensor',
+                         'connection_info', 'storage_quota', 'heap_size', 'system_colors',
+                         'system_fonts', 'codecs', 'keyboard_layout', 'fonts'):
                 if _key in _db_screen:
                     profile_data[_key] = _db_screen[_key]
         

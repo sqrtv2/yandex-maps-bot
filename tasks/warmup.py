@@ -1539,6 +1539,11 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
                 profile_data['speech_voices'] = profile_screen_fp['speech_voices']
             if 'sensor' in profile_screen_fp:
                 profile_data['sensor'] = profile_screen_fp['sensor']
+            # New fingerprint vectors
+            for key in ('connection_info', 'storage_quota', 'heap_size', 'system_colors',
+                        'system_fonts', 'codecs', 'keyboard_layout', 'fonts'):
+                if key in profile_screen_fp:
+                    profile_data[key] = profile_screen_fp[key]
         
         if is_mobile:
             logger.info(f"📱 Mobile warmup profile: {profile_name}")

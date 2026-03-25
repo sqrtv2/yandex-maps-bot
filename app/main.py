@@ -602,6 +602,14 @@ async def create_profile(profile_data: Dict[str, Any], db: Session = Depends(get
             "feature_flags": p.get("feature_flags", {}),
             "audio_properties": p.get("audio_properties", {}),
             "speech_voices": p.get("speech_voices", []),
+            "connection_info": p.get("connection_info", {}),
+            "storage_quota": p.get("storage_quota", 599720927232),
+            "heap_size": p.get("heap_size", 4294705152),
+            "system_colors": p.get("system_colors", {}),
+            "system_fonts": p.get("system_fonts", []),
+            "codecs": p.get("codecs", []),
+            "keyboard_layout": p.get("keyboard_layout", []),
+            "fonts": p.get("fonts", []),
         }
         if p.get("sensor"):
             screen_fp["sensor"] = p["sensor"]
