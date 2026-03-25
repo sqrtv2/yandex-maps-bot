@@ -29,6 +29,24 @@ from .celery_app import BaseTask
 
 # Fast mode: reduce all delays by this factor for higher throughput
 FAST_MODE = getattr(settings, 'fast_mode', False)
+
+
+def recover_stuck_warming_profiles():
+    """Reset profiles stuck in 'warming_up' after container restart.
+    Called at module load time so orphaned profiles get re-queued."""
+    try:
+        with get_db_session() as db:
+            stuck = db.query(BrowserProfile).filter(BrowserProfile.status == "warming_up").all()
+            if stuck:
+                for p in stuck:
+                    p.status = "created" if not p.warmup_completed else "warmed"
+                db.commit()
+                logger.info(f"♻️ Recovered {len(stuck)} profiles stuck in 'warming_up' after restart")
+    except Exception as e:
+        logger.warning(f"Failed to recover stuck profiles: {e}")
+
+
+recover_stuck_warming_profiles()
 SPEED_FACTOR = 0.5 if FAST_MODE else 1.0  # 50% of normal time in fast mode
 
 logger = logging.getLogger(__name__)
@@ -1870,6 +1888,17 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
 
     except SoftTimeLimitExceeded:
         logger.error(f"⏰ Soft time limit exceeded for warmup profile {profile_id}, cleaning up Chrome...")
+        try:
+            with get_db_session() as db:
+                profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+                if profile_obj:
+                    if profile_obj.warmup_completed:
+                        profile_obj.status = "warmed"
+                    else:
+                        profile_obj.status = "created"
+                    db.commit()
+        except:
+            pass
         raise
 
     except Exception as e:
@@ -1887,6 +1916,11 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
                     db.commit()
         except:
             pass
+
+        # Don't retry if profile was deleted
+        if isinstance(e, ValueError) and 'not found' in str(e):
+            logger.warning(f"Profile {profile_id} not found, skipping retry")
+            raise e
 
         if self.request.retries < self.max_retries:
             raise self.retry(exc=e)
