@@ -677,6 +677,32 @@ class BrowserManager:
             # Audio properties
             audio_props = profile_data.get("audio_properties", {})
 
+            # New fingerprint vectors
+            connection_info = profile_data.get("connection_info", {})
+            storage_quota = profile_data.get("storage_quota", 599720927232)
+            heap_size = profile_data.get("heap_size", 4294705152)
+            system_colors = profile_data.get("system_colors", {})
+            system_fonts_list = profile_data.get("system_fonts", [])
+            codecs_list = profile_data.get("codecs", [])
+            keyboard_layout = profile_data.get("keyboard_layout", [])
+            fonts_list = profile_data.get("fonts", [])
+
+            # Extract chrome version from user_agent for userAgentData mock
+            import re as _re
+            _ua = profile_data.get("user_agent", "")
+            _cv_match = _re.search(r'Chrome/(\d+[\.\d]*)', _ua)
+            chrome_version = _cv_match.group(1) if _cv_match else "131.0.0.0"
+            # Platform name for userAgentData (Windows/macOS/Linux)
+            _plat = profile_data.get("platform", "Win32")
+            if "Win" in _plat:
+                platform_name = "Windows"
+            elif "Mac" in _plat or "iPhone" in _plat or "iPad" in _plat:
+                platform_name = "macOS"
+            elif "Linux" in _plat or "Android" in _plat:
+                platform_name = "Linux"
+            else:
+                platform_name = "Windows"
+
             # Serialize WebGL profile data as JSON for JS injection
             import json as _json
             webgl_profile_json = _json.dumps(webgl_data)
@@ -1275,7 +1301,30 @@ class BrowserManager:
                         '(inverted-colors: none)': _cssMedia.invertedColors === 'none',
                         '(dynamic-range: high)': _cssMedia.dynamicRange === 'high',
                         '(dynamic-range: standard)': _cssMedia.dynamicRange === 'standard',
+                        // New CSS media queries
+                        '(color-gamut: srgb)': _cssMedia.colorGamut === 'srgb',
+                        '(color-gamut: p3)': _cssMedia.colorGamut === 'p3',
+                        '(color-gamut: rec2020)': _cssMedia.colorGamut === 'rec2020',
+                        '(color: 8)': _cssMedia.color === 8,
+                        '(color: 0)': _cssMedia.color === 0,
+                        '(color-index: 0)': _cssMedia.colorIndex === 0,
+                        '(grid: 0)': _cssMedia.grid === 0,
+                        '(monochrome: 0)': _cssMedia.monochrome === 0,
+                        '(orientation: landscape)': _cssMedia.orientation === 'landscape',
+                        '(orientation: portrait)': _cssMedia.orientation === 'portrait',
+                        '(overflow-block: scroll)': _cssMedia.overflowBlock === 'scroll',
+                        '(overflow-block: none)': _cssMedia.overflowBlock === 'none',
+                        '(prefers-reduced-transparency: no-preference)': _cssMedia.prefersReducedTransparency === 'no-preference',
+                        '(prefers-reduced-transparency: reduce)': _cssMedia.prefersReducedTransparency === 'reduce',
+                        '(update: fast)': _cssMedia.update === 'fast',
+                        '(update: slow)': _cssMedia.update === 'slow',
+                        '(update: none)': _cssMedia.update === 'none',
                     }};
+                    // Also handle resolution
+                    if (_cssMedia.resolution) {{
+                        mediaMap['(min-resolution: 1dppx)'] = true;
+                        mediaMap['(resolution: ' + _cssMedia.resolution + 'dppx)'] = true;
+                    }}
                     window.matchMedia = function(query) {{
                         const q = query.trim();
                         if (mediaMap.hasOwnProperty(q)) {{
@@ -1354,23 +1403,7 @@ class BrowserManager:
                 }}
             }} catch(e) {{}}
 
-            // --- Plugins & MimeTypes to look like real Chrome ---
-            try {{
-                Object.defineProperty(navigator, 'plugins', {{
-                    get: () => {{
-                        const arr = [
-                            {{name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format'}},
-                            {{name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: ''}},
-                            {{name: 'Native Client', filename: 'internal-nacl-plugin', description: ''}}
-                        ];
-                        arr.__proto__ = PluginArray.prototype;
-                        Object.defineProperty(arr, 'length', {{value: 3}});
-                        return arr;
-                    }},
-                    configurable: true,
-                    enumerable: true
-                }});
-            }} catch(e) {{}}
+            // --- Plugins & MimeTypes: handled by enhanced mock below ---
 
             // --- Permissions API patch (all permission types) ---
             try {{
@@ -1448,38 +1481,256 @@ class BrowserManager:
             // --- Audio properties override ---
             try {{
                 const _audioProps = {_json.dumps(audio_props)};
-                if (_audioProps && _audioProps.sampleRate) {{
+                if (_audioProps && (_audioProps.BaseAudioContextSampleRate || _audioProps.sampleRate)) {{
+                    const _sr = _audioProps.BaseAudioContextSampleRate || _audioProps.sampleRate;
+                    const _bl = _audioProps.AudioContextBaseLatency || _audioProps.baseLatency || 0.01;
+                    const _ol = _audioProps.AudioContextOutputLatency || _audioProps.outputLatency || 0;
+                    const _mc = _audioProps.AudioDestinationNodeMaxChannelCount || _audioProps.maxChannelCount || 2;
                     const OrigAudioCtx = window.AudioContext || window.webkitAudioContext;
                     if (OrigAudioCtx) {{
                         const origProto = OrigAudioCtx.prototype;
                         Object.defineProperty(origProto, 'sampleRate', {{
-                            get: function() {{ return _audioProps.sampleRate; }},
+                            get: function() {{ return _sr; }},
                             configurable: true
                         }});
-                        if (_audioProps.baseLatency !== undefined) {{
-                            Object.defineProperty(origProto, 'baseLatency', {{
-                                get: function() {{ return _audioProps.baseLatency; }},
-                                configurable: true
-                            }});
-                        }}
-                        if (_audioProps.outputLatency !== undefined) {{
-                            Object.defineProperty(origProto, 'outputLatency', {{
-                                get: function() {{ return _audioProps.outputLatency; }},
-                                configurable: true
-                            }});
-                        }}
+                        Object.defineProperty(origProto, 'baseLatency', {{
+                            get: function() {{ return _bl; }},
+                            configurable: true
+                        }});
+                        Object.defineProperty(origProto, 'outputLatency', {{
+                            get: function() {{ return _ol; }},
+                            configurable: true
+                        }});
                     }}
                     // Override destination maxChannelCount
-                    if (_audioProps.maxChannelCount !== undefined) {{
-                        const origMaxCh = Object.getOwnPropertyDescriptor(AudioDestinationNode.prototype, 'maxChannelCount');
-                        if (origMaxCh) {{
-                            Object.defineProperty(AudioDestinationNode.prototype, 'maxChannelCount', {{
-                                get: function() {{ return _audioProps.maxChannelCount; }},
-                                configurable: true
-                            }});
-                        }}
-                    }}
+                    try {{
+                        Object.defineProperty(AudioDestinationNode.prototype, 'maxChannelCount', {{
+                            get: function() {{ return _mc; }},
+                            configurable: true
+                        }});
+                    }} catch(e2) {{}}
                 }}
+            }} catch(e) {{}}
+
+            // --- Navigator.connection mock ---
+            try {{
+                const _connInfo = {_json.dumps(connection_info)};
+                if (_connInfo && _connInfo.effectiveType) {{
+                    const connObj = {{
+                        effectiveType: _connInfo.effectiveType,
+                        rtt: _connInfo.rtt || 50,
+                        downlink: parseFloat(_connInfo.downlink) || 4.7,
+                        saveData: _connInfo.saveData || false,
+                        onchange: null,
+                        addEventListener: function() {{}},
+                        removeEventListener: function() {{}},
+                        dispatchEvent: function() {{ return true; }},
+                    }};
+                    Object.defineProperty(Navigator.prototype, 'connection', {{
+                        get: function() {{ return connObj; }},
+                        configurable: true, enumerable: true
+                    }});
+                }}
+            }} catch(e) {{}}
+
+            // --- Storage quota mock ---
+            try {{
+                const _storageQuota = {storage_quota};
+                if (navigator.storage && navigator.storage.estimate) {{
+                    const origEstimate = navigator.storage.estimate.bind(navigator.storage);
+                    navigator.storage.estimate = function() {{
+                        return origEstimate().then(function(est) {{
+                            est.quota = _storageQuota;
+                            return est;
+                        }}).catch(function() {{
+                            return {{ quota: _storageQuota, usage: 0 }};
+                        }});
+                    }};
+                }}
+            }} catch(e) {{}}
+
+            // --- Performance.memory (heap size) mock ---
+            try {{
+                const _heapSize = {heap_size};
+                if (window.performance) {{
+                    Object.defineProperty(performance, 'memory', {{
+                        get: function() {{
+                            return {{
+                                jsHeapSizeLimit: _heapSize,
+                                totalJSHeapSize: Math.floor(_heapSize * 0.6),
+                                usedJSHeapSize: Math.floor(_heapSize * 0.4),
+                            }};
+                        }},
+                        configurable: true, enumerable: true
+                    }});
+                }}
+            }} catch(e) {{}}
+
+            // --- Keyboard layout mock ---
+            try {{
+                const _kbKeys = {_json.dumps(keyboard_layout)};
+                if (_kbKeys && _kbKeys.length > 0 && navigator.keyboard) {{
+                    const origGetLayoutMap = navigator.keyboard.getLayoutMap;
+                    navigator.keyboard.getLayoutMap = function() {{
+                        return Promise.resolve({{
+                            entries: function*() {{ for (const k of _kbKeys) yield [k, k]; }},
+                            keys: function*() {{ for (const k of _kbKeys) yield k; }},
+                            values: function*() {{ for (const k of _kbKeys) yield k; }},
+                            get: function(key) {{ return _kbKeys.includes(key) ? key : undefined; }},
+                            has: function(key) {{ return _kbKeys.includes(key); }},
+                            forEach: function(cb) {{ _kbKeys.forEach(function(k) {{ cb(k, k); }}); }},
+                            size: _kbKeys.length,
+                        }});
+                    }};
+                }}
+            }} catch(e) {{}}
+
+            // --- MediaCapabilities (codecs) mock ---
+            try {{
+                const _codecs = {_json.dumps(codecs_list)};
+                if (_codecs && _codecs.length > 0 && navigator.mediaCapabilities) {{
+                    const origDecode = navigator.mediaCapabilities.decodingInfo.bind(navigator.mediaCapabilities);
+                    navigator.mediaCapabilities.decodingInfo = function(config) {{
+                        const ct = config && config.audio ? config.audio.contentType : (config && config.video ? config.video.contentType : '');
+                        for (const c of _codecs) {{
+                            if (ct && ct === c.contentType) {{
+                                return Promise.resolve({{ supported: c.supported, smooth: c.smooth, powerEfficient: c.powerEfficient }});
+                            }}
+                        }}
+                        return origDecode(config);
+                    }};
+                }}
+            }} catch(e) {{}}
+
+            // --- Fonts detection (canvas-based font fingerprinting defense) ---
+            try {{
+                const _profileFonts = {_json.dumps(fonts_list)};
+                if (_profileFonts && _profileFonts.length > 0) {{
+                    // Font fingerprinting works by measuring text width with different fonts
+                    // We override measureText to give consistent results for profile fonts
+                    const _fontSet = new Set(_profileFonts);
+                    // Store reference for font detection scripts
+                    window.__profileFonts = _fontSet;
+                }}
+            }} catch(e) {{}}
+
+            // --- System colors override (getComputedStyle) ---
+            try {{
+                const _sysColors = {_json.dumps(system_colors)};
+                if (_sysColors && Object.keys(_sysColors).length > 0) {{
+                    const origGetComputed = window.getComputedStyle;
+                    window.getComputedStyle = function(el, pseudo) {{
+                        const result = origGetComputed.call(window, el, pseudo);
+                        const origGetProp = result.getPropertyValue.bind(result);
+                        result.getPropertyValue = function(prop) {{
+                            if (_sysColors[prop]) return _sysColors[prop];
+                            return origGetProp(prop);
+                        }};
+                        return result;
+                    }};
+                }}
+            }} catch(e) {{}}
+
+            // --- navigator.userAgentData mock ---
+            try {{
+                if (navigator.userAgentData) {{
+                    const _brands = [
+                        {{ brand: "Not/A)Brand", version: "8" }},
+                        {{ brand: "Chromium", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '131'}" }},
+                        {{ brand: "Google Chrome", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '131'}" }}
+                    ];
+                    Object.defineProperty(navigator, 'userAgentData', {{
+                        get: function() {{
+                            return {{
+                                brands: _brands,
+                                mobile: {'true' if is_mobile else 'false'},
+                                platform: "{platform_name}",
+                                getHighEntropyValues: function(hints) {{
+                                    return Promise.resolve({{
+                                        brands: _brands,
+                                        mobile: {'true' if is_mobile else 'false'},
+                                        platform: "{platform_name}",
+                                        platformVersion: "15.0.0",
+                                        architecture: "x86",
+                                        bitness: "64",
+                                        model: "",
+                                        uaFullVersion: "{chrome_version}",
+                                        fullVersionList: _brands.map(function(b) {{ return {{ brand: b.brand, version: "{chrome_version}" }}; }})
+                                    }});
+                                }},
+                                toJSON: function() {{
+                                    return {{ brands: _brands, mobile: {'true' if is_mobile else 'false'}, platform: "{platform_name}" }};
+                                }}
+                            }};
+                        }},
+                        configurable: true
+                    }});
+                }}
+            }} catch(e) {{}}
+
+            // --- Enhanced plugins/mimes mock ---
+            try {{
+                const pluginArr = [
+                    {{ name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
+                    {{ name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
+                    {{ name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
+                    {{ name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
+                    {{ name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format" }}
+                ];
+                const mimeArr = [
+                    {{ type: "application/pdf", suffixes: "pdf", description: "Portable Document Format" }},
+                    {{ type: "text/pdf", suffixes: "pdf", description: "Portable Document Format" }}
+                ];
+                // Build fake PluginArray
+                const fakePlugins = Object.create(PluginArray.prototype);
+                pluginArr.forEach(function(p, i) {{
+                    const plug = Object.create(Plugin.prototype);
+                    Object.defineProperties(plug, {{
+                        name: {{ value: p.name, enumerable: true }},
+                        filename: {{ value: p.filename, enumerable: true }},
+                        description: {{ value: p.description, enumerable: true }},
+                        length: {{ value: 2, enumerable: true }},
+                    }});
+                    Object.defineProperty(fakePlugins, i, {{ value: plug, enumerable: true }});
+                }});
+                Object.defineProperty(fakePlugins, 'length', {{ value: pluginArr.length }});
+                fakePlugins.item = function(i) {{ return fakePlugins[i] || null; }};
+                fakePlugins.namedItem = function(n) {{
+                    for (let i = 0; i < pluginArr.length; i++) {{ if (fakePlugins[i].name === n) return fakePlugins[i]; }}
+                    return null;
+                }};
+                fakePlugins.refresh = function() {{}};
+                Object.defineProperty(navigator, 'plugins', {{
+                    get: function() {{ return fakePlugins; }},
+                    configurable: true, enumerable: true
+                }});
+                // Build fake MimeTypeArray
+                const fakeMimes = Object.create(MimeTypeArray.prototype);
+                mimeArr.forEach(function(m, i) {{
+                    const mime = Object.create(MimeType.prototype);
+                    Object.defineProperties(mime, {{
+                        type: {{ value: m.type, enumerable: true }},
+                        suffixes: {{ value: m.suffixes, enumerable: true }},
+                        description: {{ value: m.description, enumerable: true }},
+                        enabledPlugin: {{ value: fakePlugins[0], enumerable: true }},
+                    }});
+                    Object.defineProperty(fakeMimes, i, {{ value: mime, enumerable: true }});
+                }});
+                Object.defineProperty(fakeMimes, 'length', {{ value: mimeArr.length }});
+                fakeMimes.item = function(i) {{ return fakeMimes[i] || null; }};
+                fakeMimes.namedItem = function(t) {{
+                    for (let i = 0; i < mimeArr.length; i++) {{ if (fakeMimes[i].type === t) return fakeMimes[i]; }}
+                    return null;
+                }};
+                Object.defineProperty(navigator, 'mimeTypes', {{
+                    get: function() {{ return fakeMimes; }},
+                    configurable: true, enumerable: true
+                }});
+                // Also define pdfViewerEnabled
+                Object.defineProperty(navigator, 'pdfViewerEnabled', {{
+                    get: function() {{ return true; }},
+                    configurable: true
+                }});
             }} catch(e) {{}}
 
             // --- Chrome runtime mock ---

@@ -573,6 +573,15 @@ class ProfileGenerator:
             profile["feature_flags"] = self._generate_feature_flags(is_mobile=is_mobile)
             profile["audio_properties"] = self._generate_audio_properties(is_mobile=is_mobile)
 
+            # Network/hardware fingerprints
+            profile["connection_info"] = self._generate_connection_info(is_mobile=is_mobile)
+            profile["storage_quota"] = self._generate_storage_quota(is_mobile=is_mobile)
+            profile["heap_size"] = self._generate_heap_size()
+            profile["system_colors"] = self._generate_system_colors()
+            profile["system_fonts"] = self._generate_system_fonts()
+            profile["codecs"] = self._generate_codecs()
+            profile["keyboard_layout"] = self._generate_keyboard_layout()
+
             # Generate profile hash for identification
             profile["profile_hash"] = self._generate_profile_hash(profile)
 
@@ -850,17 +859,37 @@ class ProfileGenerator:
                 "invertedColors": "none",
                 "dynamicRange": "high",
                 "videoDynamicRange": "high",
+                "colorGamut": "srgb",
+                "color": 8,
+                "colorIndex": 0,
+                "grid": "0",
+                "monochrome": 0,
+                "orientation": "portrait",
+                "overflowBlock": "scroll",
+                "prefersReducedTransparency": "no-preference",
+                "resolution": random.choice([320, 420, 480]),
+                "update": "fast",
             }
         return {
             "anyHover": "hover", "anyPointer": "fine",
             "hover": "hover", "pointer": "fine",
             "prefersColorScheme": random.choice(["light", "dark"]),
-            "prefersReducedMotion": "no-preference",
+            "prefersReducedMotion": random.choice(["no-preference", "reduce"]),
             "prefersContrast": "no-preference",
             "forcedColors": "none",
             "invertedColors": "none",
             "dynamicRange": "high",
             "videoDynamicRange": "high",
+            "colorGamut": "srgb",
+            "color": 8,
+            "colorIndex": 0,
+            "grid": "0",
+            "monochrome": 0,
+            "orientation": "landscape",
+            "overflowBlock": "scroll",
+            "prefersReducedTransparency": random.choice(["no-preference", "reduce"]),
+            "resolution": 96,
+            "update": "fast",
         }
 
     def _generate_audio_fingerprint(self) -> str:
@@ -937,39 +966,215 @@ class ProfileGenerator:
 
     def _generate_feature_flags(self, is_mobile: bool = False) -> Dict:
         """Generate feature detection flags matching device type."""
-        return dict(self._MOBILE_FEATURES if is_mobile else self._DESKTOP_FEATURES)
+        base = dict(self._MOBILE_FEATURES if is_mobile else self._DESKTOP_FEATURES)
+        # Extended flags matching competitor profiles
+        if is_mobile:
+            base.update({
+                "NavigatorContentUtils": False,
+                "CaptureHandle": False,
+                "RegionCapture": False,
+                "CaptureController": False,
+                "ConditionalFocus": False,
+                "DocumentPictureInPictureAPI": False,
+                "SmartCard": False,
+                "WebAppLaunchQueue": False,
+                "WebAppLaunchHandler": False,
+                "WebAppWindowControlsOverlay": False,
+                "AttributionReporting": False,
+                "FencedFrames": False,
+                "FencedFramesAPIChanges": False,
+                "Fledge": False,
+                "PrivacySandboxAdsAPIs": False,
+                "SharedStorageAPI": False,
+                "TopicsAPI": False,
+                "TopicsDocumentAPI": False,
+                "TopicsXHR": False,
+                "CapturedSurfaceControl": False,
+                "ElementCapture": False,
+                "WebPrinting": False,
+                "PrivateNetworkAccessPermissionPrompt": False,
+                "DigitalGoodsV2_1": False,
+                "DigitalGoods": False,
+                "SerialPortForget": False,
+                "SerialPortConnected": False,
+                "FileSystemAccessLocal": True,
+                "FileSystemAccessOriginPrivate": True,
+            })
+        else:
+            base.update({
+                "NavigatorContentUtils": True,
+                "CaptureHandle": True,
+                "RegionCapture": True,
+                "CaptureController": True,
+                "ConditionalFocus": True,
+                "DocumentPictureInPictureAPI": True,
+                "SmartCard": False,
+                "WebAppLaunchQueue": True,
+                "WebAppLaunchHandler": True,
+                "WebAppWindowControlsOverlay": True,
+                "AttributionReporting": False,
+                "FencedFrames": False,
+                "FencedFramesAPIChanges": False,
+                "Fledge": False,
+                "PrivacySandboxAdsAPIs": False,
+                "SharedStorageAPI": False,
+                "TopicsAPI": False,
+                "TopicsDocumentAPI": False,
+                "TopicsXHR": False,
+                "CapturedSurfaceControl": False,
+                "ElementCapture": False,
+                "WebPrinting": False,
+                "PrivateNetworkAccessPermissionPrompt": False,
+                "DigitalGoodsV2_1": False,
+                "DigitalGoods": False,
+                "SerialPortForget": True,
+                "SerialPortConnected": False,
+                "FileSystemAccessLocal": True,
+                "FileSystemAccessOriginPrivate": True,
+            })
+        return base
 
     def _generate_audio_properties(self, is_mobile: bool = False) -> Dict:
-        """Generate audio context properties (fingerprinting-relevant subset)."""
+        """Generate comprehensive audio context properties (all AudioNode defaults)."""
+        sr = 48000 if is_mobile else random.choice([44100, 48000])
+        max_freq = sr / 2  # Nyquist frequency
+        flt = 3.4028234663852886e+38
         return {
-            "sampleRate": 48000 if is_mobile else random.choice([44100, 48000]),
-            "baseLatency": round(random.uniform(0.002, 0.01), 4) if is_mobile else round(random.uniform(0.005, 0.02), 4),
-            "outputLatency": 0,
-            "maxChannelCount": 2,
+            "BaseAudioContextSampleRate": sr,
+            "AudioContextBaseLatency": round(random.uniform(0.005, 0.02), 4) if not is_mobile else round(random.uniform(0.002, 0.01), 4),
+            "AudioContextOutputLatency": 0,
+            "AudioDestinationNodeMaxChannelCount": 2,
+            "AnalyzerNodeFftSize": 2048,
+            "AnalyzerNodeFrequencyBinCount": 1024,
+            "AnalyzerNodeMinDecibels": -100,
+            "AnalyzerNodeMaxDecibels": -30,
+            "AnalyzerNodeSmoothingTimeConstant": 0.8,
+            "BiquadFilterNodeFrequencyDefaultValue": 350,
+            "BiquadFilterNodeFrequencyMaxValue": max_freq,
+            "BiquadFilterNodeFrequencyMinValue": 0,
+            "BiquadFilterNodeDetuneDefaultValue": 0,
+            "BiquadFilterNodeDetuneMaxValue": 153600,
+            "BiquadFilterNodeDetuneMinValue": -153600,
+            "BiquadFilterNodeQDefaultValue": 1,
+            "BiquadFilterNodeQMaxValue": flt,
+            "BiquadFilterNodeQMinValue": -flt,
+            "BiquadFilterNodeGainDefaultValue": 0,
+            "BiquadFilterNodeGainMaxValue": 1541.273681640625,
+            "BiquadFilterNodeGainMinValue": -flt,
+            "BiquadFilterNodeType": "lowpass",
+            "AudioBufferSourceNodeDetuneDefaultValue": 0,
+            "AudioBufferSourceNodeDetuneMaxValue": flt,
+            "AudioBufferSourceNodeDetuneMinValue": -flt,
+            "AudioBufferSourceNodePlaybackRateDefaultValue": 1,
+            "AudioBufferSourceNodePlaybackRateMaxValue": flt,
+            "AudioBufferSourceNodePlaybackRateMinValue": -flt,
+            "ConstantSourceNodeOffsetDefaultValue": 1,
+            "ConstantSourceNodeOffsetMaxValue": flt,
+            "ConstantSourceNodeOffsetMinValue": -flt,
+            "DelayNodeDelayTimeDefaultValue": 0,
+            "DelayNodeDelayTimeMaxValue": 1,
+            "DelayNodeDelayTimeMinValue": 0,
+            "DynamicsCompressorNodeThresholdDefaultValue": -24,
+            "DynamicsCompressorNodeThresholdMaxValue": 0,
+            "DynamicsCompressorNodeThresholdMinValue": -100,
+            "DynamicsCompressorNodeKneeDefaultValue": 30,
+            "DynamicsCompressorNodeKneeMaxValue": 40,
+            "DynamicsCompressorNodeKneeMinValue": 0,
+            "DynamicsCompressorNodeRatioDefaultValue": 12,
+            "DynamicsCompressorNodeRatioMaxValue": 20,
+            "DynamicsCompressorNodeRatioMinValue": 1,
+            "DynamicsCompressorNodeReduction": 0,
+            "DynamicsCompressorNodeAttackDefaultValue": 0.003000000026077032,
+            "DynamicsCompressorNodeAttackMaxValue": 1,
+            "DynamicsCompressorNodeAttackMinValue": 0,
+            "DynamicsCompressorNodeReleaseDefaultValue": 0.25,
+            "DynamicsCompressorNodeReleaseMaxValue": 1,
+            "DynamicsCompressorNodeReleaseMinValue": 0,
+            "GainNodeGainDefaultValue": 1,
+            "GainNodeGainMaxValue": flt,
+            "GainNodeGainMinValue": -flt,
+            "OscillatorNodeFrequencyDefaultValue": 440,
+            "OscillatorNodeFrequencyMaxValue": max_freq,
+            "OscillatorNodeFrequencyMinValue": -max_freq,
+            "OscillatorNodeDetuneDefaultValue": 0,
+            "OscillatorNodeDetuneMaxValue": 153600,
+            "OscillatorNodeDetuneMinValue": -153600,
+            "OscillatorNodeType": "sine",
+            "StereoPannerNodePanDefaultValue": 0,
+            "StereoPannerNodePanMaxValue": 1,
+            "StereoPannerNodePanMinValue": -1,
+            "AudioListenerPositionXDefaultValue": 0,
+            "AudioListenerPositionXMaxValue": flt,
+            "AudioListenerPositionXMinValue": -flt,
+            "AudioListenerPositionYDefaultValue": 0,
+            "AudioListenerPositionYMaxValue": flt,
+            "AudioListenerPositionYMinValue": -flt,
+            "AudioListenerPositionZDefaultValue": 0,
+            "AudioListenerPositionZMaxValue": flt,
+            "AudioListenerPositionZMinValue": -flt,
+            "AudioListenerForwardXDefaultValue": 0,
+            "AudioListenerForwardXMaxValue": flt,
+            "AudioListenerForwardXMinValue": -flt,
+            "AudioListenerForwardYDefaultValue": 0,
+            "AudioListenerForwardYMaxValue": flt,
+            "AudioListenerForwardYMinValue": -flt,
+            "AudioListenerForwardZDefaultValue": -1,
+            "AudioListenerForwardZMaxValue": flt,
+            "AudioListenerForwardZMinValue": -flt,
+            "AudioListenerUpXDefaultValue": 0,
+            "AudioListenerUpXMaxValue": flt,
+            "AudioListenerUpXMinValue": -flt,
+            "AudioListenerUpYDefaultValue": 1,
+            "AudioListenerUpYMaxValue": flt,
+            "AudioListenerUpYMinValue": -flt,
+            "AudioListenerUpZDefaultValue": 0,
+            "AudioListenerUpZMaxValue": flt,
+            "AudioListenerUpZMinValue": -flt,
+            "PannerNodePositionXDefaultValue": 0,
+            "PannerNodePositionXMaxValue": flt,
+            "PannerNodePositionXMinValue": -flt,
+            "PannerNodePositionYDefaultValue": 0,
+            "PannerNodePositionYMaxValue": flt,
+            "PannerNodePositionYMinValue": -flt,
+            "PannerNodePositionZDefaultValue": 0,
+            "PannerNodePositionZMaxValue": flt,
+            "PannerNodePositionZMinValue": -flt,
+            "PannerNodeOrientationXDefaultValue": 1,
+            "PannerNodeOrientationXMaxValue": flt,
+            "PannerNodeOrientationXMinValue": -flt,
+            "PannerNodeOrientationYDefaultValue": 0,
+            "PannerNodeOrientationYMaxValue": flt,
+            "PannerNodeOrientationYMinValue": -flt,
+            "PannerNodeOrientationZDefaultValue": 0,
+            "PannerNodeOrientationZMaxValue": flt,
+            "PannerNodeOrientationZMinValue": -flt,
         }
 
     def _generate_font_list(self) -> List[str]:
-        """Generate list of available fonts."""
-        platform = self._get_platform_from_ua()
-        base_fonts = self.fonts.get(platform, self.fonts["windows"])
-
-        # Randomly include/exclude fonts to create variation
-        font_list = []
-        for font in base_fonts:
-            if random.random() > 0.2:  # 80% chance to include each font
-                font_list.append(font)
-
-        # Add some random system fonts
-        additional_fonts = [
-            "Arial Unicode MS", "Book Antiqua", "Bookman Old Style",
-            "Century Gothic", "Century Schoolbook", "Garamond"
+        """Generate realistic font list matching competitor profiles (80 fonts)."""
+        # Windows-like font set that most fingerprinting scripts detect
+        _COMMON_FONTS = [
+            "Arial", "Arial Black", "Baskerville", "Book Antiqua",
+            "Bookman Old Style", "Calibri", "Cambria", "Candara",
+            "Cardo", "Casual", "Century Gothic", "Century Schoolbook",
+            "Comic Sans MS", "Consolas", "Constantia", "Corbel",
+            "Courier", "Courier New", "DejaVu Sans", "DejaVu Serif",
+            "Droid Sans", "Droid Sans Mono", "Garamond", "Georgia",
+            "Gill Sans", "Helvetica", "Helvetica Neue", "Impact",
+            "Lucida Console", "Lucida Grande", "Lucida Sans",
+            "Lucida Sans Unicode", "Microsoft Sans Serif", "Monaco",
+            "MS Gothic", "MS Mincho", "MS PGothic", "MS PMincho",
+            "MS Sans Serif", "MS Serif", "Noto Sans", "Optima",
+            "Palatino", "Palatino Linotype", "Segoe Print",
+            "Segoe Script", "Segoe UI", "Segoe UI Symbol",
+            "Sylfaen", "Symbol", "Tahoma", "Times",
+            "Times New Roman", "Trebuchet MS", "Ubuntu",
+            "Verdana", "Webdings", "Wingdings",
         ]
-
-        for font in additional_fonts:
-            if random.random() > 0.7:  # 30% chance to include additional fonts
-                font_list.append(font)
-
-        return sorted(font_list)
+        # Pick 50-80 fonts with some randomness
+        count = random.randint(50, min(80, len(_COMMON_FONTS)))
+        selected = random.sample(_COMMON_FONTS, count)
+        return sorted(selected)
 
     def _generate_plugin_list(self) -> List[Dict]:
         """Generate list of browser plugins."""
@@ -988,14 +1193,134 @@ class ProfileGenerator:
         return plugin_list
 
     def _generate_chrome_flags(self) -> List[str]:
-        """Generate Chrome command line flags for stealth.
-        
-        Only include flags that a normal Chrome user might have.
-        """
+        """Generate Chrome command line flags for stealth."""
         flags = [
             "--disable-features=TranslateUI",
         ]
         return flags
+
+    def _generate_connection_info(self, is_mobile: bool = False) -> Dict:
+        """Generate navigator.connection data."""
+        if is_mobile:
+            return {
+                "effectiveType": random.choice(["4g", "4g", "4g", "3g"]),
+                "rtt": random.choice([50, 100, 150, 200, 250]),
+                "downlink": str(round(random.uniform(1.5, 10.0), 1)),
+                "saveData": False,
+            }
+        return {
+            "effectiveType": "4g",
+            "rtt": random.choice([50, 100, 150]),
+            "downlink": str(round(random.uniform(4.0, 10.0), 1)),
+            "saveData": False,
+        }
+
+    def _generate_storage_quota(self, is_mobile: bool = False) -> int:
+        """Generate navigator.storage.estimate() quota value."""
+        if is_mobile:
+            return random.choice([
+                107374182400,  # ~100GB
+                214748364800,  # ~200GB
+                322122547200,  # ~300GB
+            ])
+        return random.choice([
+            322122547200,  # ~300GB
+            429496729600,  # ~400GB
+            599720927232,  # ~559GB (matches competitor)
+            644245094400,  # ~600GB
+        ])
+
+    def _generate_heap_size(self) -> int:
+        """Generate performance.memory jsHeapSizeLimit."""
+        return random.choice([
+            2172649472,   # ~2GB
+            4294705152,   # ~4GB (most common, matches competitor)
+            4294705152,
+            4294705152,
+        ])
+
+    def _generate_system_colors(self) -> Dict:
+        """Generate getComputedStyle system colors (Windows-style)."""
+        return {
+            "ActiveBorder": "rgb(180, 180, 180)",
+            "ActiveCaption": "rgb(153, 180, 209)",
+            "ActiveText": "rgb(0, 102, 204)",
+            "AppWorkspace": "rgb(171, 171, 171)",
+            "Background": "rgb(0, 0, 0)",
+            "ButtonBorder": "rgb(240, 240, 240)",
+            "ButtonFace": "rgb(240, 240, 240)",
+            "ButtonHighlight": "rgb(255, 255, 255)",
+            "ButtonShadow": "rgb(160, 160, 160)",
+            "ButtonText": "rgb(0, 0, 0)",
+            "Canvas": "rgb(255, 255, 255)",
+            "CanvasText": "rgb(0, 0, 0)",
+            "CaptionText": "rgb(0, 0, 0)",
+            "Field": "rgb(255, 255, 255)",
+            "FieldText": "rgb(0, 0, 0)",
+            "GrayText": "rgb(109, 109, 109)",
+            "Highlight": "rgb(0, 120, 215)",
+            "HighlightText": "rgb(255, 255, 255)",
+            "InactiveBorder": "rgb(244, 247, 252)",
+            "InactiveCaption": "rgb(191, 205, 219)",
+            "InactiveCaptionText": "rgb(0, 0, 0)",
+            "InfoBackground": "rgb(255, 255, 225)",
+            "InfoText": "rgb(0, 0, 0)",
+            "LinkText": "rgb(0, 102, 204)",
+            "Mark": "rgb(255, 255, 0)",
+            "MarkText": "rgb(0, 0, 0)",
+            "Menu": "rgb(240, 240, 240)",
+            "MenuText": "rgb(0, 0, 0)",
+            "Scrollbar": "rgb(200, 200, 200)",
+            "SelectedItem": "rgb(0, 120, 215)",
+            "SelectedItemText": "rgb(255, 255, 255)",
+            "ThreeDDarkShadow": "rgb(105, 105, 105)",
+            "ThreeDFace": "rgb(240, 240, 240)",
+            "ThreeDHighlight": "rgb(255, 255, 255)",
+            "ThreeDLightShadow": "rgb(227, 227, 227)",
+            "ThreeDShadow": "rgb(160, 160, 160)",
+            "VisitedText": "rgb(0, 102, 204)",
+            "Window": "rgb(255, 255, 255)",
+            "WindowFrame": "rgb(100, 100, 100)",
+            "WindowText": "rgb(0, 0, 0)",
+        }
+
+    def _generate_system_fonts(self) -> List[str]:
+        """Generate system font keywords for getComputedStyle."""
+        return ["caption", "icon", "menu", "message-box", "small-caption", "status-bar"]
+
+    def _generate_codecs(self) -> List[Dict]:
+        """Generate MediaCapabilities codec support info."""
+        return [
+            {"supported": True, "smooth": True, "powerEfficient": True, "contentType": "audio/webm; codecs=opus"},
+            {"supported": True, "smooth": True, "powerEfficient": True, "contentType": "audio/ogg; codecs=vorbis"},
+            {"supported": True, "smooth": True, "powerEfficient": True, "contentType": "audio/ogg; codecs=flac"},
+            {"supported": True, "smooth": True, "powerEfficient": True, "contentType": 'audio/mp4; codecs="mp4a.40.2"'},
+            {"supported": True, "smooth": True, "powerEfficient": True, "contentType": 'audio/mpeg; codecs="mp3"'},
+            {"supported": True, "smooth": True, "powerEfficient": False, "contentType": 'video/ogg; codecs="theora"'},
+            {"supported": True, "smooth": True, "powerEfficient": True, "contentType": 'video/mp4; codecs="avc1.42E01E"'},
+        ]
+
+    def _generate_keyboard_layout(self) -> List[str]:
+        """Generate keyboard.getLayoutMap() keys (US QWERTY)."""
+        return [
+            "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH",
+            "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP",
+            "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX",
+            "KeyY", "KeyZ", "Digit0", "Digit1", "Digit2", "Digit3", "Digit4",
+            "Digit5", "Digit6", "Digit7", "Digit8", "Digit9", "Minus", "Equal",
+            "BracketLeft", "BracketRight", "Semicolon", "Quote", "Backquote",
+            "Backslash", "Comma", "Period", "Slash", "Space", "Enter", "Tab",
+            "Backspace", "Delete", "Escape", "ArrowLeft", "ArrowRight", "ArrowUp",
+            "ArrowDown", "Home", "End", "PageUp", "PageDown", "Insert",
+            "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10",
+            "F11", "F12", "NumLock", "ScrollLock", "Numpad0", "Numpad1",
+            "Numpad2", "Numpad3", "Numpad4", "Numpad5", "Numpad6", "Numpad7",
+            "Numpad8", "Numpad9", "NumpadAdd", "NumpadSubtract", "NumpadMultiply",
+            "NumpadDivide", "NumpadDecimal", "NumpadEnter", "CapsLock",
+            "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight",
+            "AltLeft", "AltRight", "MetaLeft", "MetaRight",
+            "ContextMenu", "PrintScreen", "Pause",
+        ]
 
     def _get_platform_from_ua(self) -> str:
         """Determine platform from user agent."""
