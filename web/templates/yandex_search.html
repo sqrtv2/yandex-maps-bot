@@ -729,7 +729,7 @@ async function doLaunch() {
 
 async function loadLogs() {
     try {
-        const logs = await apiCall('/yandex-search-logs?limit=30');
+        const logs = await apiCall('/yandex-search-logs?limit=100');
         renderLogs(logs);
     } catch (err) {
         console.error('Failed to load logs:', err);

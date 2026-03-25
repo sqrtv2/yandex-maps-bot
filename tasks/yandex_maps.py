@@ -139,6 +139,12 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
                 'proxy_username': profile_obj.proxy_username,
                 'proxy_password': profile_obj.proxy_password,
                 'proxy_type': profile_obj.proxy_type,
+                'platform': profile_obj.platform,
+                'is_mobile': profile_obj.is_mobile,
+                'canvas_fingerprint': profile_obj.canvas_fingerprint,
+                'webgl_fingerprint': profile_obj.webgl_fingerprint,
+                'audio_fingerprint': profile_obj.audio_fingerprint,
+                'screen_fingerprint': profile_obj.screen_fingerprint,
             }
             
             # Update profile status
@@ -195,9 +201,7 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
         from core.profile_generator import ProfileGenerator
         profile_generator = ProfileGenerator()
         
-        # Detect if this is a mobile profile based on user agent
-        ua_str = profile_data_from_db['user_agent']
-        is_mobile = 'Mobile' in ua_str and 'Android' in ua_str
+        is_mobile = profile_data_from_db.get('is_mobile', False)
         
         profile_data = profile_generator.generate_profile(profile_data_from_db['name'], is_mobile=is_mobile)
 
@@ -210,8 +214,29 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
                 'height': profile_data_from_db['viewport_height']
             },
             'timezone': profile_data_from_db['timezone'],
-            'language': 'ru-RU'
+            'language': 'ru-RU',
+            'platform': profile_data_from_db.get('platform') or profile_data.get('platform', 'Win32'),
         })
+
+        # Use stored fingerprint data from DB (consistent across sessions)
+        _db_webgl = profile_data_from_db.get('webgl_fingerprint')
+        if _db_webgl:
+            import json as _json
+            try:
+                webgl_dict = _json.loads(_db_webgl) if isinstance(_db_webgl, str) else _db_webgl
+                if webgl_dict and isinstance(webgl_dict, dict) and 'unmaskedVendor' in webgl_dict:
+                    profile_data['webgl_fingerprint'] = webgl_dict
+            except (ValueError, TypeError):
+                pass
+        if profile_data_from_db.get('canvas_fingerprint'):
+            profile_data['canvas_fingerprint'] = profile_data_from_db['canvas_fingerprint']
+        if profile_data_from_db.get('audio_fingerprint'):
+            profile_data['audio_fingerprint'] = profile_data_from_db['audio_fingerprint']
+        _db_screen = profile_data_from_db.get('screen_fingerprint')
+        if _db_screen and isinstance(_db_screen, dict):
+            for _key in ('css_media', 'feature_flags', 'audio_properties', 'speech_voices', 'sensor'):
+                if _key in _db_screen:
+                    profile_data[_key] = _db_screen[_key]
         
         if is_mobile:
             logger.info(f"📱 Mobile profile detected: {profile_data_from_db['name']}")

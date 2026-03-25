@@ -579,25 +579,46 @@ async def get_profiles(
 
 @app.post("/api/profiles")
 async def create_profile(profile_data: Dict[str, Any], db: Session = Depends(get_db)):
-    """Create a new browser profile."""
+    """Create a new browser profile with full fingerprint data."""
     try:
+        import json as _json
         # Extract auto_start_warmup parameter (default: True for automatic warmup)
         auto_start_warmup = profile_data.get("auto_start_warmup", True)
+        is_mobile = profile_data.get("is_mobile", False)
 
-        # Generate proper Chrome UA if not provided
-        ua = profile_data.get("user_agent", "")
-        if not ua or not any(f"Chrome/{v}" in ua for v in ("143", "144", "145")):
-            from core.profile_generator import ProfileGenerator
-            _pg = ProfileGenerator()
-            ua = _pg._generate_user_agent(is_mobile=False)
+        # Generate full profile via ProfileGenerator (new algorithm)
+        from core.profile_generator import ProfileGenerator
+        _pg = ProfileGenerator()
+        profile_name = profile_data.get("name", "New Profile")
+        p = _pg.generate_profile(profile_name, is_mobile=is_mobile)
+
+        viewport = p.get("viewport", {})
+        screen = p.get("screen", {})
+
+        # Build screen_fingerprint JSON (extra fingerprint data)
+        screen_fp = {
+            "screen": screen,
+            "css_media": p.get("css_media", {}),
+            "feature_flags": p.get("feature_flags", {}),
+            "audio_properties": p.get("audio_properties", {}),
+            "speech_voices": p.get("speech_voices", []),
+        }
+        if p.get("sensor"):
+            screen_fp["sensor"] = p["sensor"]
 
         profile = BrowserProfile(
-            name=profile_data.get("name", "New Profile"),
-            user_agent=ua,
-            viewport_width=profile_data.get("viewport_width", 1366),
-            viewport_height=profile_data.get("viewport_height", 768),
-            timezone=profile_data.get("timezone", "Europe/Moscow"),
-            language=profile_data.get("language", "ru-RU")
+            name=profile_name,
+            user_agent=p["user_agent"],
+            viewport_width=viewport.get("width", 1366),
+            viewport_height=viewport.get("height", 768),
+            timezone=p.get("timezone", "Europe/Moscow"),
+            language=p.get("language", "ru-RU"),
+            platform=p.get("platform", "Win32"),
+            is_mobile=is_mobile,
+            canvas_fingerprint=p.get("canvas_fingerprint", ""),
+            webgl_fingerprint=_json.dumps(p.get("webgl_fingerprint", {})),
+            audio_fingerprint=p.get("audio_fingerprint", ""),
+            screen_fingerprint=screen_fp,
         )
 
         # Generate AI persona if enabled

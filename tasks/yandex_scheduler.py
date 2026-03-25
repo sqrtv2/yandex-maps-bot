@@ -644,11 +644,13 @@ def queue_watchdog():
 
         # --- 1. Check all queues ---
         queues_to_watch = ['yandex_maps', 'yandex_search', 'default', 'warmup']
+        # Warmup tasks are slow (~25 min each) so large queue is normal — never purge
+        queues_skip_purge = {'warmup'}
         for queue_name in queues_to_watch:
             qlen = r.llen(queue_name) or 0
             results[f'queue_{queue_name}'] = qlen
 
-            if qlen > QUEUE_MAX:
+            if qlen > QUEUE_MAX and queue_name not in queues_skip_purge:
                 logger.warning(
                     f"🚨 Queue '{queue_name}' overflow: {qlen} tasks (max {QUEUE_MAX}). Purging..."
                 )

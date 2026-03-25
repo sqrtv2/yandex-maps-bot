@@ -44,7 +44,8 @@ celery_app.conf.update(
     # Worker settings
     worker_prefetch_multiplier=1,
     task_acks_late=True,
-    worker_max_tasks_per_child=10,
+    # NOTE: worker_max_tasks_per_child is set per-worker via CLI --max-tasks-per-child
+    # in docker-compose.yml (warmup=50, search=2) — do NOT set globally here.
 
     # Task settings
     task_soft_time_limit=1800,  # 30 minutes

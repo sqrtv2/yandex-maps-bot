@@ -1,0 +1,423 @@
+{% extends "base.html" %}
+
+{% block title %}Журнал ошибок{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2"><i class="bi bi-exclamation-triangle"></i> Журнал ошибок</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <div class="btn-group me-2" id="periodSelector">
+            <button class="btn btn-outline-primary btn-sm" onclick="setPeriod(1)">Сегодня</button>
+            <button class="btn btn-outline-primary btn-sm" onclick="setPeriod(3)">3 дн</button>
+            <button class="btn btn-outline-primary btn-sm active" onclick="setPeriod(7)">7 дн</button>
+            <button class="btn btn-outline-primary btn-sm" onclick="setPeriod(30)">30 дн</button>
+        </div>
+        <button class="btn btn-outline-secondary btn-sm" onclick="refreshAll()">
+            <i class="bi bi-arrow-clockwise"></i> Обновить
+        </button>
+    </div>
+</div>
+
+<!-- Summary Cards -->
+<div class="row mb-4" id="statsCards">
+    <div class="col-md-2">
+        <div class="card border-danger shadow-sm h-100">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Всего ошибок</small>
+                <h3 class="mb-0 text-danger" id="statTotal">0</h3>
+                <small class="text-muted" id="statTotalToday">сегодня: 0</small>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card border-warning shadow-sm h-100">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Капча</small>
+                <h3 class="mb-0 text-warning" id="statCaptcha">0</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card border-info shadow-sm h-100">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Не найден</small>
+                <h3 class="mb-0 text-info" id="statNotFound">0</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card border-secondary shadow-sm h-100">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Таймаут</small>
+                <h3 class="mb-0 text-secondary" id="statTimeout">0</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card border-dark shadow-sm h-100">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Браузер</small>
+                <h3 class="mb-0" id="statBrowser">0</h3>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card border-primary shadow-sm h-100">
+            <div class="card-body py-2 text-center">
+                <small class="text-muted d-block">Прокси</small>
+                <h3 class="mb-0 text-primary" id="statProxy">0</h3>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Charts Row -->
+<div class="row mb-4">
+    <div class="col-md-5">
+        <div class="card shadow-sm h-100">
+            <div class="card-header py-2"><strong>По категориям</strong></div>
+            <div class="card-body" style="height: 250px;">
+                <canvas id="categoryChart"></canvas>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-7">
+        <div class="card shadow-sm h-100">
+            <div class="card-header py-2"><strong>Тренд по дням</strong></div>
+            <div class="card-body" style="height: 250px;">
+                <canvas id="trendChart"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Filters + Table -->
+<div class="card shadow-sm mb-4">
+    <div class="card-header py-2">
+        <div class="row align-items-center">
+            <div class="col-md-3">
+                <select class="form-select form-select-sm" id="filterCategory" onchange="loadLogs()">
+                    <option value="">Все категории</option>
+                    <option value="captcha">🔒 Капча</option>
+                    <option value="not_found">🔍 Не найден</option>
+                    <option value="click_failed">👆 Клик не удался</option>
+                    <option value="timeout">⏰ Таймаут</option>
+                    <option value="browser_crash">💥 Браузер упал</option>
+                    <option value="renderer_death">💀 Renderer dead</option>
+                    <option value="proxy_error">🌐 Прокси</option>
+                    <option value="worker_killed">⚡ Worker killed</option>
+                    <option value="unknown">❓ Прочее</option>
+                </select>
+            </div>
+            <div class="col-md-3">
+                <select class="form-select form-select-sm" id="filterDomain" onchange="loadLogs()">
+                    <option value="">Все домены</option>
+                </select>
+            </div>
+            <div class="col-md-3">
+                <strong id="logsCount">0</strong> записей
+            </div>
+            <div class="col-md-3 text-end">
+                <strong>По доменам:</strong>
+            </div>
+        </div>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
+            <table class="table table-sm table-hover table-striped mb-0" id="logsTable">
+                <thead class="table-light sticky-top">
+                    <tr>
+                        <th style="width:140px">Время</th>
+                        <th style="width:100px">Категория</th>
+                        <th>Сообщение</th>
+                        <th style="width:120px">Домен</th>
+                        <th style="width:160px">Ключевое слово</th>
+                        <th style="width:100px">Профиль</th>
+                        <th style="width:100px">Прокси</th>
+                        <th style="width:60px">Сек</th>
+                    </tr>
+                </thead>
+                <tbody id="logsBody">
+                    <tr><td colspan="8" class="text-center text-muted py-4">Загрузка...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Domain breakdown table -->
+<div class="card shadow-sm mb-4">
+    <div class="card-header py-2"><strong>Ошибки по доменам (топ-20)</strong></div>
+    <div class="card-body p-0">
+        <table class="table table-sm table-hover mb-0">
+            <thead class="table-light">
+                <tr>
+                    <th>Домен</th>
+                    <th class="text-center">Ошибок</th>
+                </tr>
+            </thead>
+            <tbody id="domainBody"></tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Proxy breakdown table -->
+<div class="card shadow-sm mb-4">
+    <div class="card-header py-2"><strong>Ошибки по прокси</strong></div>
+    <div class="card-body p-0">
+        <table class="table table-sm table-hover mb-0">
+            <thead class="table-light">
+                <tr>
+                    <th>Прокси</th>
+                    <th class="text-center">Ошибок</th>
+                    <th class="text-center">Ср. длительность (сек)</th>
+                </tr>
+            </thead>
+            <tbody id="proxyBody"></tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Error detail modal -->
+<div class="modal fade" id="errorDetailModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Детали ошибки</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <pre id="errorDetailContent" style="white-space: pre-wrap; word-break: break-all; max-height: 500px; overflow-y: auto;"></pre>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let currentDays = 7;
+let categoryChartInstance = null;
+let trendChartInstance = null;
+let allLogs = [];
+
+const CATEGORY_LABELS = {
+    captcha: '🔒 Капча',
+    not_found: '🔍 Не найден',
+    click_failed: '👆 Клик не удался',
+    timeout: '⏰ Таймаут',
+    browser_crash: '💥 Браузер упал',
+    renderer_death: '💀 Renderer dead',
+    proxy_error: '🌐 Прокси',
+    worker_killed: '⚡ Worker killed',
+    unknown: '❓ Прочее'
+};
+
+const CATEGORY_COLORS = {
+    captcha: '#ffc107',
+    not_found: '#0dcaf0',
+    click_failed: '#fd7e14',
+    timeout: '#6c757d',
+    browser_crash: '#dc3545',
+    renderer_death: '#212529',
+    proxy_error: '#0d6efd',
+    worker_killed: '#6610f2',
+    unknown: '#adb5bd'
+};
+
+function setPeriod(days) {
+    currentDays = days;
+    document.querySelectorAll('#periodSelector .btn').forEach(b => b.classList.remove('active'));
+    event.target.classList.add('active');
+    refreshAll();
+}
+
+async function refreshAll() {
+    await Promise.all([loadStats(), loadLogs()]);
+}
+
+async function loadStats() {
+    try {
+        const stats = await apiCall(`/error-logs/stats?days=${currentDays}`);
+
+        document.getElementById('statTotal').textContent = stats.total || 0;
+        document.getElementById('statTotalToday').textContent = `сегодня: ${stats.total_today || 0}`;
+        document.getElementById('statCaptcha').textContent = stats.by_category.captcha || 0;
+        document.getElementById('statNotFound').textContent = stats.by_category.not_found || 0;
+        document.getElementById('statTimeout').textContent = stats.by_category.timeout || 0;
+        document.getElementById('statBrowser').textContent =
+            (stats.by_category.browser_crash || 0) + (stats.by_category.renderer_death || 0);
+        document.getElementById('statProxy').textContent = stats.by_category.proxy_error || 0;
+
+        // Category pie chart
+        const catLabels = Object.keys(stats.by_category);
+        const catData = Object.values(stats.by_category);
+        const catColors = catLabels.map(c => CATEGORY_COLORS[c] || '#adb5bd');
+
+        if (categoryChartInstance) categoryChartInstance.destroy();
+        categoryChartInstance = new Chart(document.getElementById('categoryChart'), {
+            type: 'doughnut',
+            data: {
+                labels: catLabels.map(c => CATEGORY_LABELS[c] || c),
+                datasets: [{
+                    data: catData,
+                    backgroundColor: catColors,
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { position: 'right', labels: { font: { size: 11 } } } }
+            }
+        });
+
+        // Trend line chart
+        if (trendChartInstance) trendChartInstance.destroy();
+        if (stats.daily_trend && stats.daily_trend.length > 0) {
+            trendChartInstance = new Chart(document.getElementById('trendChart'), {
+                type: 'bar',
+                data: {
+                    labels: stats.daily_trend.map(d => d.date.slice(5)), // MM-DD
+                    datasets: [{
+                        label: 'Ошибок',
+                        data: stats.daily_trend.map(d => d.count),
+                        backgroundColor: 'rgba(220, 53, 69, 0.6)',
+                        borderColor: '#dc3545',
+                        borderWidth: 1,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: { beginAtZero: true, ticks: { stepSize: 1 } }
+                    }
+                }
+            });
+        }
+
+        // Domain breakdown
+        const domainBody = document.getElementById('domainBody');
+        if (stats.by_domain && Object.keys(stats.by_domain).length) {
+            domainBody.innerHTML = Object.entries(stats.by_domain)
+                .sort((a, b) => b[1] - a[1])
+                .map(([d, c]) => `<tr><td>${d}</td><td class="text-center">${c}</td></tr>`)
+                .join('');
+        } else {
+            domainBody.innerHTML = '<tr><td colspan="2" class="text-center text-muted">Нет данных</td></tr>';
+        }
+
+        // Proxy breakdown
+        const proxyBody = document.getElementById('proxyBody');
+        if (stats.by_proxy && Object.keys(stats.by_proxy).length) {
+            proxyBody.innerHTML = Object.entries(stats.by_proxy)
+                .sort((a, b) => b[1] - a[1])
+                .map(([p, c]) => {
+                    const avgDur = stats.avg_duration || {};
+                    return `<tr><td>${p}</td><td class="text-center">${c}</td><td class="text-center">—</td></tr>`;
+                })
+                .join('');
+        } else {
+            proxyBody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">Нет данных</td></tr>';
+        }
+
+        // Populate domain filter
+        const domainSelect = document.getElementById('filterDomain');
+        const currentVal = domainSelect.value;
+        domainSelect.innerHTML = '<option value="">Все домены</option>';
+        if (stats.by_domain) {
+            Object.keys(stats.by_domain).sort().forEach(d => {
+                domainSelect.innerHTML += `<option value="${d}" ${d === currentVal ? 'selected' : ''}>${d} (${stats.by_domain[d]})</option>`;
+            });
+        }
+    } catch (e) {
+        console.error('Failed to load stats:', e);
+    }
+}
+
+async function loadLogs() {
+    try {
+        const category = document.getElementById('filterCategory').value;
+        const domain = document.getElementById('filterDomain').value;
+        let url = `/error-logs?days=${currentDays}&limit=500`;
+        if (category) url += `&category=${encodeURIComponent(category)}`;
+        if (domain) url += `&domain=${encodeURIComponent(domain)}`;
+
+        allLogs = await apiCall(url);
+        document.getElementById('logsCount').textContent = allLogs.length;
+
+        const tbody = document.getElementById('logsBody');
+        if (!allLogs.length) {
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-4">Нет ошибок за выбранный период</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = allLogs.map((log, i) => {
+            const dt = new Date(log.created_at);
+            const timeStr = dt.toLocaleString('ru-RU', {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit'});
+            const catBadge = getCategoryBadge(log.error_category);
+            const msg = (log.error_message || '').length > 80
+                ? log.error_message.substring(0, 80) + '...'
+                : (log.error_message || '—');
+            const hasDetail = log.error_detail && log.error_detail.length > 0;
+            const clickAttr = hasDetail ? `onclick="showDetail(${i})" style="cursor:pointer"` : '';
+
+            return `<tr ${clickAttr}>
+                <td><small>${timeStr}</small></td>
+                <td>${catBadge}</td>
+                <td><small>${escapeHtml(msg)}</small></td>
+                <td><small>${log.domain || '—'}</small></td>
+                <td><small>${escapeHtml((log.keyword || '—').substring(0, 30))}</small></td>
+                <td><small>${log.profile_name || (log.profile_id ? 'P-' + log.profile_id : '—')}</small></td>
+                <td><small>${log.proxy_host || '—'}</small></td>
+                <td class="text-center">${log.task_duration_seconds || '—'}</td>
+            </tr>`;
+        }).join('');
+    } catch (e) {
+        console.error('Failed to load logs:', e);
+    }
+}
+
+function getCategoryBadge(cat) {
+    const colors = {
+        captcha: 'warning', not_found: 'info', click_failed: 'orange',
+        timeout: 'secondary', browser_crash: 'danger', renderer_death: 'dark',
+        proxy_error: 'primary', worker_killed: 'purple', unknown: 'light text-dark'
+    };
+    const cls = colors[cat] || 'light text-dark';
+    const label = CATEGORY_LABELS[cat] || cat;
+    return `<span class="badge bg-${cls}" style="font-size:0.7rem">${label}</span>`;
+}
+
+function showDetail(index) {
+    const log = allLogs[index];
+    const content = document.getElementById('errorDetailContent');
+    content.textContent = [
+        `ID: ${log.id}`,
+        `Task ID: ${log.task_id || '—'}`,
+        `Category: ${log.error_category}`,
+        `Profile: ${log.profile_name || log.profile_id || '—'}`,
+        `Domain: ${log.domain || '—'}`,
+        `Keyword: ${log.keyword || '—'}`,
+        `Proxy: ${log.proxy_host || '—'}`,
+        `Duration: ${log.task_duration_seconds || '—'}s`,
+        `Time: ${log.created_at}`,
+        '',
+        '=== Error Message ===',
+        log.error_message || '—',
+        '',
+        '=== Error Detail ===',
+        log.error_detail || '—'
+    ].join('\n');
+    new bootstrap.Modal(document.getElementById('errorDetailModal')).show();
+}
+
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+// Initial load
+refreshAll();
+</script>
+{% endblock %}

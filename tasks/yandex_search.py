@@ -80,18 +80,36 @@ def _classify_error(error_str: str) -> str:
     return 'unknown'
 
 
-def _retire_profile_after_search(profile_id: int):
-    """Deactivate profile after a single search click use (1 profile = 1 click)."""
+def _retire_profile_after_search(profile_id: int, target_id: int = None):
+    """Retire profile only after it has clicked ALL active search targets (1 click per target)."""
     try:
         with get_db_session() as db:
-            profile = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
-            if profile:
-                profile.is_active = False
-                profile.status = 'retired'
-                db.commit()
-                logger.info(f"🗑️ Profile {profile_id} retired after search click (1 profile = 1 click)")
+            # Count active targets
+            active_target_count = db.query(YandexSearchTarget).filter(
+                YandexSearchTarget.is_active == True
+            ).count()
+
+            # Count how many distinct targets this profile has successfully clicked
+            clicked_target_count = db.query(ProfileSearchVisit.search_target_id).filter(
+                ProfileSearchVisit.profile_id == profile_id,
+                ProfileSearchVisit.status == 'completed',
+            ).distinct().count()
+
+            if clicked_target_count >= active_target_count:
+                profile = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+                if profile:
+                    profile.is_active = False
+                    profile.status = 'retired'
+                    db.commit()
+                    logger.info(
+                        f"🗑️ Profile {profile_id} retired — clicked all {active_target_count} targets"
+                    )
+            else:
+                logger.info(
+                    f"♻️ Profile {profile_id} reusable — clicked {clicked_target_count}/{active_target_count} targets"
+                )
     except Exception as e:
-        logger.warning(f"Failed to retire profile {profile_id}: {e}")
+        logger.warning(f"Failed to check/retire profile {profile_id}: {e}")
 
 
 def _save_error_log(task_id: int = None, task_type: str = 'yandex_search',
@@ -2327,6 +2345,12 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 'proxy_username': profile_obj.proxy_username,
                 'proxy_password': profile_obj.proxy_password,
                 'proxy_type': profile_obj.proxy_type,
+                'platform': profile_obj.platform,
+                'is_mobile': profile_obj.is_mobile,
+                'canvas_fingerprint': profile_obj.canvas_fingerprint,
+                'webgl_fingerprint': profile_obj.webgl_fingerprint,
+                'audio_fingerprint': profile_obj.audio_fingerprint,
+                'screen_fingerprint': profile_obj.screen_fingerprint,
             }
             profile_obj.last_used_at = datetime.utcnow()
             db.commit()
@@ -2384,9 +2408,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         from core.profile_generator import ProfileGenerator
         profile_generator = ProfileGenerator()
         
-        # Detect if this is a mobile profile based on user agent
-        ua_str = profile_data_from_db['user_agent']
-        is_mobile = 'Mobile' in ua_str and 'Android' in ua_str
+        is_mobile = profile_data_from_db.get('is_mobile', False)
         
         profile_data = profile_generator.generate_profile(profile_data_from_db['name'], is_mobile=is_mobile)
         profile_data.update({
@@ -2397,8 +2419,29 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             },
             'timezone': profile_data_from_db['timezone'],
             'language': 'ru-RU',
+            'platform': profile_data_from_db.get('platform') or profile_data.get('platform', 'Win32'),
             'images_enabled': False,  # Disable images for speed
         })
+
+        # Use stored fingerprint data from DB (consistent across sessions)
+        _db_webgl = profile_data_from_db.get('webgl_fingerprint')
+        if _db_webgl:
+            import json as _json
+            try:
+                webgl_dict = _json.loads(_db_webgl) if isinstance(_db_webgl, str) else _db_webgl
+                if webgl_dict and isinstance(webgl_dict, dict) and 'unmaskedVendor' in webgl_dict:
+                    profile_data['webgl_fingerprint'] = webgl_dict
+            except (ValueError, TypeError):
+                pass
+        if profile_data_from_db.get('canvas_fingerprint'):
+            profile_data['canvas_fingerprint'] = profile_data_from_db['canvas_fingerprint']
+        if profile_data_from_db.get('audio_fingerprint'):
+            profile_data['audio_fingerprint'] = profile_data_from_db['audio_fingerprint']
+        _db_screen = profile_data_from_db.get('screen_fingerprint')
+        if _db_screen and isinstance(_db_screen, dict):
+            for _key in ('css_media', 'feature_flags', 'audio_properties', 'speech_voices', 'sensor'):
+                if _key in _db_screen:
+                    profile_data[_key] = _db_screen[_key]
         
         if is_mobile:
             logger.info(f"📱 Mobile profile detected: {profile_data_from_db['name']}")
@@ -3507,8 +3550,8 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             f"(page {result['page']}, pos {result['position']}, {actual_browse_time:.0f}s on site)"
         )
 
-        # Retire profile after successful click on target site (1 profile = 1 successful click)
-        _retire_profile_after_search(profile_id)
+        # Retire profile only if it has clicked ALL active targets
+        _retire_profile_after_search(profile_id, target_id)
 
         # Save position history: success
         _save_position_history(
@@ -3749,10 +3792,10 @@ def schedule_search_visits():
         scheduler_logger.warning(f"Could not check queue length: {qe}")
 
     # ── Limit total concurrent tasks to avoid overloading proxies ──
-    # concurrency=10 in docker-compose limits actual simultaneous workers
+    # concurrency=20 in docker-compose limits actual simultaneous workers
     # This limit controls how many tasks sit in queue (pending+in_progress)
     # Keep slightly above concurrency so workers always have work ready
-    MAX_CONCURRENT_SEARCH_TASKS = 50
+    MAX_CONCURRENT_SEARCH_TASKS = 100
     try:
         with get_db_session() as db:
             active_count = db.query(Task).filter(
@@ -4043,20 +4086,27 @@ def schedule_search_visits():
                         f"keywords: {', '.join(summary_parts)}"
                     )
 
-                    # ── Profile selection: 1 profile = 1 click (no reuse) ──
-                    # Each profile is used exactly once then retired.
-                    # Just shuffle all available warmed profiles.
-                    available_ids = list(all_profile_ids)  # copy
+                    # ── Profile selection: 1 profile = 1 click per target ──
+                    # Exclude profiles that already clicked THIS target.
+                    already_clicked_ids = set(
+                        row[0] for row in db.query(ProfileSearchVisit.profile_id).filter(
+                            ProfileSearchVisit.search_target_id == target.id,
+                            ProfileSearchVisit.status == 'completed',
+                        ).all()
+                    )
+                    available_ids = [pid for pid in all_profile_ids if pid not in already_clicked_ids]
                     random.shuffle(available_ids)
 
                     if not available_ids:
                         scheduler_logger.warning(
-                            f"⚠️ No warmed profiles available for {target.domain}, skipping"
+                            f"⚠️ No fresh profiles for {target.domain} "
+                            f"(all {len(already_clicked_ids)} already clicked), skipping"
                         )
                         continue
 
                     scheduler_logger.info(
-                        f"🔄 {target.domain}: {len(available_ids)} fresh profiles available"
+                        f"🔄 {target.domain}: {len(available_ids)} fresh profiles "
+                        f"({len(already_clicked_ids)} already clicked)"
                     )
 
                     target_schedule_data.append({
@@ -4098,7 +4148,7 @@ def schedule_search_visits():
                 proportion = td['total_budget'] / grand_total if grand_total > 0 else 1.0 / len(target_schedule_data)
                 target_slots = max(1, round(slots_available * proportion))
                 # Cap per-domain tasks to avoid one domain dominating the round
-                MAX_TASKS_PER_DOMAIN = 8
+                MAX_TASKS_PER_DOMAIN = 16
                 target_slots = min(target_slots, len(candidates), len(available_ids), MAX_TASKS_PER_DOMAIN)
 
                 scheduler_logger.info(

@@ -426,6 +426,7 @@ class BrowserManager:
         all browser instances.
         """
         # Mandatory args — required for Docker/headless stability
+        js_heap_mb = os.environ.get('YANDEX_BOT_BROWSER_JS_HEAP', '4096')
         args = [
             "--no-sandbox",
             "--disable-dev-shm-usage",
@@ -433,7 +434,7 @@ class BrowserManager:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-hang-monitor",
-            "--js-flags=--max-old-space-size=4096",
+            f"--js-flags=--max-old-space-size={js_heap_mb}",
             "--disable-ipc-flooding-protection",
             # WebRTC: prevent real IP leak through STUN/TURN
             "--enforce-webrtc-ip-permission-check",
@@ -641,8 +642,8 @@ class BrowserManager:
             dev_memory = profile_data.get('device_memory', 8)
             platform = profile_data.get("platform", "Win32")
             max_touch = profile_data.get('max_touch_points', 0)
-            webgl_vendor = webgl_data.get("vendor", "Google Inc. (NVIDIA)")
-            webgl_renderer = webgl_data.get("renderer", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB Direct3D11 vs_5_0 ps_5_0, D3D11)")
+            webgl_vendor = webgl_data.get("unmaskedVendor", "Google Inc. (NVIDIA)")
+            webgl_renderer = webgl_data.get("unmaskedRenderer", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB Direct3D11 vs_5_0 ps_5_0, D3D11)")
             
             # Screen dimensions from profile
             screen_data = profile_data.get("screen", {})
@@ -651,19 +652,34 @@ class BrowserManager:
             color_depth = screen_data.get("color_depth", 24)
             pixel_ratio = screen_data.get("pixel_ratio", 1)
             
-            # WebGL extended parameters from profile
-            webgl_max_texture = webgl_data.get("max_texture_size", 16384)
-            webgl_max_viewport = webgl_data.get("max_viewport_dims", 16384)
-            webgl_max_vertex_attribs = webgl_data.get("max_vertex_attribs", 16)
-            webgl_max_frag_uniforms = webgl_data.get("max_fragment_uniform_vectors", 1024)
-            webgl_max_vert_uniforms = webgl_data.get("max_vertex_uniform_vectors", 1024)
-            
             # Viewport from profile
             viewport_data = profile_data.get("viewport", {})
             viewport_width = viewport_data.get("width", 1366)
             viewport_height = viewport_data.get("height", 768)
             
             is_mobile = profile_data.get("is_mobile", False)
+
+            # WebGPU profile data
+            webgpu_data = profile_data.get("webgpu_fingerprint", {})
+
+            # Sensor data (mobile only)
+            sensor_data = profile_data.get("sensor", {})
+
+            # CSS media queries
+            css_media = profile_data.get("css_media", {})
+
+            # Speech synthesis voices
+            speech_voices = profile_data.get("speech_voices", [])
+
+            # Feature detection flags
+            feature_flags = profile_data.get("feature_flags", {})
+
+            # Audio properties
+            audio_props = profile_data.get("audio_properties", {})
+
+            # Serialize WebGL profile data as JSON for JS injection
+            import json as _json
+            webgl_profile_json = _json.dumps(webgl_data)
 
             # Canvas noise seed: deterministic per profile so the fingerprint is
             # unique but consistent across page loads (defeats averaging attacks).
@@ -902,31 +918,409 @@ class BrowserManager:
                 }};
             }} catch(e) {{}}
 
-            // --- WebGL vendor/renderer + extended parameters override ---
+            // --- WebGL vendor/renderer + comprehensive parameters override ---
             try {{
-                const webglParamOverrides = {{
-                    37445: '{webgl_vendor}',     // UNMASKED_VENDOR_WEBGL
-                    37446: '{webgl_renderer}',   // UNMASKED_RENDERER_WEBGL
-                    3379: {webgl_max_texture},    // MAX_TEXTURE_SIZE
-                    3386: new Int32Array([{webgl_max_viewport}, {webgl_max_viewport}]), // MAX_VIEWPORT_DIMS
-                    34921: {webgl_max_vertex_attribs},  // MAX_VERTEX_ATTRIBS
-                    36349: {webgl_max_frag_uniforms},   // MAX_FRAGMENT_UNIFORM_VECTORS
-                    36347: {webgl_max_vert_uniforms},   // MAX_VERTEX_UNIFORM_VECTORS
+                const _wgp = {webgl_profile_json};
+
+                // --- WebGL1 parameter overrides ---
+                const webgl1Overrides = {{
+                    37445: _wgp.unmaskedVendor,   // UNMASKED_VENDOR_WEBGL
+                    37446: _wgp.unmaskedRenderer,  // UNMASKED_RENDERER_WEBGL
+                    7936: _wgp.vendor || 'WebKit',            // VENDOR
+                    7937: _wgp.renderer || 'WebKit WebGL',    // RENDERER
+                    7938: _wgp.version,            // VERSION
+                    35724: _wgp.shadingLanguage,   // SHADING_LANGUAGE_VERSION
+                    3379: parseInt(_wgp.maxTextureSize),       // MAX_TEXTURE_SIZE
+                    3386: new Int32Array(_wgp.maxViewportDims),  // MAX_VIEWPORT_DIMS
+                    34921: parseInt(_wgp.maxVertexAttribs),    // MAX_VERTEX_ATTRIBS
+                    36349: parseInt(_wgp.maxFragmentUniformVectors),  // MAX_FRAGMENT_UNIFORM_VECTORS
+                    36347: parseInt(_wgp.maxVertexUniformVectors),    // MAX_VERTEX_UNIFORM_VECTORS
+                    34076: parseInt(_wgp.maxCubeMapTextureSize),      // MAX_CUBE_MAP_TEXTURE_SIZE
+                    34024: parseInt(_wgp.maxRenderBufferSize),        // MAX_RENDERBUFFER_SIZE
+                    35661: parseInt(_wgp.maxCombinedTextureImageUnits),  // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+                    34930: parseInt(_wgp.maxTextureImageUnits),       // MAX_TEXTURE_IMAGE_UNITS
+                    35660: parseInt(_wgp.maxVertexTextureImageUnits), // MAX_VERTEX_TEXTURE_IMAGE_UNITS
+                    36348: parseInt(_wgp.maxVaryingVectors),          // MAX_VARYING_VECTORS
+                    3413: parseInt(_wgp.sampleBuffers),               // SAMPLE_BUFFERS
+                    3415: parseInt(_wgp.samples),                     // SAMPLES
+                    3408: new Float32Array(_wgp.aliasedLineWidthRange),  // ALIASED_LINE_WIDTH_RANGE
+                    3414: new Float32Array(_wgp.aliasedPointSizeRange),  // ALIASED_POINT_SIZE_RANGE
+                    3410: parseInt(_wgp.alphaBits),      // ALPHA_BITS
+                    3412: parseInt(_wgp.blueBits),       // BLUE_BITS
+                    3411: parseInt(_wgp.greenBits),      // GREEN_BITS
+                    3410: parseInt(_wgp.redBits),        // RED_BITS  → note: 3409 is RED_BITS, 3410 is GREEN
+                    3414: new Float32Array(_wgp.aliasedPointSizeRange),
+                    3416: parseInt(_wgp.depthBits),      // DEPTH_BITS
+                    3415: parseInt(_wgp.samples),
+                    36003: parseInt(_wgp.stencilBits),   // STENCIL_BITS
+                    36004: parseInt(_wgp.subpixelBits),  // SUBPIXEL_BITS
+                    36005: parseInt(_wgp.stencilBackValueMask),   // STENCIL_BACK_VALUE_MASK
+                    36006: parseInt(_wgp.stencilBackWritemask),   // STENCIL_BACK_WRITEMASK
+                    2967: parseInt(_wgp.stencilValueMask),        // STENCIL_VALUE_MASK
+                    2968: parseInt(_wgp.stencilWritemask),        // STENCIL_WRITEMASK
+                    34047: parseInt(_wgp.maxAnisotropy || '16'),  // MAX_TEXTURE_MAX_ANISOTROPY_EXT
                 }};
-                
-                function patchGetParameter(proto) {{
-                    const orig = proto.getParameter;
-                    proto.getParameter = function(param) {{
-                        if (webglParamOverrides.hasOwnProperty(param)) {{
-                            return webglParamOverrides[param];
+
+                // --- WebGL2 additional parameter overrides ---
+                const webgl2Overrides = Object.assign({{}}, webgl1Overrides, {{
+                    7938: _wgp.version2,              // VERSION (WebGL 2.0)
+                    35724: _wgp.shadingLanguage2,     // SHADING_LANGUAGE_VERSION
+                    // WebGL2-specific limits
+                    35371: parseInt(_wgp.maxVertexUniformComponents2),    // MAX_VERTEX_UNIFORM_COMPONENTS
+                    35374: parseInt(_wgp.maxVertexUniformBlocks2),        // MAX_VERTEX_UNIFORM_BLOCKS
+                    36122: parseInt(_wgp.maxVertexOutputComponents2),     // MAX_VERTEX_OUTPUT_COMPONENTS
+                    35659: parseInt(_wgp.maxVaryingComponents2),          // MAX_VARYING_COMPONENTS
+                    35977: parseInt(_wgp.maxTransformFeedbackInterleavedComponents2),  // MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS
+                    35979: parseInt(_wgp.maxTransformFeedbackSeparateAttribs2),        // MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS
+                    35981: parseInt(_wgp.maxTransformFeedbackSeparateComponents2),     // MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS
+                    35657: parseInt(_wgp.maxFragmentUniformComponents2),  // MAX_FRAGMENT_UNIFORM_COMPONENTS
+                    35373: parseInt(_wgp.maxFragmentUniformBlocks2),      // MAX_FRAGMENT_UNIFORM_BLOCKS
+                    37157: parseInt(_wgp.maxFragmentInputComponents2),    // MAX_FRAGMENT_INPUT_COMPONENTS
+                    36346: parseInt(_wgp.minProgramTexelOffset2),         // MIN_PROGRAM_TEXEL_OFFSET
+                    36345: parseInt(_wgp.maxProgramTexelOffset2),         // MAX_PROGRAM_TEXEL_OFFSET
+                    34852: parseInt(_wgp.maxDrawBuffers2),     // MAX_DRAW_BUFFERS
+                    36063: parseInt(_wgp.maxColorAttachments2),  // MAX_COLOR_ATTACHMENTS
+                    36183: parseInt(_wgp.maxSamples2),          // MAX_SAMPLES
+                    32883: parseInt(_wgp.max3DTextureSize2),    // MAX_3D_TEXTURE_SIZE
+                    35071: parseInt(_wgp.maxArrayTextureLayers2),  // MAX_ARRAY_TEXTURE_LAYERS
+                    36203: parseInt(_wgp.maxClientWaitTimeoutWebgl2 || '0'),
+                    36202: _wgp.maxElementIndex2,               // MAX_ELEMENT_INDEX
+                    36205: parseInt(_wgp.maxServerWaitTimeout2 || '0'),
+                    34045: parseFloat(_wgp.maxTextureLodBias2 || '2'),  // MAX_TEXTURE_LOD_BIAS
+                    35375: parseInt(_wgp.maxUniformBufferBindings2),    // MAX_UNIFORM_BUFFER_BINDINGS
+                    35376: parseInt(_wgp.maxUniformBlockSize2),         // MAX_UNIFORM_BLOCK_SIZE
+                    35380: parseInt(_wgp.uniformBufferOffsetAlignment2),  // UNIFORM_BUFFER_OFFSET_ALIGNMENT
+                    35377: parseInt(_wgp.maxCombinedUniformBlocks2),    // MAX_COMBINED_UNIFORM_BLOCKS
+                    35378: parseInt(_wgp.maxCombinedVertexUniformComponents2),
+                    35379: parseInt(_wgp.maxCombinedFragmentUniformComponents2),
+                    33000: parseInt(_wgp.maxElementsVertices2 || '2147483647'),
+                    33001: parseInt(_wgp.maxElementsIndices2 || '2147483647'),
+                    // WGL2 also overrides the same basic limits
+                    3379: parseInt(_wgp.maxTextureSize2 || _wgp.maxTextureSize),
+                    3386: new Int32Array(_wgp.maxViewportDims2 || _wgp.maxViewportDims),
+                    34076: parseInt(_wgp.maxCubeMapTextureSize2 || _wgp.maxCubeMapTextureSize),
+                    34024: parseInt(_wgp.maxRenderBufferSize2 || _wgp.maxRenderBufferSize),
+                    35661: parseInt(_wgp.maxCombinedTextureImageUnits2 || _wgp.maxCombinedTextureImageUnits),
+                    34930: parseInt(_wgp.maxTextureImageUnits2 || _wgp.maxTextureImageUnits),
+                    35660: parseInt(_wgp.maxVertexTextureImageUnits2 || _wgp.maxVertexTextureImageUnits),
+                    36348: parseInt(_wgp.maxVaryingVectors2 || _wgp.maxVaryingVectors),
+                    34921: parseInt(_wgp.maxVertexAttribs2 || _wgp.maxVertexAttribs),
+                    36349: parseInt(_wgp.maxFragmentUniformVectors2 || _wgp.maxFragmentUniformVectors),
+                    36347: parseInt(_wgp.maxVertexUniformVectors2 || _wgp.maxVertexUniformVectors),
+                }});
+
+                // --- Patch getParameter for WebGL1 ---
+                const origGetParam1 = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(param) {{
+                    if (webgl1Overrides.hasOwnProperty(param)) {{
+                        return webgl1Overrides[param];
+                    }}
+                    return origGetParam1.call(this, param);
+                }};
+
+                // --- Patch getParameter for WebGL2 ---
+                if (typeof WebGL2RenderingContext !== 'undefined') {{
+                    const origGetParam2 = WebGL2RenderingContext.prototype.getParameter;
+                    WebGL2RenderingContext.prototype.getParameter = function(param) {{
+                        if (webgl2Overrides.hasOwnProperty(param)) {{
+                            return webgl2Overrides[param];
                         }}
-                        return orig.call(this, param);
+                        return origGetParam2.call(this, param);
                     }};
                 }}
-                patchGetParameter(WebGLRenderingContext.prototype);
+
+                // --- Patch getSupportedExtensions ---
+                const _wgl1Exts = (_wgp.extensions || '').split(',').map(s => s.trim()).filter(Boolean);
+                const _wgl2Exts = (_wgp.extensions2 || '').split(',').map(s => s.trim()).filter(Boolean);
+                const origGetExts1 = WebGLRenderingContext.prototype.getSupportedExtensions;
+                WebGLRenderingContext.prototype.getSupportedExtensions = function() {{
+                    return _wgl1Exts.length > 0 ? _wgl1Exts : origGetExts1.call(this);
+                }};
                 if (typeof WebGL2RenderingContext !== 'undefined') {{
-                    patchGetParameter(WebGL2RenderingContext.prototype);
+                    const origGetExts2 = WebGL2RenderingContext.prototype.getSupportedExtensions;
+                    WebGL2RenderingContext.prototype.getSupportedExtensions = function() {{
+                        return _wgl2Exts.length > 0 ? _wgl2Exts : origGetExts2.call(this);
+                    }};
                 }}
+
+                // --- Patch getContextAttributes ---
+                const _ctxAttrs1 = _wgp.contextAttributes || null;
+                const _ctxAttrs2 = _wgp.contextAttributes2 || _ctxAttrs1;
+                if (_ctxAttrs1) {{
+                    const origGetCtxAttr1 = WebGLRenderingContext.prototype.getContextAttributes;
+                    WebGLRenderingContext.prototype.getContextAttributes = function() {{
+                        const real = origGetCtxAttr1.call(this);
+                        return Object.assign({{}}, real, _ctxAttrs1);
+                    }};
+                }}
+                if (_ctxAttrs2 && typeof WebGL2RenderingContext !== 'undefined') {{
+                    const origGetCtxAttr2 = WebGL2RenderingContext.prototype.getContextAttributes;
+                    WebGL2RenderingContext.prototype.getContextAttributes = function() {{
+                        const real = origGetCtxAttr2.call(this);
+                        return Object.assign({{}}, real, _ctxAttrs2);
+                    }};
+                }}
+
+                // --- Patch getShaderPrecisionFormat ---
+                const _precData = _wgp.precision || null;
+                if (_precData) {{
+                    function patchShaderPrecision(proto) {{
+                        const orig = proto.getShaderPrecisionFormat;
+                        proto.getShaderPrecisionFormat = function(shaderType, precisionType) {{
+                            const real = orig.call(this, shaderType, precisionType);
+                            // Map shaderType + precisionType to key
+                            const shaderNames = {{35633: 'vertexShader', 35632: 'fragmentShader'}};
+                            const precNames = {{36336: 'HighFloat', 36337: 'MediumFloat', 36338: 'LowFloat',
+                                               36339: 'HighInt', 36340: 'MediumInt', 36341: 'LowInt'}};
+                            const sName = shaderNames[shaderType];
+                            const pName = precNames[precisionType];
+                            if (sName && pName) {{
+                                const key = sName + pName;
+                                const val = _precData[key];
+                                if (val) {{
+                                    return {{
+                                        precision: val.precision,
+                                        rangeMin: val.rangeMin,
+                                        rangeMax: val.rangeMax
+                                    }};
+                                }}
+                            }}
+                            return real;
+                        }};
+                    }}
+                    patchShaderPrecision(WebGLRenderingContext.prototype);
+                    if (typeof WebGL2RenderingContext !== 'undefined') {{
+                        patchShaderPrecision(WebGL2RenderingContext.prototype);
+                    }}
+                }}
+            }} catch(e) {{}}
+
+            // --- WebGPU adapter/device mock ---
+            try {{
+                const _wgpuData = {_json.dumps(webgpu_data)};
+                if (_wgpuData.isEnabled && navigator.gpu) {{
+                    // Build a fake GPUSupportedLimits object from dict
+                    function makeLimits(limDict) {{
+                        const obj = {{}};
+                        for (const [k, v] of Object.entries(limDict)) {{
+                            obj[k] = typeof v === 'string' ? parseInt(v) || 0 : v;
+                        }}
+                        return obj;
+                    }}
+                    // Build a fake GPUSupportedFeatures (Set-like)
+                    function makeFeatures(arr) {{
+                        const s = new Set(arr);
+                        return s;
+                    }}
+                    function makeAdapterInfo(info) {{
+                        return {{
+                            vendor: info.vendor || '',
+                            architecture: info.architecture || '',
+                            device: info.device || '',
+                            description: info.description || '',
+                        }};
+                    }}
+                    function buildAdapter(adapterData, deviceLimits) {{
+                        const adapter = {{
+                            isFallbackAdapter: adapterData.isFallbackAdapter || false,
+                            features: makeFeatures(adapterData.features || []),
+                            limits: makeLimits(adapterData.limits || {{}}),
+                            info: makeAdapterInfo(adapterData.info || {{}}),
+                            requestDevice: function(descriptor) {{
+                                const dev = {{
+                                    features: makeFeatures(adapterData.features || []),
+                                    limits: makeLimits(deviceLimits || adapterData.limits_gpudevice || {{}}),
+                                    queue: {{
+                                        label: '',
+                                        submit: function() {{}},
+                                        onSubmittedWorkDone: function() {{ return Promise.resolve(); }},
+                                        writeBuffer: function() {{}},
+                                        writeTexture: function() {{}},
+                                        copyExternalImageToTexture: function() {{}},
+                                    }},
+                                    label: '',
+                                    lost: new Promise(function() {{}}),
+                                    destroy: function() {{}},
+                                    createBuffer: function() {{ return {{}}; }},
+                                    createTexture: function() {{ return {{}}; }},
+                                    createSampler: function() {{ return {{}}; }},
+                                    createBindGroupLayout: function() {{ return {{}}; }},
+                                    createPipelineLayout: function() {{ return {{}}; }},
+                                    createShaderModule: function() {{ return {{}}; }},
+                                    createComputePipeline: function() {{ return {{}}; }},
+                                    createRenderPipeline: function() {{ return {{}}; }},
+                                    createCommandEncoder: function() {{ return {{}}; }},
+                                    createRenderBundleEncoder: function() {{ return {{}}; }},
+                                    createQuerySet: function() {{ return {{}}; }},
+                                    pushErrorScope: function() {{}},
+                                    popErrorScope: function() {{ return Promise.resolve(null); }},
+                                }};
+                                return Promise.resolve(dev);
+                            }},
+                            requestAdapterInfo: function() {{
+                                return Promise.resolve(makeAdapterInfo(adapterData.info || {{}}));
+                            }},
+                        }};
+                        return adapter;
+                    }}
+
+                    const _hp = _wgpuData.highPerformance;
+                    const _lp = _wgpuData.lowPerformance;
+
+                    const origRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu);
+                    navigator.gpu.requestAdapter = function(options) {{
+                        const powerPref = (options && options.powerPreference) || 'high-performance';
+                        const src = (powerPref === 'low-power' && _lp) ? _lp : _hp;
+                        if (src) {{
+                            return Promise.resolve(buildAdapter(src, src.limits_gpudevice || {{}}));
+                        }}
+                        return origRequestAdapter(options);
+                    }};
+
+                    // Override getPreferredCanvasFormat
+                    if (_wgpuData.preferredCanvasFormat) {{
+                        navigator.gpu.getPreferredCanvasFormat = function() {{
+                            return _wgpuData.preferredCanvasFormat;
+                        }};
+                    }}
+                }}
+            }} catch(e) {{}}
+
+            // --- Device Sensor APIs (mobile) ---
+            try {{
+                const _sensorData = {_json.dumps(sensor_data)};
+                if (_sensorData && _sensorData.gyroscope) {{
+                    // Gyroscope mock
+                    if (typeof Gyroscope !== 'undefined') {{
+                        const OrigGyro = Gyroscope;
+                        window.Gyroscope = function(opts) {{
+                            const inst = new OrigGyro(opts);
+                            Object.defineProperties(inst, {{
+                                x: {{ get: () => _sensorData.gyroscope.x }},
+                                y: {{ get: () => _sensorData.gyroscope.y }},
+                                z: {{ get: () => _sensorData.gyroscope.z }},
+                            }});
+                            return inst;
+                        }};
+                        window.Gyroscope.prototype = OrigGyro.prototype;
+                    }}
+                    // Accelerometer mock
+                    if (typeof Accelerometer !== 'undefined') {{
+                        const OrigAccel = Accelerometer;
+                        window.Accelerometer = function(opts) {{
+                            const inst = new OrigAccel(opts);
+                            Object.defineProperties(inst, {{
+                                x: {{ get: () => _sensorData.accelerometer.x }},
+                                y: {{ get: () => _sensorData.accelerometer.y }},
+                                z: {{ get: () => _sensorData.accelerometer.z }},
+                            }});
+                            return inst;
+                        }};
+                        window.Accelerometer.prototype = OrigAccel.prototype;
+                    }}
+                    // GravitySensor mock
+                    if (typeof GravitySensor !== 'undefined') {{
+                        const OrigGrav = GravitySensor;
+                        window.GravitySensor = function(opts) {{
+                            const inst = new OrigGrav(opts);
+                            Object.defineProperties(inst, {{
+                                x: {{ get: () => _sensorData.gravity.x }},
+                                y: {{ get: () => _sensorData.gravity.y }},
+                                z: {{ get: () => _sensorData.gravity.z }},
+                            }});
+                            return inst;
+                        }};
+                        window.GravitySensor.prototype = OrigGrav.prototype;
+                    }}
+                    // LinearAccelerationSensor mock
+                    if (typeof LinearAccelerationSensor !== 'undefined') {{
+                        const OrigLin = LinearAccelerationSensor;
+                        window.LinearAccelerationSensor = function(opts) {{
+                            const inst = new OrigLin(opts);
+                            Object.defineProperties(inst, {{
+                                x: {{ get: () => _sensorData.linearAcceleration.x }},
+                                y: {{ get: () => _sensorData.linearAcceleration.y }},
+                                z: {{ get: () => _sensorData.linearAcceleration.z }},
+                            }});
+                            return inst;
+                        }};
+                        window.LinearAccelerationSensor.prototype = OrigLin.prototype;
+                    }}
+                }}
+            }} catch(e) {{}}
+
+            // --- CSS matchMedia overrides ---
+            try {{
+                const _cssMedia = {_json.dumps(css_media)};
+                if (_cssMedia && Object.keys(_cssMedia).length > 0) {{
+                    const origMatchMedia = window.matchMedia;
+                    const mediaMap = {{
+                        '(hover: hover)': _cssMedia.hover === 'hover',
+                        '(hover: none)': _cssMedia.hover === 'none',
+                        '(pointer: fine)': _cssMedia.pointer === 'fine',
+                        '(pointer: coarse)': _cssMedia.pointer === 'coarse',
+                        '(any-hover: hover)': _cssMedia.anyHover === 'hover',
+                        '(any-hover: none)': _cssMedia.anyHover === 'none',
+                        '(any-pointer: fine)': _cssMedia.anyPointer === 'fine',
+                        '(any-pointer: coarse)': _cssMedia.anyPointer === 'coarse',
+                        '(prefers-color-scheme: dark)': _cssMedia.prefersColorScheme === 'dark',
+                        '(prefers-color-scheme: light)': _cssMedia.prefersColorScheme === 'light',
+                        '(prefers-reduced-motion: reduce)': _cssMedia.prefersReducedMotion === 'reduce',
+                        '(prefers-reduced-motion: no-preference)': _cssMedia.prefersReducedMotion === 'no-preference',
+                        '(prefers-contrast: more)': _cssMedia.prefersContrast === 'more',
+                        '(prefers-contrast: no-preference)': _cssMedia.prefersContrast === 'no-preference',
+                        '(forced-colors: active)': _cssMedia.forcedColors === 'active',
+                        '(forced-colors: none)': _cssMedia.forcedColors === 'none',
+                        '(inverted-colors: inverted)': _cssMedia.invertedColors === 'inverted',
+                        '(inverted-colors: none)': _cssMedia.invertedColors === 'none',
+                        '(dynamic-range: high)': _cssMedia.dynamicRange === 'high',
+                        '(dynamic-range: standard)': _cssMedia.dynamicRange === 'standard',
+                    }};
+                    window.matchMedia = function(query) {{
+                        const q = query.trim();
+                        if (mediaMap.hasOwnProperty(q)) {{
+                            const result = origMatchMedia.call(window, q);
+                            Object.defineProperty(result, 'matches', {{
+                                get: () => mediaMap[q],
+                                configurable: true
+                            }});
+                            return result;
+                        }}
+                        return origMatchMedia.call(window, q);
+                    }};
+                }}
+            }} catch(e) {{}}
+
+            // --- DOMRect fingerprint noise (seed-based) ---
+            try {{
+                const RECT_SEED = {canvas_seed} ^ 0xDEAD;
+                function rectRng(seed) {{
+                    return function() {{
+                        seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+                        var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+                        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+                        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+                    }};
+                }}
+                const _rr = rectRng(RECT_SEED);
+                // Per-profile tiny offset (0 to 0.001 px)
+                const _rxOff = _rr() * 0.001;
+                const _ryOff = _rr() * 0.001;
+                const origGetBCR = Element.prototype.getBoundingClientRect;
+                Element.prototype.getBoundingClientRect = function() {{
+                    const r = origGetBCR.call(this);
+                    return new DOMRect(r.x + _rxOff, r.y + _ryOff, r.width + _rxOff, r.height + _ryOff);
+                }};
+                const origGetCR = Element.prototype.getClientRects;
+                Element.prototype.getClientRects = function() {{
+                    const rects = origGetCR.call(this);
+                    const out = [];
+                    for (let i = 0; i < rects.length; i++) {{
+                        const r = rects[i];
+                        out.push(new DOMRect(r.x + _rxOff, r.y + _ryOff, r.width + _rxOff, r.height + _ryOff));
+                    }}
+                    return out;
+                }};
             }} catch(e) {{}}
 
             // --- AudioContext fingerprint spoofing ---
@@ -994,6 +1388,98 @@ class BrowserManager:
                     }}
                     return origQuery.call(this, params);
                 }};
+            }} catch(e) {{}}
+
+            // --- Speech Synthesis voices mock ---
+            try {{
+                const _voices = {_json.dumps(speech_voices)};
+                if (_voices && _voices.length > 0) {{
+                    const voiceObjects = _voices.map(v => {{
+                        const obj = {{
+                            name: v.name,
+                            lang: v.lang.replace('_', '-'),
+                            localService: v.localService !== false,
+                            voiceURI: v.voiceURI || v.name,
+                            default: v.default || false,
+                        }};
+                        return obj;
+                    }});
+                    Object.defineProperty(speechSynthesis, 'getVoices', {{
+                        value: function() {{ return voiceObjects; }},
+                        writable: false,
+                        configurable: true,
+                    }});
+                    // Fire voiceschanged event on next tick
+                    setTimeout(() => {{
+                        try {{ speechSynthesis.dispatchEvent(new Event('voiceschanged')); }} catch(e) {{}}
+                    }}, 50);
+                }}
+            }} catch(e) {{}}
+
+            // --- Feature detection flags ---
+            try {{
+                const _feats = {_json.dumps(feature_flags)};
+                if (_feats) {{
+                    // Hide APIs that shouldn't exist on this device type
+                    if (_feats.SharedWorker === false && typeof SharedWorker !== 'undefined') {{
+                        Object.defineProperty(window, 'SharedWorker', {{ get: () => undefined, configurable: true }});
+                    }}
+                    if (_feats.WebHID === false && navigator.hid) {{
+                        Object.defineProperty(Navigator.prototype, 'hid', {{ get: () => undefined, configurable: true }});
+                    }}
+                    if (_feats.Serial === false && navigator.serial) {{
+                        Object.defineProperty(Navigator.prototype, 'serial', {{ get: () => undefined, configurable: true }});
+                    }}
+                    if (_feats.EyeDropperAPI === false && typeof EyeDropper !== 'undefined') {{
+                        Object.defineProperty(window, 'EyeDropper', {{ get: () => undefined, configurable: true }});
+                    }}
+                    if (_feats.WebNFC === true && !('NDEFReader' in window)) {{
+                        window.NDEFReader = function() {{ throw new DOMException('NFC not available', 'NotSupportedError'); }};
+                    }}
+                    if (_feats.ContactsManager === true && !navigator.contacts) {{
+                        Object.defineProperty(Navigator.prototype, 'contacts', {{
+                            get: () => ({{ select: () => Promise.resolve([]), getProperties: () => Promise.resolve(['name', 'email', 'tel']) }}),
+                            configurable: true
+                        }});
+                    }}
+                }}
+            }} catch(e) {{}}
+
+            // --- Audio properties override ---
+            try {{
+                const _audioProps = {_json.dumps(audio_props)};
+                if (_audioProps && _audioProps.sampleRate) {{
+                    const OrigAudioCtx = window.AudioContext || window.webkitAudioContext;
+                    if (OrigAudioCtx) {{
+                        const origProto = OrigAudioCtx.prototype;
+                        Object.defineProperty(origProto, 'sampleRate', {{
+                            get: function() {{ return _audioProps.sampleRate; }},
+                            configurable: true
+                        }});
+                        if (_audioProps.baseLatency !== undefined) {{
+                            Object.defineProperty(origProto, 'baseLatency', {{
+                                get: function() {{ return _audioProps.baseLatency; }},
+                                configurable: true
+                            }});
+                        }}
+                        if (_audioProps.outputLatency !== undefined) {{
+                            Object.defineProperty(origProto, 'outputLatency', {{
+                                get: function() {{ return _audioProps.outputLatency; }},
+                                configurable: true
+                            }});
+                        }}
+                    }}
+                    // Override destination maxChannelCount
+                    if (_audioProps.maxChannelCount !== undefined) {{
+                        const origMaxCh = Object.getOwnPropertyDescriptor(AudioDestinationNode.prototype, 'maxChannelCount');
+                        if (origMaxCh) {{
+                            Object.defineProperty(AudioDestinationNode.prototype, 'maxChannelCount', {{
+                                get: function() {{ return _audioProps.maxChannelCount; }},
+                                configurable: true
+                            }});
+                        }}
+                    }}
+                }}
             }} catch(e) {{}}
 
             // --- Chrome runtime mock ---

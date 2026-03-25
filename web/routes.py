@@ -2689,7 +2689,7 @@ async def toggle_keywords_batch(target_id: int, body: Dict[str, Any], db: Sessio
 
 
 @router.get("/api/yandex-search-logs")
-async def get_yandex_search_logs(db: Session = Depends(get_db), limit: int = 50):
+async def get_yandex_search_logs(db: Session = Depends(get_db), limit: int = 100):
     """Get recent search click-through task logs."""
     try:
         tasks = db.query(Task).filter(

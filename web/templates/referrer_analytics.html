@@ -1,0 +1,330 @@
+{% extends "base.html" %}
+
+{% block title %}Аналитика реферера — Яндекс Поиск{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2"><i class="bi bi-link-45deg"></i> Аналитика реферера</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <button class="btn btn-outline-secondary" onclick="loadReferrerAnalytics()">
+            <i class="bi bi-arrow-clockwise"></i> Обновить
+        </button>
+    </div>
+</div>
+
+<!-- Referrer Settings -->
+<div class="card shadow-sm mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-gear"></i> Настройка реферера</h5>
+        <span class="badge bg-info" id="referrerStatus">Загрузка...</span>
+    </div>
+    <div class="card-body">
+        <div class="row align-items-end">
+            <div class="col-md-3 mb-2">
+                <label class="form-label">Процент переходов через реферер</label>
+                <div class="input-group">
+                    <input type="number" class="form-control" id="referrerPercent" min="0" max="100" value="50">
+                    <span class="input-group-text">%</span>
+                </div>
+                <small class="text-muted">0% = всегда напрямую, 100% = всегда через реферер</small>
+            </div>
+            <div class="col-md-5 mb-2">
+                <label class="form-label">Сайт-реферер</label>
+                <input type="text" class="form-control" id="referrerSite" value="https://mail.ru" placeholder="https://mail.ru">
+                <small class="text-muted">Браузер сначала откроет этот сайт, потом перейдёт на ya.ru</small>
+            </div>
+            <div class="col-md-4 mb-2">
+                <button class="btn btn-success" onclick="saveReferrerSettings()">
+                    <i class="bi bi-check-lg"></i> Сохранить
+                </button>
+                <span class="ms-2 text-muted small" id="referrerSaveStatus"></span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Period Selector -->
+<div class="card shadow-sm mb-4">
+    <div class="card-body py-3">
+        <div class="row align-items-center">
+            <div class="col-md-3">
+                <label class="form-label fw-bold mb-1">Период анализа</label>
+                <select class="form-select" id="refAnalyticsDays" onchange="loadReferrerAnalytics()">
+                    <option value="7">7 дней</option>
+                    <option value="14">14 дней</option>
+                    <option value="30" selected>30 дней</option>
+                    <option value="60">60 дней</option>
+                    <option value="90">90 дней</option>
+                </select>
+            </div>
+            <div class="col-md-9">
+                <div class="alert alert-info mb-0 mt-2 mt-md-0">
+                    <i class="bi bi-info-circle"></i>
+                    Сравнение позиций сайтов при переходе через реферер (напр. mail.ru → ya.ru) и при прямом заходе на ya.ru.
+                    Положительная разница означает, что реферер помогает продвижению.
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Analytics Content -->
+<div id="refAnalyticsBody">
+    <div class="text-center text-muted py-5">
+        <div class="spinner-border text-info"></div>
+        <p class="mt-2">Загрузка аналитики...</p>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+// === Referrer Settings ===
+async function loadReferrerSettings() {
+    try {
+        const data = await apiCall('/search-referrer-settings', 'GET');
+        document.getElementById('referrerPercent').value = data.search_referrer_percent ?? 50;
+        document.getElementById('referrerSite').value = data.search_referrer_site || 'https://mail.ru';
+        const pct = data.search_referrer_percent ?? 50;
+        const badge = document.getElementById('referrerStatus');
+        if (pct === 0) {
+            badge.className = 'badge bg-secondary';
+            badge.textContent = 'Выключен';
+        } else if (pct === 100) {
+            badge.className = 'badge bg-success';
+            badge.textContent = '100% через реферер';
+        } else {
+            badge.className = 'badge bg-info';
+            badge.textContent = `${pct}% через реферер`;
+        }
+    } catch (err) {
+        document.getElementById('referrerStatus').textContent = 'Ошибка';
+        document.getElementById('referrerStatus').className = 'badge bg-danger';
+    }
+}
+
+async function saveReferrerSettings() {
+    const pct = parseInt(document.getElementById('referrerPercent').value) || 0;
+    const site = document.getElementById('referrerSite').value.trim() || 'https://mail.ru';
+    if (pct < 0 || pct > 100) { alert('Процент должен быть от 0 до 100'); return; }
+    try {
+        await apiCall('/search-referrer-settings', 'POST', {
+            search_referrer_percent: pct,
+            search_referrer_site: site
+        });
+        document.getElementById('referrerSaveStatus').textContent = '✅ Сохранено!';
+        setTimeout(() => { document.getElementById('referrerSaveStatus').textContent = ''; }, 3000);
+        loadReferrerSettings();
+    } catch (err) {
+        document.getElementById('referrerSaveStatus').textContent = '❌ Ошибка';
+        alert('Ошибка сохранения: ' + (err.message || err));
+    }
+}
+
+// === Referrer Analytics ===
+async function loadReferrerAnalytics() {
+    const body = document.getElementById('refAnalyticsBody');
+    const days = document.getElementById('refAnalyticsDays').value;
+    body.innerHTML = '<div class="text-center text-muted py-5"><div class="spinner-border text-info"></div><p class="mt-2">Загрузка аналитики...</p></div>';
+    try {
+        const data = await apiCall(`/referrer-analytics?days=${days}`, 'GET');
+        if (!data.has_data) {
+            body.innerHTML = '<div class="alert alert-warning text-center py-4"><i class="bi bi-inbox fs-1 d-block mb-2"></i>Нет данных за выбранный период</div>';
+            return;
+        }
+        if (!data.has_referrer_data) {
+            body.innerHTML = '<div class="alert alert-info text-center py-4"><i class="bi bi-hourglass-split fs-1 d-block mb-2"></i>Данные по реферерам ещё не накоплены.<br>Статистика начнёт появляться после новых визитов.</div>';
+            return;
+        }
+        const wr = data.with_referrer;
+        const wor = data.without_referrer;
+
+        // Summary cards row
+        let html = '<div class="row g-3 mb-4">';
+        html += buildSummaryCard('С реферером', wr, 'success');
+        html += buildSummaryCard('Без реферера', wor, 'secondary');
+        // Delta card
+        const deltaPos = (wr.avg_position && wor.avg_position) ? (wor.avg_position - wr.avg_position).toFixed(1) : null;
+        html += `<div class="col-md-4"><div class="card border-info h-100"><div class="card-body text-center">
+            <h6 class="text-info"><i class="bi bi-arrow-left-right"></i> Разница</h6>
+            <div class="display-4 mb-2">${deltaPos !== null ? (deltaPos > 0 ? '<span class="text-success">+' + deltaPos + '</span>' : '<span class="text-danger">' + deltaPos + '</span>') : '<span class="text-muted">—</span>'}</div>
+            <p class="text-muted mb-1">${deltaPos > 0 ? '✅ Реферер помогает (позиция ниже = лучше)' : deltaPos < 0 ? '⚠️ Реферер ухудшает позицию' : deltaPos !== null ? '➡️ Нет разницы' : 'Недостаточно данных'}</p>
+            <small class="text-muted">Всего записей: ${data.total_records}</small>
+        </div></div></div>`;
+        html += '</div>';
+
+        // Detailed stats
+        html += '<div class="row g-3 mb-4">';
+        html += buildDetailedCard('С реферером', wr, 'success');
+        html += buildDetailedCard('Без реферера', wor, 'secondary');
+        html += '</div>';
+
+        // Chart
+        html += '<div class="card shadow-sm mb-4"><div class="card-header"><h5 class="mb-0"><i class="bi bi-graph-up"></i> Средняя позиция по дням</h5></div>';
+        html += '<div class="card-body"><canvas id="refChart" height="80"></canvas></div></div>';
+
+        // Per-keyword comparison table
+        if (data.keywords && data.keywords.length > 0) {
+            html += '<div class="card shadow-sm mb-4"><div class="card-header"><h5 class="mb-0"><i class="bi bi-table"></i> Сравнение по ключевым словам</h5></div>';
+            html += '<div class="card-body"><div class="table-responsive"><table class="table table-sm table-striped table-hover">';
+            html += '<thead class="table-light"><tr><th>Ключевое слово</th><th class="text-center">С реф. (визиты)</th><th class="text-center">Ср. поз. с реф.</th><th class="text-center">Без реф. (визиты)</th><th class="text-center">Ср. поз. без реф.</th><th class="text-center">Разница</th></tr></thead><tbody>';
+            for (const kw of data.keywords) {
+                const diffBadge = kw.diff !== null
+                    ? (kw.diff > 0 ? `<span class="badge bg-success">+${kw.diff}</span>` : kw.diff < 0 ? `<span class="badge bg-danger">${kw.diff}</span>` : '<span class="badge bg-secondary">0</span>')
+                    : '<span class="text-muted">—</span>';
+                html += `<tr>
+                    <td><strong>${escapeHtml(kw.keyword)}</strong></td>
+                    <td class="text-center">${kw.with_ref_count}</td>
+                    <td class="text-center">${kw.with_ref_avg ?? '<span class="text-muted">—</span>'}</td>
+                    <td class="text-center">${kw.without_ref_count}</td>
+                    <td class="text-center">${kw.without_ref_avg ?? '<span class="text-muted">—</span>'}</td>
+                    <td class="text-center">${diffBadge}</td>
+                </tr>`;
+            }
+            html += '</tbody></table></div></div></div>';
+        }
+
+        body.innerHTML = html;
+
+        // Draw chart
+        drawRefChart(wr.chart_data, wor.chart_data);
+    } catch (err) {
+        body.innerHTML = `<div class="alert alert-danger"><i class="bi bi-exclamation-triangle"></i> Ошибка загрузки: ${err.message || err}</div>`;
+    }
+}
+
+function buildSummaryCard(title, stats, color) {
+    const trendIcon = stats.trend === 'improving' ? '📈' : stats.trend === 'declining' ? '📉' : '➡️';
+    const trendText = stats.trend === 'improving' ? 'Рост' : stats.trend === 'declining' ? 'Падение' : 'Стабильно';
+    return `<div class="col-md-4"><div class="card border-${color} h-100"><div class="card-body text-center">
+        <h6 class="text-${color}"><i class="bi bi-${color === 'success' ? 'link-45deg' : 'arrow-right'}"></i> ${title}</h6>
+        <div class="display-4 mb-1">${stats.avg_position ?? '<span class="text-muted">—</span>'}</div>
+        <small class="text-muted">средняя позиция</small><br>
+        <div class="mt-2">
+            <span class="badge bg-${color}">${stats.total} визитов</span>
+            <span class="badge bg-light text-dark">${stats.found_rate}% найдено</span>
+        </div>
+        <small class="mt-1 d-block">${trendIcon} ${trendText} (${stats.trend_value > 0 ? '+' : ''}${stats.trend_value})</small>
+    </div></div></div>`;
+}
+
+function buildDetailedCard(title, stats, color) {
+    return `<div class="col-md-6"><div class="card border-${color}"><div class="card-header bg-${color} bg-opacity-10">
+        <h6 class="mb-0 text-${color}">${title} — подробности</h6>
+    </div><div class="card-body">
+        <div class="row text-center">
+            <div class="col-3">
+                <div class="h4 mb-0">${stats.total}</div>
+                <small class="text-muted">Всего</small>
+            </div>
+            <div class="col-3">
+                <div class="h4 mb-0">${stats.found}</div>
+                <small class="text-muted">Найдено</small>
+            </div>
+            <div class="col-3">
+                <div class="h4 mb-0">${stats.clicked}</div>
+                <small class="text-muted">Кликнуто</small>
+            </div>
+            <div class="col-3">
+                <div class="h4 mb-0">${stats.not_found}</div>
+                <small class="text-muted">Не найдено</small>
+            </div>
+        </div>
+        <hr>
+        <div class="row text-center">
+            <div class="col-4">
+                <span class="badge bg-warning text-dark">TOP-3: ${stats.top3}</span>
+            </div>
+            <div class="col-4">
+                <span class="badge bg-info">TOP-5: ${stats.top5}</span>
+            </div>
+            <div class="col-4">
+                <span class="badge bg-primary">TOP-10: ${stats.top10}</span>
+            </div>
+        </div>
+    </div></div></div>`;
+}
+
+function drawRefChart(wrData, worData) {
+    const canvas = document.getElementById('refChart');
+    if (!canvas) return;
+    const allDates = new Set();
+    wrData.forEach(d => allDates.add(d.date));
+    worData.forEach(d => allDates.add(d.date));
+    const dates = [...allDates].sort();
+
+    const wrMap = {};
+    wrData.forEach(d => { wrMap[d.date] = d.avg_position; });
+    const worMap = {};
+    worData.forEach(d => { worMap[d.date] = d.avg_position; });
+
+    new Chart(canvas, {
+        type: 'line',
+        data: {
+            labels: dates,
+            datasets: [
+                {
+                    label: 'С реферером',
+                    data: dates.map(d => wrMap[d] ?? null),
+                    borderColor: '#198754',
+                    backgroundColor: 'rgba(25,135,84,0.1)',
+                    fill: true,
+                    tension: 0.3,
+                    spanGaps: true,
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
+                    borderWidth: 2,
+                },
+                {
+                    label: 'Без реферера',
+                    data: dates.map(d => worMap[d] ?? null),
+                    borderColor: '#6c757d',
+                    backgroundColor: 'rgba(108,117,125,0.1)',
+                    fill: true,
+                    tension: 0.3,
+                    spanGaps: true,
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
+                    borderWidth: 2,
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { position: 'top' },
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) {
+                            return ctx.dataset.label + ': ' + (ctx.parsed.y !== null ? ctx.parsed.y : 'нет данных');
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    reverse: true,
+                    title: { display: true, text: 'Позиция (меньше = лучше)' },
+                    beginAtZero: false
+                },
+                x: {
+                    title: { display: true, text: 'Дата' }
+                }
+            }
+        }
+    });
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Init
+loadReferrerSettings();
+loadReferrerAnalytics();
+</script>
+{% endblock %}

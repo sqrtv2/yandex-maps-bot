@@ -1,0 +1,140 @@
+# ОПТИМИЗИРОВАННАЯ КОНФИГУРАЦИЯ для стабильной работы 1000 кликов/день
+
+services:
+  # Celery worker for Yandex Search clicks - ОПТИМИЗИРОВАНО
+  celery_yandex_search:
+    build: .
+    init: true
+    # ФИКСЫ:
+    # 1. concurrency=4 (вместо 10) - меньше параллельных браузеров
+    # 2. max-memory-per-child=500000000 (500MB вместо 8MB) - достаточно для Chrome
+    # 3. max-tasks-per-child=5 (вместо 2) - меньше перезапусков
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=4 -Q yandex_search -n yandex_search@%h --max-memory-per-child=500000000 --max-tasks-per-child=5 --soft-time-limit=180 --time-limit=240
+
+    shm_size: '8gb'  # Оставляем как есть
+
+    # Увеличиваем лимиты Docker контейнера
+    deploy:
+      resources:
+        limits:
+          memory: 16G  # Увеличиваем с 48G до разумных 16G
+          cpus: '6'    # Увеличиваем с 8 до 6 CPU
+
+    # Добавляем переменные для стабилизации
+    environment:
+      - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
+      - YANDEX_BOT_REDIS_HOST=redis
+      - YANDEX_BOT_REDIS_PORT=6379
+      - YANDEX_BOT_DEBUG=false
+      - YANDEX_BOT_BROWSER_HEADLESS=true
+      - YANDEX_BOT_SAVE_SCREENSHOTS=false
+      - YANDEX_BOT_FAST_MODE=true
+
+      # НОВЫЕ НАСТРОЙКИ для стабилизации браузера:
+      - YANDEX_BOT_BROWSER_TIMEOUT=60           # Увеличить таймаут до 60 сек
+      - YANDEX_BOT_MAX_BROWSER_INSTANCES=4      # Лимит браузеров = concurrency
+      - YANDEX_BOT_MIN_REQUEST_DELAY=8          # Минимум 8 сек между запросами
+      - YANDEX_BOT_MAX_REQUEST_DELAY=15         # Максимум 15 сек между запросами
+
+      # Настройки для медленных прокси:
+      - YANDEX_BOT_YANDEX_MIN_VISIT_TIME=10     # Минимум времени на сайте
+      - YANDEX_BOT_YANDEX_MAX_VISIT_TIME=30     # Максимум времени на сайте
+      - YANDEX_BOT_PROXY_TIMEOUT=30             # Таймаут прокси 30 сек
+      - YANDEX_BOT_CAPTCHA_TIMEOUT=180          # Таймаут капчи 3 мин
+
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d yandex_search@$$HOSTNAME --timeout=15 || exit 1"]
+      interval: 45s      # Увеличить интервал
+      timeout: 20s       # Увеличить таймаут
+      retries: 5         # Больше попыток
+
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./browser_profiles:/app/browser_profiles
+      - ./tasks:/app/tasks
+      - ./core:/app/core
+      - ./app:/app/app
+      - ./web:/app/web
+      - ./parser:/app/parser
+
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - yandex_maps_network
+
+# Добавляем дополнительный search worker для масштабирования
+  celery_yandex_search_2:
+    build: .
+    init: true
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=3 -Q yandex_search -n yandex_search_2@%h --max-memory-per-child=500000000 --max-tasks-per-child=5 --soft-time-limit=180 --time-limit=240
+
+    shm_size: '6gb'
+
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+          cpus: '4'
+
+    environment:
+      - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
+      - YANDEX_BOT_REDIS_HOST=redis
+      - YANDEX_BOT_REDIS_PORT=6379
+      - YANDEX_BOT_DEBUG=false
+      - YANDEX_BOT_BROWSER_HEADLESS=true
+      - YANDEX_BOT_SAVE_SCREENSHOTS=false
+      - YANDEX_BOT_FAST_MODE=true
+      - YANDEX_BOT_BROWSER_TIMEOUT=60
+      - YANDEX_BOT_MAX_BROWSER_INSTANCES=3
+      - YANDEX_BOT_MIN_REQUEST_DELAY=8
+      - YANDEX_BOT_MAX_REQUEST_DELAY=15
+      - YANDEX_BOT_PROXY_TIMEOUT=30
+      - YANDEX_BOT_CAPTCHA_TIMEOUT=180
+
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d yandex_search_2@$$HOSTNAME --timeout=15 || exit 1"]
+      interval: 45s
+      timeout: 20s
+      retries: 5
+
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./browser_profiles:/app/browser_profiles
+      - ./tasks:/app/tasks
+      - ./core:/app/core
+      - ./app:/app/app
+      - ./web:/app/web
+      - ./parser:/app/parser
+
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - yandex_maps_network
+
+networks:
+  yandex_maps_network:
+    driver: bridge
+
+# ИТОГО ПРОИЗВОДИТЕЛЬНОСТЬ:
+# - Worker 1: 4 concurrent * 60 кликов/час = 240 кликов/час
+# - Worker 2: 3 concurrent * 60 кликов/час = 180 кликов/час
+# - ВСЕГО: 420 кликов/час * 4 часа работы = 1680 кликов/день
+# - С учетом ошибок/капч: ~1000-1200 успешных кликов/день

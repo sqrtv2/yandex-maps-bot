@@ -94,19 +94,405 @@ class ProfileGenerator:
             "QuickTime Plug-in", "VLC Web Plugin", "Adobe Acrobat"
         ]
 
-        # WebGL vendor/renderer combinations (must match ANGLE format on Chrome)
-        self.webgl_vendors = [
-            ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) HD Graphics 4000 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-            ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-            ("Google Inc. (Intel)", "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-            ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-            ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-            ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-            ("Google Inc. (NVIDIA)", "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-            ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-            ("Google Inc. (AMD)", "ANGLE (AMD, AMD Radeon RX 6600 XT Direct3D11 vs_5_0 ps_5_0, D3D11)"),
-            ("Google Inc. (Apple)", "ANGLE (Apple, Apple M1, OpenGL 4.1)"),
-            ("Google Inc. (Apple)", "ANGLE (Apple, Apple M2, OpenGL 4.1)"),
+        # ============================================================
+        # GPU DATABASE — complete WebGL1/WebGL2 profiles per GPU
+        # Each entry contains ALL parameters that fingerprinting
+        # scripts check: vendor, renderer, limits, precision,
+        # extensions, context attributes, etc.
+        # Values are taken from real device measurements.
+        # ============================================================
+        self._gpu_profiles_desktop = self._build_gpu_database_desktop()
+        self._gpu_profiles_mobile = self._build_gpu_database_mobile()
+
+    @staticmethod
+    def _webgl_context_defaults():
+        """Default WebGL context attributes (constant across GPUs)."""
+        return {
+            "alpha": True, "antialias": True, "depth": True,
+            "desynchronized": False, "failIfMajorPerformanceCaveat": False,
+            "powerPreference": "default", "premultipliedAlpha": True,
+            "preserveDrawingBuffer": False, "stencil": False, "xrCompatible": False,
+        }
+
+    @staticmethod
+    def _shader_precision_desktop():
+        """Shader precision values typical for desktop GPUs."""
+        return {
+            "vertexShaderHighFloat":   {"precision": 23, "rangeMin": 127, "rangeMax": 127},
+            "vertexShaderMediumFloat": {"precision": 23, "rangeMin": 127, "rangeMax": 127},
+            "vertexShaderLowFloat":    {"precision": 23, "rangeMin": 127, "rangeMax": 127},
+            "fragmentShaderHighFloat":   {"precision": 23, "rangeMin": 127, "rangeMax": 127},
+            "fragmentShaderMediumFloat": {"precision": 23, "rangeMin": 127, "rangeMax": 127},
+            "fragmentShaderLowFloat":    {"precision": 23, "rangeMin": 127, "rangeMax": 127},
+            "vertexShaderHighInt":   {"precision": 0, "rangeMin": 31, "rangeMax": 31},
+            "vertexShaderMediumInt": {"precision": 0, "rangeMin": 31, "rangeMax": 31},
+            "vertexShaderLowInt":    {"precision": 0, "rangeMin": 31, "rangeMax": 31},
+            "fragmentShaderHighInt":   {"precision": 0, "rangeMin": 31, "rangeMax": 31},
+            "fragmentShaderMediumInt": {"precision": 0, "rangeMin": 31, "rangeMax": 31},
+            "fragmentShaderLowInt":    {"precision": 0, "rangeMin": 31, "rangeMax": 31},
+        }
+
+    @staticmethod
+    def _shader_precision_mobile():
+        """Shader precision values typical for mobile GPUs (medium/low float differ)."""
+        return {
+            "vertexShaderHighFloat":   {"precision": 23, "rangeMin": 127, "rangeMax": 127},
+            "vertexShaderMediumFloat": {"precision": 23, "rangeMin": 127, "rangeMax": 127},
+            "vertexShaderLowFloat":    {"precision": 23, "rangeMin": 127, "rangeMax": 127},
+            "fragmentShaderHighFloat":   {"precision": 23, "rangeMin": 127, "rangeMax": 127},
+            "fragmentShaderMediumFloat": {"precision": 10, "rangeMin": 15, "rangeMax": 15},
+            "fragmentShaderLowFloat":    {"precision": 10, "rangeMin": 15, "rangeMax": 15},
+            "vertexShaderHighInt":   {"precision": 0, "rangeMin": 31, "rangeMax": 31},
+            "vertexShaderMediumInt": {"precision": 0, "rangeMin": 31, "rangeMax": 31},
+            "vertexShaderLowInt":    {"precision": 0, "rangeMin": 31, "rangeMax": 31},
+            "fragmentShaderHighInt":   {"precision": 0, "rangeMin": 31, "rangeMax": 31},
+            "fragmentShaderMediumInt": {"precision": 0, "rangeMin": 15, "rangeMax": 15},
+            "fragmentShaderLowInt":    {"precision": 0, "rangeMin": 15, "rangeMax": 15},
+        }
+
+    def _build_gpu_database_desktop(self) -> list:
+        """Build complete GPU database for desktop devices."""
+        ctx_defaults = self._webgl_context_defaults()
+        precision = self._shader_precision_desktop()
+
+        # Common desktop WebGL1 extensions
+        ext_desktop = (
+            "ANGLE_instanced_arrays,EXT_blend_minmax,EXT_clip_control,"
+            "EXT_color_buffer_half_float,EXT_depth_clamp,EXT_float_blend,"
+            "EXT_polygon_offset_clamp,EXT_texture_compression_bptc,"
+            "EXT_texture_compression_rgtc,EXT_texture_filter_anisotropic,"
+            "EXT_sRGB,OES_element_index_uint,OES_fbo_render_mipmap,"
+            "OES_standard_derivatives,OES_texture_float,OES_texture_float_linear,"
+            "OES_texture_half_float,OES_texture_half_float_linear,"
+            "OES_vertex_array_object,WEBGL_color_buffer_float,"
+            "WEBGL_compressed_texture_s3tc,WEBGL_compressed_texture_s3tc_srgb,"
+            "WEBGL_debug_renderer_info,WEBGL_debug_shaders,"
+            "WEBGL_depth_texture,WEBGL_lose_context,WEBGL_multi_draw"
+        )
+        ext2_desktop = (
+            "EXT_clip_control,EXT_color_buffer_float,EXT_color_buffer_half_float,"
+            "EXT_depth_clamp,EXT_float_blend,EXT_polygon_offset_clamp,"
+            "EXT_texture_compression_bptc,EXT_texture_compression_rgtc,"
+            "EXT_texture_filter_anisotropic,EXT_texture_norm16,"
+            "OES_draw_buffers_indexed,OES_texture_float_linear,"
+            "WEBGL_clip_cull_distance,WEBGL_compressed_texture_s3tc,"
+            "WEBGL_compressed_texture_s3tc_srgb,WEBGL_debug_renderer_info,"
+            "WEBGL_debug_shaders,WEBGL_lose_context,WEBGL_multi_draw"
+        )
+
+        def desktop_gpu(unmasked_vendor, unmasked_renderer, params_override=None):
+            """Create a complete desktop GPU profile."""
+            base = {
+                "unmaskedVendor": unmasked_vendor,
+                "unmaskedRenderer": unmasked_renderer,
+                "vendor": "WebKit",
+                "renderer": "WebKit WebGL",
+                "shadingLanguage": "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)",
+                "version": "WebGL 1.0 (OpenGL ES 2.0 Chromium)",
+                "shadingLanguage2": "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)",
+                "version2": "WebGL 2.0 (OpenGL ES 3.0 Chromium)",
+                "maxAnisotropy": "16",
+                # WebGL1 limits
+                "aliasedLineWidthRange": [1, 1],
+                "aliasedPointSizeRange": [1, 1024],
+                "alphaBits": "8", "blueBits": "8", "greenBits": "8", "redBits": "8",
+                "depthBits": "24", "stencilBits": "8", "subpixelBits": "4",
+                "sampleBuffers": "1", "samples": "4",
+                "maxCombinedTextureImageUnits": "32",
+                "maxCubeMapTextureSize": "16384",
+                "maxFragmentUniformVectors": "1024",
+                "maxRenderBufferSize": "16384",
+                "maxTextureImageUnits": "16",
+                "maxTextureSize": "16384",
+                "maxVaryingVectors": "30",
+                "maxVertexAttribs": "16",
+                "maxVertexTextureImageUnits": "16",
+                "maxVertexUniformVectors": "4096",
+                "maxViewportDims": [32767, 32767],
+                "stencilBackValueMask": "2147483647",
+                "stencilBackWritemask": "2147483647",
+                "stencilValueMask": "2147483647",
+                "stencilWritemask": "2147483647",
+                "extensions": ext_desktop,
+                "contextAttributes": ctx_defaults,
+                # WebGL2-specific limits
+                "maxVertexUniformComponents2": "16384",
+                "maxVertexUniformBlocks2": "16",
+                "maxVertexOutputComponents2": "128",
+                "maxVaryingComponents2": "124",
+                "maxTransformFeedbackInterleavedComponents2": "128",
+                "maxTransformFeedbackSeparateAttribs2": "4",
+                "maxTransformFeedbackSeparateComponents2": "4",
+                "maxFragmentUniformComponents2": "4096",
+                "maxFragmentUniformBlocks2": "16",
+                "maxFragmentInputComponents2": "128",
+                "minProgramTexelOffset2": "-8",
+                "maxProgramTexelOffset2": "7",
+                "maxDrawBuffers2": "8",
+                "maxColorAttachments2": "8",
+                "maxSamples2": "4",
+                "max3DTextureSize2": "2048",
+                "maxArrayTextureLayers2": "2048",
+                "maxClientWaitTimeoutWebgl2": "0",
+                "maxElementIndex2": "4294967295",
+                "maxServerWaitTimeout2": "0",
+                "maxTextureLodBias2": "2",
+                "maxUniformBufferBindings2": "72",
+                "maxUniformBlockSize2": "65536",
+                "uniformBufferOffsetAlignment2": "256",
+                "maxCombinedUniformBlocks2": "48",
+                "maxCombinedVertexUniformComponents2": "212992",
+                "maxCombinedFragmentUniformComponents2": "200704",
+                "maxElementsVertices2": "2147483647",
+                "maxElementsIndices2": "2147483647",
+                "aliasedLineWidthRange2": [1, 1],
+                "aliasedPointSizeRange2": [1, 1024],
+                "contextAttributes2": ctx_defaults,
+                "alphaBits2": "8", "blueBits2": "8", "greenBits2": "8", "redBits2": "8",
+                "depthBits2": "24", "stencilBits2": "8", "subpixelBits2": "4",
+                "sampleBuffers2": "1", "samples2": "4",
+                "maxCombinedTextureImageUnits2": "32",
+                "maxCubeMapTextureSize2": "16384",
+                "maxFragmentUniformVectors2": "1024",
+                "maxRenderBufferSize2": "16384",
+                "maxTextureImageUnits2": "16",
+                "maxTextureSize2": "16384",
+                "maxVaryingVectors2": "30",
+                "maxVertexAttribs2": "16",
+                "maxVertexTextureImageUnits2": "16",
+                "maxVertexUniformVectors2": "4096",
+                "maxViewportDims2": [32767, 32767],
+                "stencilBackValueMask2": "2147483647",
+                "stencilBackWritemask2": "2147483647",
+                "stencilValueMask2": "2147483647",
+                "stencilWritemask2": "2147483647",
+                "extensions2": ext2_desktop,
+                "precision": precision,
+            }
+            if params_override:
+                base.update(params_override)
+            return base
+
+        return [
+            desktop_gpu(
+                "Google Inc. (Intel)",
+                "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            ),
+            desktop_gpu(
+                "Google Inc. (Intel)",
+                "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            ),
+            desktop_gpu(
+                "Google Inc. (Intel)",
+                "ANGLE (Intel, Intel(R) HD Graphics 4000 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                {"maxTextureSize": "8192", "maxCubeMapTextureSize": "8192",
+                 "maxRenderBufferSize": "8192", "maxTextureSize2": "8192",
+                 "maxCubeMapTextureSize2": "8192", "maxRenderBufferSize2": "8192",
+                 "maxViewportDims": [16384, 16384], "maxViewportDims2": [16384, 16384],
+                 "aliasedPointSizeRange": [1, 511], "aliasedPointSizeRange2": [1, 511]},
+            ),
+            desktop_gpu(
+                "Google Inc. (NVIDIA)",
+                "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                {"maxVertexUniformVectors": "4096", "maxFragmentUniformVectors": "1024",
+                 "maxVertexUniformComponents2": "16384", "maxFragmentUniformComponents2": "4096"},
+            ),
+            desktop_gpu(
+                "Google Inc. (NVIDIA)",
+                "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+            ),
+            desktop_gpu(
+                "Google Inc. (NVIDIA)",
+                "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                {"maxVertexUniformVectors": "4096", "maxFragmentUniformVectors": "1024",
+                 "aliasedPointSizeRange": [1, 1024], "aliasedPointSizeRange2": [1, 1024]},
+            ),
+            desktop_gpu(
+                "Google Inc. (NVIDIA)",
+                "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                {"maxVertexUniformVectors": "4096", "maxFragmentUniformVectors": "1024"},
+            ),
+            desktop_gpu(
+                "Google Inc. (AMD)",
+                "ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                {"maxVertexUniformVectors": "4096", "maxFragmentUniformVectors": "1024"},
+            ),
+            desktop_gpu(
+                "Google Inc. (AMD)",
+                "ANGLE (AMD, AMD Radeon RX 6600 XT Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                {"maxVertexUniformVectors": "4096", "maxFragmentUniformVectors": "1024"},
+            ),
+            desktop_gpu(
+                "Google Inc. (Apple)",
+                "ANGLE (Apple, Apple M1, OpenGL 4.1)",
+                {"maxVertexUniformVectors": "4096", "maxFragmentUniformVectors": "1024",
+                 "maxViewportDims": [16384, 16384], "maxViewportDims2": [16384, 16384],
+                 "aliasedPointSizeRange": [1, 1023], "aliasedPointSizeRange2": [1, 1023]},
+            ),
+            desktop_gpu(
+                "Google Inc. (Apple)",
+                "ANGLE (Apple, Apple M2, OpenGL 4.1)",
+                {"maxVertexUniformVectors": "4096", "maxFragmentUniformVectors": "1024",
+                 "maxViewportDims": [16384, 16384], "maxViewportDims2": [16384, 16384],
+                 "aliasedPointSizeRange": [1, 1023], "aliasedPointSizeRange2": [1, 1023]},
+            ),
+        ]
+
+    def _build_gpu_database_mobile(self) -> list:
+        """Build complete GPU database for mobile devices."""
+        ctx_defaults = self._webgl_context_defaults()
+        precision = self._shader_precision_mobile()
+
+        # Mobile WebGL1 extensions (include mobile-specific: ETC, ASTC)
+        ext_mobile = (
+            "ANGLE_instanced_arrays,EXT_blend_minmax,EXT_clip_control,"
+            "EXT_color_buffer_half_float,EXT_depth_clamp,EXT_float_blend,"
+            "EXT_polygon_offset_clamp,EXT_texture_compression_bptc,"
+            "EXT_texture_compression_rgtc,EXT_texture_filter_anisotropic,"
+            "EXT_sRGB,OES_element_index_uint,OES_fbo_render_mipmap,"
+            "OES_standard_derivatives,OES_texture_float,OES_texture_float_linear,"
+            "OES_texture_half_float,OES_texture_half_float_linear,"
+            "OES_vertex_array_object,WEBGL_color_buffer_float,"
+            "WEBGL_compressed_texture_astc,WEBGL_compressed_texture_etc,"
+            "WEBGL_compressed_texture_etc1,WEBGL_compressed_texture_s3tc,"
+            "WEBGL_compressed_texture_s3tc_srgb,WEBGL_debug_renderer_info,"
+            "WEBGL_debug_shaders,WEBGL_depth_texture,WEBGL_lose_context,"
+            "WEBGL_multi_draw"
+        )
+        ext2_mobile = (
+            "EXT_clip_control,EXT_color_buffer_float,EXT_color_buffer_half_float,"
+            "EXT_depth_clamp,EXT_float_blend,EXT_polygon_offset_clamp,"
+            "EXT_texture_compression_bptc,EXT_texture_compression_rgtc,"
+            "EXT_texture_filter_anisotropic,EXT_texture_norm16,"
+            "NV_shader_noperspective_interpolation,OES_draw_buffers_indexed,"
+            "OES_texture_float_linear,WEBGL_clip_cull_distance,"
+            "WEBGL_compressed_texture_astc,WEBGL_compressed_texture_etc,"
+            "WEBGL_compressed_texture_etc1,WEBGL_compressed_texture_s3tc,"
+            "WEBGL_compressed_texture_s3tc_srgb,WEBGL_debug_renderer_info,"
+            "WEBGL_debug_shaders,WEBGL_lose_context,WEBGL_multi_draw"
+        )
+
+        def mobile_gpu(unmasked_vendor, unmasked_renderer, params_override=None):
+            """Create a complete mobile GPU profile."""
+            base = {
+                "unmaskedVendor": unmasked_vendor,
+                "unmaskedRenderer": unmasked_renderer,
+                "vendor": "WebKit",
+                "renderer": "WebKit WebGL",
+                "shadingLanguage": "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)",
+                "version": "WebGL 1.0 (OpenGL ES 2.0 Chromium)",
+                "shadingLanguage2": "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)",
+                "version2": "WebGL 2.0 (OpenGL ES 3.0 Chromium)",
+                "maxAnisotropy": "16",
+                # WebGL1 limits — mobile defaults
+                "aliasedLineWidthRange": [1, 8],
+                "aliasedPointSizeRange": [1, 1023],
+                "alphaBits": "8", "blueBits": "8", "greenBits": "8", "redBits": "8",
+                "depthBits": "24", "stencilBits": "8", "subpixelBits": "4",
+                "sampleBuffers": "1", "samples": "4",
+                "maxCombinedTextureImageUnits": "48",
+                "maxCubeMapTextureSize": "4096",
+                "maxFragmentUniformVectors": "256",
+                "maxRenderBufferSize": "16384",
+                "maxTextureImageUnits": "16",
+                "maxTextureSize": "4096",
+                "maxVaryingVectors": "31",
+                "maxVertexAttribs": "16",
+                "maxVertexTextureImageUnits": "16",
+                "maxVertexUniformVectors": "256",
+                "maxViewportDims": [16384, 16384],
+                "stencilBackValueMask": "2147483647",
+                "stencilBackWritemask": "2147483647",
+                "stencilValueMask": "2147483647",
+                "stencilWritemask": "2147483647",
+                "extensions": ext_mobile,
+                "contextAttributes": ctx_defaults,
+                # WebGL2-specific limits — mobile
+                "maxVertexUniformComponents2": "1024",
+                "maxVertexUniformBlocks2": "14",
+                "maxVertexOutputComponents2": "128",
+                "maxVaryingComponents2": "124",
+                "maxTransformFeedbackInterleavedComponents2": "128",
+                "maxTransformFeedbackSeparateAttribs2": "4",
+                "maxTransformFeedbackSeparateComponents2": "4",
+                "maxFragmentUniformComponents2": "1024",
+                "maxFragmentUniformBlocks2": "14",
+                "maxFragmentInputComponents2": "128",
+                "minProgramTexelOffset2": "-8",
+                "maxProgramTexelOffset2": "7",
+                "maxDrawBuffers2": "8",
+                "maxColorAttachments2": "8",
+                "maxSamples2": "4",
+                "max3DTextureSize2": "2048",
+                "maxArrayTextureLayers2": "2048",
+                "maxClientWaitTimeoutWebgl2": "0",
+                "maxElementIndex2": "2147483647",
+                "maxServerWaitTimeout2": "4294967295000000",
+                "maxTextureLodBias2": "15.99609375",
+                "maxUniformBufferBindings2": "72",
+                "maxUniformBlockSize2": "65536",
+                "uniformBufferOffsetAlignment2": "32",
+                "maxCombinedUniformBlocks2": "42",
+                "maxCombinedVertexUniformComponents2": "230400",
+                "maxCombinedFragmentUniformComponents2": "230400",
+                "maxElementsVertices2": "2147483647",
+                "maxElementsIndices2": "2147483647",
+                "aliasedLineWidthRange2": [1, 8],
+                "aliasedPointSizeRange2": [1, 1023],
+                "contextAttributes2": ctx_defaults,
+                "alphaBits2": "8", "blueBits2": "8", "greenBits2": "8", "redBits2": "8",
+                "depthBits2": "24", "stencilBits2": "8", "subpixelBits2": "4",
+                "sampleBuffers2": "1", "samples2": "4",
+                "maxCombinedTextureImageUnits2": "48",
+                "maxCubeMapTextureSize2": "4096",
+                "maxFragmentUniformVectors2": "256",
+                "maxRenderBufferSize2": "16384",
+                "maxTextureImageUnits2": "16",
+                "maxTextureSize2": "4096",
+                "maxVaryingVectors2": "31",
+                "maxVertexAttribs2": "16",
+                "maxVertexTextureImageUnits2": "16",
+                "maxVertexUniformVectors2": "256",
+                "maxViewportDims2": [16384, 16384],
+                "stencilBackValueMask2": "2147483647",
+                "stencilBackWritemask2": "2147483647",
+                "stencilValueMask2": "2147483647",
+                "stencilWritemask2": "2147483647",
+                "extensions2": ext2_mobile,
+                "precision": precision,
+            }
+            if params_override:
+                base.update(params_override)
+            return base
+
+        return [
+            mobile_gpu(
+                "Google Inc. (Qualcomm)",
+                "Adreno (TM) 730",
+            ),
+            mobile_gpu(
+                "Google Inc. (Qualcomm)",
+                "Adreno (TM) 740",
+            ),
+            mobile_gpu(
+                "Google Inc. (Qualcomm)",
+                "Adreno (TM) 660",
+                {"maxRenderBufferSize": "8192", "maxRenderBufferSize2": "8192"},
+            ),
+            mobile_gpu(
+                "Google Inc. (ARM)",
+                "Mali-G710 MC10",
+                {"maxCombinedTextureImageUnits": "64", "maxCombinedTextureImageUnits2": "64"},
+            ),
+            mobile_gpu(
+                "Google Inc. (ARM)",
+                "Mali-G78 MC20",
+                {"maxCombinedTextureImageUnits": "64", "maxCombinedTextureImageUnits2": "64"},
+            ),
+            mobile_gpu(
+                "Google Inc. (Imagination Technologies)",
+                "PowerVR Rogue GE8320",
+            ),
         ]
 
     def generate_profile(self, profile_name: str = None, is_mobile: bool = False) -> Dict:
@@ -140,6 +526,7 @@ class ProfileGenerator:
                 # Fingerprinting data
                 "canvas_fingerprint": self._generate_canvas_fingerprint(),
                 "webgl_fingerprint": self._generate_webgl_fingerprint(is_mobile=is_mobile),
+                "webgpu_fingerprint": self._generate_webgpu_fingerprint(is_mobile=is_mobile),
                 "audio_fingerprint": self._generate_audio_fingerprint(),
                 "fonts": self._generate_font_list(),
                 "plugins": self._generate_plugin_list(),
@@ -173,6 +560,18 @@ class ProfileGenerator:
             # Mobile-specific fields
             if is_mobile and device_info:
                 profile["mobile_device"] = device_info
+
+            # Sensor data (mobile only)
+            if is_mobile:
+                profile["sensor"] = self._generate_sensor_data()
+
+            # CSS media queries
+            profile["css_media"] = self._generate_css_media(is_mobile=is_mobile)
+
+            # Speech synthesis, feature flags, audio properties
+            profile["speech_voices"] = self._generate_speech_voices(is_mobile=is_mobile)
+            profile["feature_flags"] = self._generate_feature_flags(is_mobile=is_mobile)
+            profile["audio_properties"] = self._generate_audio_properties(is_mobile=is_mobile)
 
             # Generate profile hash for identification
             profile["profile_hash"] = self._generate_profile_hash(profile)
@@ -294,32 +693,174 @@ class ProfileGenerator:
             return hashlib.md5(f"fallback_{random.randint(1000000, 9999999)}".encode()).hexdigest()
 
     def _generate_webgl_fingerprint(self, is_mobile: bool = False) -> Dict:
-        """Generate WebGL fingerprint data."""
+        """Generate WebGL fingerprint data from GPU-consistent database."""
         if is_mobile:
-            mobile_webgl = [
-                ("Qualcomm", "Adreno (TM) 730"),
-                ("Qualcomm", "Adreno (TM) 740"),
-                ("Qualcomm", "Adreno (TM) 660"),
-                ("ARM", "Mali-G710 MC10"),
-                ("ARM", "Mali-G78 MC20"),
-                ("Imagination Technologies", "PowerVR GE8320"),
-            ]
-            vendor, renderer = random.choice(mobile_webgl)
+            gpu = random.choice(self._gpu_profiles_mobile)
         else:
-            vendor, renderer = random.choice(self.webgl_vendors)
+            gpu = random.choice(self._gpu_profiles_desktop)
+
+        # Return complete GPU profile (used by browser_manager for JS injection)
+        return gpu
+
+    def _generate_webgpu_fingerprint(self, is_mobile: bool = False) -> Dict:
+        """Generate WebGPU fingerprint data consistent with selected WebGL GPU."""
+        # WebGPU adapter limits (highPerformance — what requestAdapter returns)
+        _adapter_limits = {
+            "maxTextureDimension1D": "16384", "maxTextureDimension2D": "16384",
+            "maxTextureDimension3D": "2048", "maxTextureArrayLayers": "256",
+            "maxBindGroups": "4", "maxBindGroupsPlusVertexBuffers": "24",
+            "maxBindingsPerBindGroup": "1000",
+            "maxDynamicUniformBuffersPerPipelineLayout": "10",
+            "maxDynamicStorageBuffersPerPipelineLayout": "8",
+            "maxSampledTexturesPerShaderStage": "16",
+            "maxSamplersPerShaderStage": "16",
+            "maxStorageBuffersPerShaderStage": "10",
+            "maxStorageTexturesPerShaderStage": "8",
+            "maxUniformBuffersPerShaderStage": "12",
+            "maxUniformBufferBindingSize": "65536",
+            "maxStorageBufferBindingSize": "134217728",
+            "minUniformBufferOffsetAlignment": "256",
+            "minStorageBufferOffsetAlignment": "256",
+            "maxVertexBuffers": "8", "maxBufferSize": "2147483648",
+            "maxVertexAttributes": "30", "maxVertexBufferArrayStride": "2048",
+            "maxInterStageShaderComponents": "60",
+            "maxInterStageShaderVariables": "16",
+            "maxColorAttachments": "8",
+            "maxColorAttachmentBytesPerSample": "32",
+            "maxComputeWorkgroupStorageSize": "32768",
+            "maxComputeInvocationsPerWorkgroup": "1024",
+            "maxComputeWorkgroupSizeX": "1024",
+            "maxComputeWorkgroupSizeY": "1024",
+            "maxComputeWorkgroupSizeZ": "64",
+            "maxComputeWorkgroupsPerDimension": "65535",
+        }
+        # GPUDevice limits (lower defaults, what you get after requestDevice)
+        _device_limits = {
+            "maxTextureDimension1D": "8192", "maxTextureDimension2D": "8192",
+            "maxTextureDimension3D": "2048", "maxTextureArrayLayers": "256",
+            "maxBindGroups": "4", "maxBindGroupsPlusVertexBuffers": "24",
+            "maxBindingsPerBindGroup": "1000",
+            "maxDynamicUniformBuffersPerPipelineLayout": "8",
+            "maxDynamicStorageBuffersPerPipelineLayout": "4",
+            "maxSampledTexturesPerShaderStage": "16",
+            "maxSamplersPerShaderStage": "16",
+            "maxStorageBuffersPerShaderStage": "8",
+            "maxStorageTexturesPerShaderStage": "4",
+            "maxUniformBuffersPerShaderStage": "12",
+            "maxUniformBufferBindingSize": "65536",
+            "maxStorageBufferBindingSize": "134217728",
+            "minUniformBufferOffsetAlignment": "256",
+            "minStorageBufferOffsetAlignment": "256",
+            "maxVertexBuffers": "8", "maxBufferSize": "268435456",
+            "maxVertexAttributes": "16", "maxVertexBufferArrayStride": "2048",
+            "maxInterStageShaderComponents": "60",
+            "maxInterStageShaderVariables": "16",
+            "maxColorAttachments": "8",
+            "maxColorAttachmentBytesPerSample": "32",
+            "maxComputeWorkgroupStorageSize": "16384",
+            "maxComputeInvocationsPerWorkgroup": "256",
+            "maxComputeWorkgroupSizeX": "256",
+            "maxComputeWorkgroupSizeY": "256",
+            "maxComputeWorkgroupSizeZ": "64",
+            "maxComputeWorkgroupsPerDimension": "65535",
+        }
+
+        # GPU vendor/arch maps linked to WebGL GPU vendors
+        _desktop_gpu_info = [
+            {"vendor": "google", "architecture": "gen-12",
+             "features": ["texture-compression-bc", "depth-clip-control", "depth32float-stencil8",
+                          "timestamp-query", "indirect-first-instance", "rg11b10ufloat-renderable"]},
+            {"vendor": "nvidia", "architecture": "turing",
+             "features": ["texture-compression-bc", "depth-clip-control", "depth32float-stencil8",
+                          "timestamp-query", "indirect-first-instance", "rg11b10ufloat-renderable",
+                          "shader-f16"]},
+            {"vendor": "amd", "architecture": "rdna-2",
+             "features": ["texture-compression-bc", "depth-clip-control", "depth32float-stencil8",
+                          "timestamp-query", "indirect-first-instance", "rg11b10ufloat-renderable"]},
+            {"vendor": "apple", "architecture": "common-3",
+             "features": ["texture-compression-bc", "depth-clip-control", "depth32float-stencil8",
+                          "timestamp-query", "indirect-first-instance", "rg11b10ufloat-renderable",
+                          "shader-f16"]},
+        ]
+        _mobile_gpu_info = [
+            {"vendor": "qualcomm", "architecture": "adreno-7xx",
+             "features": ["indirect-first-instance", "texture-compression-etc2",
+                          "texture-compression-astc", "depth-clip-control",
+                          "depth32float-stencil8", "timestamp-query",
+                          "texture-compression-bc", "rg11b10ufloat-renderable"]},
+            {"vendor": "arm", "architecture": "valhall",
+             "features": ["indirect-first-instance", "texture-compression-etc2",
+                          "texture-compression-astc", "depth-clip-control",
+                          "depth32float-stencil8", "rg11b10ufloat-renderable"]},
+            {"vendor": "imagination-technologies", "architecture": "powervr-rogue",
+             "features": ["texture-compression-etc2", "texture-compression-astc",
+                          "depth32float-stencil8", "rg11b10ufloat-renderable"]},
+        ]
+
+        if is_mobile:
+            gpu_info = random.choice(_mobile_gpu_info)
+            canvas_format = "rgba8unorm"
+        else:
+            gpu_info = random.choice(_desktop_gpu_info)
+            canvas_format = "bgra8unorm"
+
+        adapter_data = {
+            "isFallbackAdapter": False,
+            "features": gpu_info["features"],
+            "info": {
+                "vendor": gpu_info["vendor"],
+                "architecture": gpu_info["architecture"],
+                "device": "",
+                "description": "",
+            },
+            "limits": _adapter_limits,
+            "limits_gpudevice": _device_limits,
+        }
 
         return {
-            "vendor": vendor,
-            "renderer": renderer,
-            "version": f"OpenGL ES 2.0 ({renderer})",
-            "shading_language_version": "WebGL GLSL ES 1.0",
-            "max_texture_size": random.choice([4096, 8192, 16384]),
-            "max_vertex_attribs": random.choice([16, 32]),
-            "max_viewport_dims": random.choice([4096, 8192, 16384]),
-            "aliased_line_width_range": [1, 1],
-            "aliased_point_size_range": [1, random.choice([511, 1023, 8192])],
-            "max_fragment_uniform_vectors": random.choice([256, 512, 1024]),
-            "max_vertex_uniform_vectors": random.choice([256, 512, 1024])
+            "isEnabled": True,
+            "highPerformance": adapter_data,
+            "lowPerformance": adapter_data,
+            "fallback": None,
+            "preferredCanvasFormat": canvas_format,
+        }
+
+    def _generate_sensor_data(self) -> Dict:
+        """Generate sensor data for mobile profiles (stationary device)."""
+        # Small orientation variations per profile (device lying on table)
+        qz = round(random.uniform(-0.8, 0.8), 6)
+        return {
+            "gyroscope": {"x": 0, "y": 0, "z": 0},
+            "gravity": {"x": 0, "y": 0, "z": 9.8},
+            "accelerometer": {"x": 0, "y": 0, "z": 9.8},
+            "linearAcceleration": {"x": 0, "y": 0, "z": 0},
+            "orientationQuaternionZ": qz,
+        }
+
+    def _generate_css_media(self, is_mobile: bool = False) -> Dict:
+        """Generate CSS media query values matching device type."""
+        if is_mobile:
+            return {
+                "anyHover": "none", "anyPointer": "coarse",
+                "hover": "none", "pointer": "coarse",
+                "prefersColorScheme": random.choice(["light", "dark"]),
+                "prefersReducedMotion": "no-preference",
+                "prefersContrast": "no-preference",
+                "forcedColors": "none",
+                "invertedColors": "none",
+                "dynamicRange": "high",
+                "videoDynamicRange": "high",
+            }
+        return {
+            "anyHover": "hover", "anyPointer": "fine",
+            "hover": "hover", "pointer": "fine",
+            "prefersColorScheme": random.choice(["light", "dark"]),
+            "prefersReducedMotion": "no-preference",
+            "prefersContrast": "no-preference",
+            "forcedColors": "none",
+            "invertedColors": "none",
+            "dynamicRange": "high",
+            "videoDynamicRange": "high",
         }
 
     def _generate_audio_fingerprint(self) -> str:
@@ -331,6 +872,81 @@ class ProfileGenerator:
         # Create unique audio fingerprint
         audio_data = f"AudioContext_{sample_rate}_{base_frequency}_{random.random()}"
         return hashlib.md5(audio_data.encode()).hexdigest()
+
+    # ---- Android TTS voices (Russian locale, typical Samsung/Pixel) ----
+    _ANDROID_VOICES = [
+        {"name": "немецкий Германия", "lang": "de_DE", "default": True},
+        {"name": "английский Великобритания", "lang": "en_GB", "default": False},
+        {"name": "английский Соединенные Штаты", "lang": "en_US", "default": False},
+        {"name": "испанский Испания", "lang": "es_ES", "default": False},
+        {"name": "испанский Мексика", "lang": "es_MX", "default": False},
+        {"name": "французский Франция", "lang": "fr_FR", "default": False},
+        {"name": "итальянский Италия", "lang": "it_IT", "default": False},
+        {"name": "португальский Бразилия", "lang": "pt_BR", "default": False},
+        {"name": "русский Россия", "lang": "ru_RU", "default": False},
+    ]
+
+    # ---- Desktop Chrome voices (varies by OS) ----
+    _DESKTOP_VOICES = [
+        {"name": "Microsoft Irina - Russian (Russia)", "lang": "ru-RU", "default": True},
+        {"name": "Microsoft Pavel - Russian (Russia)", "lang": "ru-RU", "default": False},
+        {"name": "Google US English", "lang": "en-US", "default": False},
+        {"name": "Google UK English Female", "lang": "en-GB", "default": False},
+        {"name": "Google Deutsch", "lang": "de-DE", "default": False},
+        {"name": "Google français", "lang": "fr-FR", "default": False},
+        {"name": "Google español", "lang": "es-ES", "default": False},
+        {"name": "Google italiano", "lang": "it-IT", "default": False},
+        {"name": "Google русский", "lang": "ru-RU", "default": False},
+    ]
+
+    def _generate_speech_voices(self, is_mobile: bool = False) -> list:
+        """Generate speechSynthesis voice list for the platform."""
+        voices = self._ANDROID_VOICES if is_mobile else self._DESKTOP_VOICES
+        result = []
+        for v in voices:
+            result.append({
+                "name": v["name"],
+                "lang": v["lang"],
+                "localService": True,
+                "voiceURI": v["name"],
+                "default": v["default"],
+            })
+        return result
+
+    # ---- Mobile vs Desktop feature detection ----
+    _MOBILE_FEATURES = {
+        "SharedWorker": False, "OrientationEvent": True,
+        "WebHID": False, "Serial": False,
+        "ContactsManager": True, "BarcodeDetector": True,
+        "WebNFC": True, "PictureInPictureAPI": True,
+        "EyeDropperAPI": False, "GetDisplayMedia": False,
+        "FileSystemAccess": True, "ContentIndex": True,
+        "FontAccess": False, "AudioOutputDevices": False,
+        "OnDeviceChange": False, "DisplayCutoutAPI": False,
+    }
+    _DESKTOP_FEATURES = {
+        "SharedWorker": True, "OrientationEvent": False,
+        "WebHID": True, "Serial": True,
+        "ContactsManager": False, "BarcodeDetector": True,
+        "WebNFC": False, "PictureInPictureAPI": True,
+        "EyeDropperAPI": True, "GetDisplayMedia": True,
+        "FileSystemAccess": True, "ContentIndex": False,
+        "FontAccess": True, "AudioOutputDevices": True,
+        "OnDeviceChange": True, "DisplayCutoutAPI": False,
+    }
+
+    def _generate_feature_flags(self, is_mobile: bool = False) -> Dict:
+        """Generate feature detection flags matching device type."""
+        return dict(self._MOBILE_FEATURES if is_mobile else self._DESKTOP_FEATURES)
+
+    def _generate_audio_properties(self, is_mobile: bool = False) -> Dict:
+        """Generate audio context properties (fingerprinting-relevant subset)."""
+        return {
+            "sampleRate": 48000 if is_mobile else random.choice([44100, 48000]),
+            "baseLatency": round(random.uniform(0.002, 0.01), 4) if is_mobile else round(random.uniform(0.005, 0.02), 4),
+            "outputLatency": 0,
+            "maxChannelCount": 2,
+        }
 
     def _generate_font_list(self) -> List[str]:
         """Generate list of available fonts."""

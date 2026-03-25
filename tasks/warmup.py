@@ -1393,7 +1393,7 @@ def _visit_site_with_actions(driver, url: str, site_index: int, total_sites: int
     return time.time() - visit_start
 
 
-@shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=60, time_limit=900, soft_time_limit=840)
+@shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=60, time_limit=4500, soft_time_limit=4440)
 def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sites_list: List[str] = None):
     """
     Multi-session warmup: each call = one warmup session (stage).
@@ -1428,6 +1428,12 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
             profile_proxy_username = profile_obj.proxy_username
             profile_proxy_password = profile_obj.proxy_password
             profile_proxy_type = profile_obj.proxy_type or 'http'
+            profile_platform = profile_obj.platform
+            profile_is_mobile = profile_obj.is_mobile or False
+            profile_canvas_fp = profile_obj.canvas_fingerprint
+            profile_webgl_fp = profile_obj.webgl_fingerprint
+            profile_audio_fp = profile_obj.audio_fingerprint
+            profile_screen_fp = profile_obj.screen_fingerprint
             
             current_stage = profile_obj.get_next_warmup_stage()
             is_rewarmup = profile_obj.warmup_completed  # re-warming already warmed profile
@@ -1494,9 +1500,7 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
         # Generate profile data for browser
         profile_generator = ProfileGenerator()
         
-        # Detect if this is a mobile profile based on user agent
-        ua_str = profile_user_agent or ''
-        is_mobile = 'Mobile' in ua_str and 'Android' in ua_str
+        is_mobile = profile_is_mobile
         
         profile_data = profile_generator.generate_profile(profile_name, is_mobile=is_mobile)
         profile_data.update({
@@ -1507,8 +1511,34 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
             },
             'timezone': profile_timezone,
             'language': profile_language,
+            'platform': profile_platform or profile_data.get('platform', 'Win32'),
             'images_enabled': True,  # Images enabled — Yandex detects image-less browsers
         })
+
+        # Use stored fingerprint data from DB if available (new scheme)
+        if profile_webgl_fp:
+            import json as _json
+            try:
+                webgl_dict = _json.loads(profile_webgl_fp) if isinstance(profile_webgl_fp, str) else profile_webgl_fp
+                if webgl_dict and isinstance(webgl_dict, dict) and 'unmaskedVendor' in webgl_dict:
+                    profile_data['webgl_fingerprint'] = webgl_dict
+            except (ValueError, TypeError):
+                pass
+        if profile_canvas_fp:
+            profile_data['canvas_fingerprint'] = profile_canvas_fp
+        if profile_audio_fp:
+            profile_data['audio_fingerprint'] = profile_audio_fp
+        if profile_screen_fp and isinstance(profile_screen_fp, dict):
+            if 'css_media' in profile_screen_fp:
+                profile_data['css_media'] = profile_screen_fp['css_media']
+            if 'feature_flags' in profile_screen_fp:
+                profile_data['feature_flags'] = profile_screen_fp['feature_flags']
+            if 'audio_properties' in profile_screen_fp:
+                profile_data['audio_properties'] = profile_screen_fp['audio_properties']
+            if 'speech_voices' in profile_screen_fp:
+                profile_data['speech_voices'] = profile_screen_fp['speech_voices']
+            if 'sensor' in profile_screen_fp:
+                profile_data['sensor'] = profile_screen_fp['sensor']
         
         if is_mobile:
             logger.info(f"📱 Mobile warmup profile: {profile_name}")
@@ -1902,7 +1932,7 @@ def warmup_multiple_profiles_task(self, profile_ids: List[int], duration_minutes
         raise
 
 
-@shared_task(base=BaseTask, bind=True, time_limit=900, soft_time_limit=840)
+@shared_task(base=BaseTask, bind=True, time_limit=4500, soft_time_limit=4440)
 def advanced_warmup_task(self, profile_id: int, warmup_strategy: Dict = None):
     """
     Advanced warmup with custom strategy — delegates to warmup_profile_task.
@@ -1946,7 +1976,7 @@ def periodic_rewarmup():
                 BrowserProfile.warmup_stage >= 0,  # include stage 0 (never warmed) too
                 BrowserProfile.warmup_stage < MIN_WARMUP_SESSIONS + 1,  # not done yet
                 (BrowserProfile.last_used_at < interval_threshold) | (BrowserProfile.last_used_at.is_(None))
-            ).order_by(BrowserProfile.warmup_stage.asc(), BrowserProfile.last_used_at.asc().nullsfirst()).limit(10).all()
+            ).order_by(BrowserProfile.warmup_stage.asc(), BrowserProfile.last_used_at.asc().nullsfirst()).limit(20).all()
 
             if pipeline_profiles:
                 profile_ids_next = [p.id for p in pipeline_profiles]
@@ -2093,8 +2123,8 @@ def auto_schedule_initial_warmup():
                 BrowserProfile.status == "warming_up"
             ).count()
 
-            # Allow up to 50 concurrent warmup tasks
-            MAX_WARMUP_CONCURRENT = 50
+            # Allow up to 20 concurrent warmup tasks (concurrency=10, with overlap for pipeline)
+            MAX_WARMUP_CONCURRENT = 20
             slots = max(0, MAX_WARMUP_CONCURRENT - active_warming)
 
             if slots <= 0:
