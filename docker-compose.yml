@@ -46,7 +46,7 @@ services:
   celery_warmup:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=10 -Q default,warmup,proxy,maintenance -n warmup@%h --max-memory-per-child=4000000 --max-tasks-per-child=50
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=20 -Q default,warmup,proxy,maintenance -n warmup@%h --max-memory-per-child=4000000 --max-tasks-per-child=50
     shm_size: '16gb'
     healthcheck:
       test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d warmup@$$HOSTNAME --timeout=10 || exit 1"]
