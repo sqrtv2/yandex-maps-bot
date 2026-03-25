@@ -173,13 +173,20 @@ class BrowserProfile(Base):
     @classmethod
     def get_warmup_stats(cls, db):
         """Get warmup statistics efficiently for large datasets."""
-        from sqlalchemy import func, case
+        from sqlalchemy import func, case, or_
 
         # Single query to get all stats we need
+        # "warming" = actively in warming_up status OR in warmup pipeline (sessions started but not complete)
         result = db.query(
             func.count(cls.id).label('total_profiles'),
             func.sum(case((cls.warmup_completed == True, 1), else_=0)).label('warmed_profiles'),
-            func.sum(case((cls.status == 'warming_up', 1), else_=0)).label('warming_profiles'),
+            func.sum(case(
+                (or_(
+                    cls.status == 'warming_up',
+                    (cls.warmup_completed == False) & (cls.warmup_sessions_count > 0)
+                ), 1),
+                else_=0
+            )).label('warming_profiles'),
             func.sum(case((cls.is_active == True, 1), else_=0)).label('active_profiles')
         ).first()
 
