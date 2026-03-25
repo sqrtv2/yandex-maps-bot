@@ -825,13 +825,10 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
     """Create multiple browser profiles at once (up to 10 000)."""
     try:
         import random
-        from fake_useragent import UserAgent
+        import json as _json
 
         count = request_data.get("count", 1)
         name_prefix = request_data.get("name_prefix", "Profile-")
-        config = request_data.get("config", {})
-        auto_start_warmup = request_data.get("auto_start_warmup", False)
-        randomize_all = request_data.get("randomize_all", True)
         mobile_percentage = request_data.get("mobile_percentage", 0)
 
         # Validate count
@@ -843,51 +840,9 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
         mobile_count = round(count * mobile_percentage / 100)
         desktop_count = count - mobile_count
 
-        # Predefined options for randomization — only Russian locales for Yandex
-        viewports = [
-            (1366, 768), (1920, 1080), (1440, 900), (1536, 864),
-            (1280, 720), (1600, 1200), (2560, 1440), (1024, 768)
-        ]
-
-        timezones = [
-            "Europe/Moscow", "Europe/Moscow", "Europe/Moscow",
-            "Europe/Samara", "Asia/Yekaterinburg", "Europe/Volgograd",
-        ]
-
-        languages = [
-            "ru-RU", "ru-RU", "ru-RU", "ru-RU",
-            "ru,en-US;q=0.9,en;q=0.8",
-        ]
-
-        platforms = ["Win32", "MacIntel", "Linux x86_64"]
-
-        # Pre-generate a pool of Chrome user-agents matching installed Chromium version
-        from core.profile_generator import ProfileGenerator as _PG
-        _pg_for_ua = _PG()
-        UA_POOL_SIZE = min(count, 200)
-        ua_pool = []
-        for _ in range(UA_POOL_SIZE):
-            try:
-                ua_pool.append(_pg_for_ua._generate_user_agent(is_mobile=False))
-            except Exception:
-                ua_pool.append(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
-
-        user_agent_type = config.get("user_agent_type", "generate")
-
-        # Determine fixed values when randomize_all is off
-        fixed_width = int(config.get("viewport_width", 1366)) if config.get("viewport_width") not in (None, "random") else None
-        fixed_height = int(config.get("viewport_height", 768)) if config.get("viewport_height") not in (None, "random") else None
-        fixed_tz = config.get("timezone") if config.get("timezone") != "random" else None
-        fixed_lang = config.get("language") if config.get("language") != "random" else None
-        fixed_plat = config.get("platform") if config.get("platform") != "random" else None
-
-        # Initialize ProfileGenerator for mobile profiles
+        # Initialize ProfileGenerator for ALL profiles (full fingerprints, Chrome-only UAs)
         from core.profile_generator import ProfileGenerator
-        profile_gen = ProfileGenerator() if mobile_count > 0 else None
+        profile_gen = ProfileGenerator()
 
         # Pre-decide which indices will be mobile (spread evenly)
         mobile_indices = set()
@@ -901,23 +856,6 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
         first_id = None
         last_id = None
 
-        # Pre-generate AI personas if enabled
-        personas_pool = []
-        try:
-            from app.database import get_setting as _gs
-            ai_enabled = _gs("ai_persona_enabled", True)
-            if ai_enabled:
-                from core.ai_persona_generator import generate_personas as _gen_personas
-                # Generate personas in batches of 10 (Gemini returns them fast)
-                personas_needed = count
-                while len(personas_pool) < personas_needed:
-                    batch = _gen_personas(count=min(10, personas_needed - len(personas_pool)))
-                    personas_pool.extend(batch)
-                logger.info(f"Pre-generated {len(personas_pool)} AI personas for bulk creation")
-                # Warmup sites will be generated asynchronously via Celery after profiles are created
-        except Exception as persona_err:
-            logger.warning(f"AI persona pre-generation skipped: {persona_err}")
-
         # Find the current max profile number for this prefix to avoid collisions
         existing_max = (
             db.query(func.max(BrowserProfile.id)).scalar() or 0
@@ -930,53 +868,45 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
 
             for i in range(batch_start + 1, batch_end + 1):
                 profile_name = f"{name_prefix}{existing_max + i}"
-                global_idx = i - 1  # 0-based index
+                global_idx = i - 1
                 is_mobile = global_idx in mobile_indices
 
-                if is_mobile and profile_gen:
-                    # Use ProfileGenerator for proper mobile fingerprints
-                    gen_profile = profile_gen.generate_profile(profile_name=profile_name, is_mobile=True)
-                    vp = gen_profile.get("viewport", {})
-                    w = vp.get("width", 412)
-                    h = vp.get("height", 915)
-                    tz = gen_profile.get("timezone", "Europe/Moscow")
-                    lang = gen_profile.get("language", "ru-RU")
-                    plat = gen_profile.get("platform", "Linux armv81")
-                    ua_str = gen_profile.get("user_agent", random.choice(ua_pool))
-                else:
-                    # Desktop profile — original logic
-                    if randomize_all:
-                        w, h = random.choice(viewports)
-                        tz = random.choice(timezones)
-                        lang = random.choice(languages)
-                        plat = random.choice(platforms)
-                    else:
-                        w = fixed_width or random.choice(viewports)[0]
-                        h = fixed_height or random.choice(viewports)[1]
-                        tz = fixed_tz or random.choice(timezones)
-                        lang = fixed_lang or random.choice(languages)
-                        plat = fixed_plat or random.choice(platforms)
-                    ua_str = random.choice(ua_pool)
+                # Use ProfileGenerator for ALL profiles (full fingerprints, Chrome-only UAs)
+                p = profile_gen.generate_profile(profile_name=profile_name, is_mobile=is_mobile)
+                viewport = p.get("viewport", {})
+                screen = p.get("screen", {})
 
-                # Assign AI persona if available
-                persona = None
-                persona_idx = batch_start + i - 1  # 0-based index
-                if persona_idx < len(personas_pool):
-                    persona = personas_pool[persona_idx]
-                    # Override timezone from persona for consistency
-                    if persona.get("timezone"):
-                        tz = persona["timezone"]
-                    persona["assigned_profile"] = profile_name
+                screen_fp = {
+                    "screen": screen,
+                    "css_media": p.get("css_media", {}),
+                    "feature_flags": p.get("feature_flags", {}),
+                    "audio_properties": p.get("audio_properties", {}),
+                    "speech_voices": p.get("speech_voices", []),
+                    "connection_info": p.get("connection_info", {}),
+                    "storage_quota": p.get("storage_quota", 599720927232),
+                    "heap_size": p.get("heap_size", 4294705152),
+                    "system_colors": p.get("system_colors", {}),
+                    "system_fonts": p.get("system_fonts", []),
+                    "codecs": p.get("codecs", []),
+                    "keyboard_layout": p.get("keyboard_layout", []),
+                    "fonts": p.get("fonts", []),
+                }
+                if p.get("sensor"):
+                    screen_fp["sensor"] = p["sensor"]
 
                 rows.append({
                     "name": profile_name,
-                    "user_agent": ua_str,
-                    "viewport_width": w,
-                    "viewport_height": h,
-                    "timezone": tz,
-                    "language": lang,
-                    "platform": plat,
+                    "user_agent": p["user_agent"],
+                    "viewport_width": viewport.get("width", 1366),
+                    "viewport_height": viewport.get("height", 768),
+                    "timezone": p.get("timezone", "Europe/Moscow"),
+                    "language": p.get("language", "ru-RU"),
+                    "platform": p.get("platform", "Win32"),
                     "is_mobile": is_mobile,
+                    "canvas_fingerprint": p.get("canvas_fingerprint", ""),
+                    "webgl_fingerprint": _json.dumps(p.get("webgl_fingerprint", {})),
+                    "audio_fingerprint": p.get("audio_fingerprint", ""),
+                    "screen_fingerprint": screen_fp,
                     "status": "created",
                     "is_active": True,
                     "warmup_completed": False,
@@ -988,12 +918,11 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
                     "webrtc_leak_protect": True,
                     "geolocation_enabled": False,
                     "notifications_enabled": False,
-                    "persona_data": persona,
                 })
 
             # Bulk insert this batch
             db.bulk_insert_mappings(BrowserProfile, rows)
-            db.flush()  # get IDs assigned
+            db.flush()
             total_created += batch_size
 
             # Track first/last id
