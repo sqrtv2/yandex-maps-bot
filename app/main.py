@@ -610,6 +610,11 @@ async def create_profile(profile_data: Dict[str, Any], db: Session = Depends(get
             "codecs": p.get("codecs", []),
             "keyboard_layout": p.get("keyboard_layout", []),
             "fonts": p.get("fonts", []),
+            "webgpu_fingerprint": p.get("webgpu_fingerprint", {}),
+            "hardware_concurrency": p.get("hardware_concurrency", 8),
+            "device_memory": p.get("device_memory", 8),
+            "max_touch_points": p.get("max_touch_points", 0),
+            "do_not_track": p.get("do_not_track", False),
         }
         if p.get("sensor"):
             screen_fp["sensor"] = p["sensor"]
@@ -830,6 +835,7 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
         count = request_data.get("count", 1)
         name_prefix = request_data.get("name_prefix", "Profile-")
         mobile_percentage = request_data.get("mobile_percentage", 0)
+        auto_start_warmup = request_data.get("auto_start_warmup", False)
 
         # Validate count
         if count < 1 or count > 10000:
@@ -855,6 +861,19 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
         total_created = 0
         first_id = None
         last_id = None
+        personas_pool = []
+
+        # Generate AI personas for profiles
+        try:
+            from core.ai_persona_generator import generate_personas
+            logger.info(f"🤖 Generating AI personas for {count} profiles...")
+            while len(personas_pool) < count:
+                batch = generate_personas(count=min(10, count - len(personas_pool)))
+                personas_pool.extend(batch)
+            logger.info(f"🤖 Generated {len(personas_pool)} AI personas")
+        except Exception as persona_err:
+            logger.warning(f"AI persona generation failed (will create without): {persona_err}")
+            personas_pool = []
 
         # Find the current max profile number for this prefix to avoid collisions
         existing_max = (
@@ -870,6 +889,11 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
                 profile_name = f"{name_prefix}{existing_max + i}"
                 global_idx = i - 1
                 is_mobile = global_idx in mobile_indices
+
+                # Assign persona if available
+                persona = personas_pool[global_idx] if global_idx < len(personas_pool) else None
+                if persona:
+                    persona["assigned_profile"] = profile_name
 
                 # Use ProfileGenerator for ALL profiles (full fingerprints, Chrome-only UAs)
                 p = profile_gen.generate_profile(profile_name=profile_name, is_mobile=is_mobile)
@@ -890,6 +914,11 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
                     "codecs": p.get("codecs", []),
                     "keyboard_layout": p.get("keyboard_layout", []),
                     "fonts": p.get("fonts", []),
+                    "webgpu_fingerprint": p.get("webgpu_fingerprint", {}),
+                    "hardware_concurrency": p.get("hardware_concurrency", 8),
+                    "device_memory": p.get("device_memory", 8),
+                    "max_touch_points": p.get("max_touch_points", 0),
+                    "do_not_track": p.get("do_not_track", False),
                 }
                 if p.get("sensor"):
                     screen_fp["sensor"] = p["sensor"]
@@ -899,7 +928,7 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
                     "user_agent": p["user_agent"],
                     "viewport_width": viewport.get("width", 1366),
                     "viewport_height": viewport.get("height", 768),
-                    "timezone": p.get("timezone", "Europe/Moscow"),
+                    "timezone": persona.get("timezone", p.get("timezone", "Europe/Moscow")) if persona else p.get("timezone", "Europe/Moscow"),
                     "language": p.get("language", "ru-RU"),
                     "platform": p.get("platform", "Win32"),
                     "is_mobile": is_mobile,
@@ -907,6 +936,7 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
                     "webgl_fingerprint": _json.dumps(p.get("webgl_fingerprint", {})),
                     "audio_fingerprint": p.get("audio_fingerprint", ""),
                     "screen_fingerprint": screen_fp,
+                    "persona_data": persona,
                     "status": "created",
                     "is_active": True,
                     "warmup_completed": False,
@@ -949,7 +979,7 @@ async def bulk_create_profiles(request_data: Dict[str, Any], db: Session = Depen
 
         # Trigger async warmup sites generation for profiles with personas
         warmup_sites_task_id = None
-        if personas_pool and total_created > 0 and first_id_row:
+        if total_created > 0 and first_id_row and personas_pool:
             try:
                 if CELERY_AVAILABLE:
                     from tasks.warmup import generate_warmup_sites_task

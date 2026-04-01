@@ -786,15 +786,16 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidos
         return False
 
 
-def _solve_showcaptcha_fast(driver, max_wait: int = 45) -> bool:
+def _solve_showcaptcha_fast(driver, max_wait: int = 20) -> bool:
     """Handle Yandex showcaptchaFAST — a JS-only captcha with no checkbox/form.
     
     showcaptchaFAST pages have NO <body>, NO form, NO checkbox. They load
     tmgrdfrend.fp.js which collects browser fingerprint, computes PoW, and
     auto-submits a form via JS. The page auto-redirects to the original search
-    results after PoW completes (typically 5-40 seconds).
+    results after PoW completes (typically 5-15 seconds).
     
     Strategy: Just wait for the JS to complete and redirect. No interaction needed.
+    Wait reduced to 20s — if PoW fingerprint is rejected it won't pass even with more time.
     """
     logger.info("🚀 showcaptchaFAST detected — waiting for JS auto-redirect (no checkbox needed)...")
     
@@ -987,13 +988,13 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
         # Save pre-click URL to detect redirect
         pre_click_url = driver.current_url
         
-        # Wait up to 45 seconds for URL change.
-        # PoW + fingerprint check takes 5-40 seconds (confirmed by visual tests).
+        # Wait up to 20 seconds for URL change.
+        # PoW typically completes in 5-15s. If fingerprint is rejected, waiting longer won't help.
         # Navigation errors during this wait are NORMAL (PoW sub-submits).
         redirected = False
         driver_alive = True
         image_grid_appeared = False
-        for i in range(45):
+        for i in range(20):
             time.sleep(1)
             try:
                 new_url = driver.current_url
@@ -2134,27 +2135,68 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
                 except:
                     pass
             
-            # Download images
+            # Download images via page.evaluate (Playwright natively awaits promises)
+            def _browser_fetch_image_v2(url):
+                """Download image through browser fetch, using page.evaluate directly."""
+                try:
+                    b64 = driver._page.evaluate("""async (url) => {
+                        try {
+                            const r = await fetch(url, {credentials: 'include'});
+                            if (!r.ok) return 'ERR:status=' + r.status;
+                            const buf = await r.arrayBuffer();
+                            const bytes = new Uint8Array(buf);
+                            let binary = '';
+                            const chunk = 8192;
+                            for (let i = 0; i < bytes.length; i += chunk) {
+                                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+                            }
+                            return btoa(binary);
+                        } catch(e) { return 'ERR:' + e.name + ':' + e.message; }
+                    }""", url)
+                    if b64 and isinstance(b64, str):
+                        if b64.startswith('ERR:'):
+                            logger.warning(f"Browser fetch error: {b64}")
+                            return None
+                        import base64
+                        return base64.b64decode(b64)
+                except Exception as fe:
+                    logger.warning(f"Browser fetch v2 exception: {fe}")
+                return None
+            
+            # Fallback: download via requests (external, no proxy)
+            def _requests_download(url):
+                """Download image via requests library."""
+                try:
+                    import requests as req
+                    resp = req.get(url, timeout=15, headers={
+                        'User-Agent': driver.execute_script("return navigator.userAgent"),
+                        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+                        'Referer': driver.current_url,
+                    })
+                    if resp.status_code == 200 and len(resp.content) > 100:
+                        return resp.content
+                except Exception as e:
+                    logger.debug(f"Requests download failed: {e}")
+                return None
+            
+            # Try downloading silhouette image
             if image_src and image_src.startswith('http'):
                 logger.info(f"📥 Downloading silhouette image from URL...")
-                cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                resp = req.get(image_src, cookies=cookies, timeout=15, headers={
-                    'User-Agent': driver.execute_script("return navigator.userAgent"),
-                    'Referer': driver.current_url
-                })
-                if resp.status_code == 200 and len(resp.content) > 100:
-                    click_image_data = resp.content
+                img_bytes = _browser_fetch_image_v2(image_src)
+                if not img_bytes or len(img_bytes) < 1000:
+                    img_bytes = _requests_download(image_src)
+                if img_bytes and len(img_bytes) > 1000:
+                    click_image_data = img_bytes
                     logger.info(f"✅ Downloaded silhouette image: {len(click_image_data)} bytes")
             
+            # Try downloading task icons image
             if task_image_src and task_image_src.startswith('http'):
                 logger.info(f"📥 Downloading task icons image from URL...")
-                cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                resp = req.get(task_image_src, cookies=cookies, timeout=15, headers={
-                    'User-Agent': driver.execute_script("return navigator.userAgent"),
-                    'Referer': driver.current_url
-                })
-                if resp.status_code == 200 and len(resp.content) > 100:
-                    task_image_data = resp.content
+                img_bytes = _browser_fetch_image_v2(task_image_src)
+                if not img_bytes or len(img_bytes) < 500:
+                    img_bytes = _requests_download(task_image_src)
+                if img_bytes and len(img_bytes) > 500:
+                    task_image_data = img_bytes
                     logger.info(f"✅ Downloaded task icons image: {len(task_image_data)} bytes")
         except Exception as e:
             logger.warning(f"⚠️ Failed to download images from URLs: {e}")
@@ -2259,13 +2301,11 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
                             if el.is_displayed():
                                 new_src = el.get_attribute('src')
                                 if new_src and new_src.startswith('http'):
-                                    cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                                    resp = req.get(new_src, cookies=cookies, timeout=15, headers={
-                                        'User-Agent': driver.execute_script("return navigator.userAgent"),
-                                        'Referer': driver.current_url
-                                    })
-                                    if resp.status_code == 200 and len(resp.content) > 100:
-                                        click_image_data = resp.content
+                                    img_bytes = _browser_fetch_image_v2(new_src)
+                                    if not img_bytes or len(img_bytes) < 1000:
+                                        img_bytes = _requests_download(new_src)
+                                    if img_bytes and len(img_bytes) > 1000:
+                                        click_image_data = img_bytes
                                         logger.info(f"📥 Re-downloaded silhouette image: {len(click_image_data)} bytes")
                                 break
                         except:
@@ -2276,13 +2316,11 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
                             if el.is_displayed():
                                 new_src = el.get_attribute('src')
                                 if new_src and new_src.startswith('http'):
-                                    cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                                    resp = req.get(new_src, cookies=cookies, timeout=15, headers={
-                                        'User-Agent': driver.execute_script("return navigator.userAgent"),
-                                        'Referer': driver.current_url
-                                    })
-                                    if resp.status_code == 200 and len(resp.content) > 100:
-                                        task_image_data = resp.content
+                                    img_bytes = _browser_fetch_image_v2(new_src)
+                                    if not img_bytes or len(img_bytes) < 500:
+                                        img_bytes = _requests_download(new_src)
+                                    if img_bytes and len(img_bytes) > 500:
+                                        task_image_data = img_bytes
                                         logger.info(f"📥 Re-downloaded task image: {len(task_image_data)} bytes")
                                 break
                         except:

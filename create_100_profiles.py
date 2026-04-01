@@ -59,6 +59,11 @@ def main():
                 "codecs": p.get("codecs", []),
                 "keyboard_layout": p.get("keyboard_layout", []),
                 "fonts": p.get("fonts", []),
+                "webgpu_fingerprint": p.get("webgpu_fingerprint", {}),
+                "hardware_concurrency": p.get("hardware_concurrency", 8),
+                "device_memory": p.get("device_memory", 8),
+                "max_touch_points": p.get("max_touch_points", 0),
+                "do_not_track": p.get("do_not_track", False),
             }
             if p.get("sensor"):
                 screen_fp["sensor"] = p["sensor"]

@@ -182,6 +182,13 @@ def _reseed_random_on_fork(**kwargs):
     random.seed(os.urandom(32))
     logger.info("🎲 Random re-seeded in forked worker (pid=%d)", os.getpid())
 
+    # Dispose inherited DB connections — forked processes must NOT share parent's pool
+    try:
+        from app.database import engine
+        engine.dispose()
+    except Exception as e:
+        logger.warning("⚠️ Failed to dispose DB engine on fork: %s", e)
+
     # Only reap zombie children of THIS process (safe, targeted)
     try:
         while True:

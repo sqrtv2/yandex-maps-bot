@@ -303,10 +303,20 @@ class BrowserManager:
             is_mobile = profile_data.get('is_mobile', False)
 
             try:
+                # Use full Chromium binary (not headless_shell) to avoid TLS/JA3
+                # fingerprint detection by SmartCaptcha. headless_shell has a unique
+                # TLS fingerprint that Yandex's server detects, triggering captcha
+                # on 100% of search requests.
+                import glob
+                chromium_paths = sorted(glob.glob('/opt/pw-browsers/chromium-*/chrome-linux*/chrome'))
+                chromium_exe = chromium_paths[-1] if chromium_paths else None
+
                 # Launch persistent context (uses profile directory for cookies/storage)
+                # timeout=60s prevents hanging on slow proxy handshake / corrupted profile
                 context = playwright.chromium.launch_persistent_context(
                     user_data_dir=profile_dir,
-                    headless=settings.browser_headless,
+                    headless=False,  # Always headed — uses Xvfb virtual display
+                    executable_path=chromium_exe,
                     args=launch_args,
                     proxy=proxy_config,
                     viewport={"width": viewport.get("width", 1366), "height": viewport.get("height", 768)},
@@ -320,6 +330,7 @@ class BrowserManager:
                     has_touch=is_mobile,
                     device_scale_factor=profile_data.get('screen', {}).get('pixel_ratio', 1) if is_mobile else 1,
                     ignore_https_errors=True,
+                    timeout=60000,  # 60s max for Chrome launch (prevents hang on proxy/profile issues)
                 )
             except Exception as launch_exc:
                 logger.warning(f"Chrome launch failed, cleaning up orphans for {profile_dir}: {launch_exc}")
@@ -347,7 +358,7 @@ class BrowserManager:
                     media_codecs=True,
                     error_prototype=True,
                     navigator_vendor=True,
-                    sec_ch_ua=True,
+                    sec_ch_ua=False,  # DISABLED: we set YaBrowser brands ourselves via CDP + JS
                     # Features we already handle with profile-specific values — DISABLED:
                     navigator_webdriver=False,      # our CDP script uses profile data
                     navigator_hardware_concurrency=False,  # profile-specific
@@ -356,12 +367,12 @@ class BrowserManager:
                     navigator_plugins=False,         # our custom mock
                     navigator_permissions=False,     # our custom patch
                     navigator_user_agent=False,      # set via CDP
-                    chrome_runtime=False,            # our custom mock
-                    iframe_content_window=False,     # our custom patch
+                    chrome_runtime=True,             # SmartCaptcha checks window.chrome.runtime
+                    iframe_content_window=True,      # SmartCaptcha checks iframe access
                     webgl_vendor=False,              # profile-specific values
                 )
                 stealth.apply_stealth_sync(context)
-                logger.info("✅ playwright-stealth applied (chrome_app, chrome_csi, chrome_load_times, hairline, media_codecs, error_prototype, navigator_vendor, sec_ch_ua)")
+                logger.info("✅ playwright-stealth applied (chrome_app, chrome_csi, chrome_load_times, hairline, media_codecs, error_prototype, navigator_vendor, sec_ch_ua, chrome_runtime, iframe_content_window)")
             except Exception as stealth_err:
                 logger.warning(f"⚠️ playwright-stealth failed to apply: {stealth_err}")
 
@@ -426,7 +437,7 @@ class BrowserManager:
         all browser instances.
         """
         # Mandatory args — required for Docker/headless stability
-        js_heap_mb = os.environ.get('YANDEX_BOT_BROWSER_JS_HEAP', '4096')
+        js_heap_mb = os.environ.get('YANDEX_BOT_BROWSER_JS_HEAP', '1024')
         args = [
             "--no-sandbox",
             "--disable-dev-shm-usage",
@@ -440,6 +451,8 @@ class BrowserManager:
             "--enforce-webrtc-ip-permission-check",
             "--webrtc-ip-handling-policy=disable_non_proxied_udp",
         ]
+        
+        from app.config import settings as _settings
 
         # Per-profile seed for deterministic but varied flag selection
         import hashlib
@@ -454,7 +467,6 @@ class BrowserManager:
             ("--disable-background-timer-throttling", 0.7),
             ("--disable-backgrounding-occluded-windows", 0.6),
             ("--disable-renderer-backgrounding", 0.65),
-            ("--disable-gpu", 0.5),
             ("--disable-software-rasterizer", 0.4),
             ("--disable-component-extensions-with-background-pages", 0.5),
             ("--disable-features=TranslateUI,BlinkGenPropertyTrees", 0.6),
@@ -565,9 +577,14 @@ class BrowserManager:
                 import re
                 ua_str = profile_data.get('user_agent') or ''
                 chrome_match = re.search(r'Chrome/(\d+)\.(\d+)\.(\d+)\.(\d+)', ua_str)
+                ya_match = re.search(r'YaBrowser/(\d+)\.(\d+)\.(\d+)\.(\d+)', ua_str)
                 if chrome_match:
                     major_ver = chrome_match.group(1)
                     full_ver = chrome_match.group(0).replace('Chrome/', '')
+                    
+                    # Extract YaBrowser version if present
+                    ya_major = ya_match.group(1) if ya_match else major_ver
+                    ya_full = ya_match.group(0).replace('YaBrowser/', '') if ya_match else full_ver
                     
                     if is_mobile:
                         ua_platform = 'Android'
@@ -580,7 +597,7 @@ class BrowserManager:
                         model = ''
                         if 'Windows' in ua_str:
                             ua_platform = 'Windows'
-                            platform_ver = '15.0.0' if 'Windows NT 10' in ua_str else '10.0.0'
+                            platform_ver = '10.0.0'
                         elif 'Macintosh' in ua_str or 'Mac OS X' in ua_str:
                             ua_platform = 'macOS'
                             platform_ver = '14.7.6'
@@ -590,21 +607,39 @@ class BrowserManager:
                         architecture = 'x86' if 'x86' in ua_str or 'Win' in ua_str else 'arm'
                         bitness = '64'
                     
+                    # Build brands list: YaBrowser format if YaBrowser UA, else Chrome
+                    if ya_match:
+                        brands = [
+                            {'brand': 'Chromium', 'version': major_ver},
+                            {'brand': 'YaBrowser', 'version': ya_major},
+                            {'brand': 'Yowser', 'version': '2'},
+                            {'brand': 'Not_A Brand', 'version': ya_major}
+                        ]
+                        full_version_list = [
+                            {'brand': 'Chromium', 'version': full_ver},
+                            {'brand': 'YaBrowser', 'version': ya_full},
+                            {'brand': 'Yowser', 'version': '2.5'},
+                            {'brand': 'Not_A Brand', 'version': ya_full}
+                        ]
+                    else:
+                        brands = [
+                            {'brand': 'Chromium', 'version': major_ver},
+                            {'brand': 'Google Chrome', 'version': major_ver},
+                            {'brand': 'Not-A.Brand', 'version': '99'}
+                        ]
+                        full_version_list = [
+                            {'brand': 'Chromium', 'version': full_ver},
+                            {'brand': 'Google Chrome', 'version': full_ver},
+                            {'brand': 'Not-A.Brand', 'version': '99.0.0.0'}
+                        ]
+                    
                     driver.execute_cdp_cmd('Emulation.setUserAgentOverride', {
                         'userAgent': ua_str,
                         'platform': profile_data.get('platform', 'Linux armv81' if is_mobile else 'Win32'),
                         'userAgentMetadata': {
-                            'brands': [
-                                {'brand': 'Chromium', 'version': major_ver},
-                                {'brand': 'Google Chrome', 'version': major_ver},
-                                {'brand': 'Not-A.Brand', 'version': '99'}
-                            ],
-                            'fullVersionList': [
-                                {'brand': 'Chromium', 'version': full_ver},
-                                {'brand': 'Google Chrome', 'version': full_ver},
-                                {'brand': 'Not-A.Brand', 'version': '99.0.0.0'}
-                            ],
-                            'fullVersion': full_ver,
+                            'brands': brands,
+                            'fullVersionList': full_version_list,
+                            'fullVersion': ya_full if ya_match else full_ver,
                             'platform': ua_platform,
                             'platformVersion': platform_ver,
                             'architecture': architecture if is_mobile else ('x86' if 'x86' in ua_str or 'Win' in ua_str else 'arm'),
@@ -614,8 +649,9 @@ class BrowserManager:
                             'wow64': False
                         }
                     })
+                    browser_label = f'YaBrowser/{ya_major}' if ya_match else f'Chrome/{major_ver}'
                     device_label = f"📱 {model}" if is_mobile else f"🖥️ {ua_platform}"
-                    logger.info(f"🛡️ userAgentData override set: Chrome/{major_ver} {device_label}")
+                    logger.info(f"🛡️ userAgentData override set: {browser_label} {device_label}")
             except Exception as e:
                 logger.warning(f"Could not override userAgentData: {e}")
 
@@ -687,11 +723,15 @@ class BrowserManager:
             keyboard_layout = profile_data.get("keyboard_layout", [])
             fonts_list = profile_data.get("fonts", [])
 
-            # Extract chrome version from user_agent for userAgentData mock
+            # Extract chrome and YaBrowser versions from user_agent for userAgentData mock
             import re as _re
             _ua = profile_data.get("user_agent", "")
             _cv_match = _re.search(r'Chrome/(\d+[\.\d]*)', _ua)
             chrome_version = _cv_match.group(1) if _cv_match else "131.0.0.0"
+            _ya_match = _re.search(r'YaBrowser/(\d+[\.\d]*)', _ua)
+            ya_version = _ya_match.group(1) if _ya_match else ""
+            ya_major = ya_version.split('.')[0] if ya_version else ""
+            is_yabrowser = bool(_ya_match)
             # Platform name for userAgentData (Windows/macOS/Linux)
             _plat = profile_data.get("platform", "Win32")
             if "Win" in _plat:
@@ -720,14 +760,31 @@ class BrowserManager:
             // ===== Stealth fingerprint overrides =====
             // Runs BEFORE page JS via Page.addScriptToEvaluateOnNewDocument
 
-            // --- Remove webdriver flag ---
+            // --- Utility: make patched functions appear native ---
+            // SmartCaptcha checks Function.prototype.toString() to detect overrides.
+            const _nativeToStringFunc = Function.prototype.toString;
+            const _nativeFuncs = new Map();
+            function _maskAsNative(patched, originalName) {{
+                _nativeFuncs.set(patched, `function ${{originalName || patched.name || ''}}() {{ [native code] }}`);
+            }}
+            // Patch Function.prototype.toString once
             try {{
-                Object.defineProperty(navigator, 'webdriver', {{
-                    get: () => undefined,
-                    configurable: true
+                Function.prototype.toString = function() {{
+                    if (_nativeFuncs.has(this)) return _nativeFuncs.get(this);
+                    return _nativeToStringFunc.call(this);
+                }};
+                _maskAsNative(Function.prototype.toString, 'toString');
+            }} catch(e) {{}}
+
+            // --- Remove webdriver flag ---
+            // Real Chrome sets navigator.webdriver = false (not undefined!)
+            // Must override on prototype so iframes inherit the value.
+            try {{
+                Object.defineProperty(Navigator.prototype, 'webdriver', {{
+                    get: () => false,
+                    configurable: true,
+                    enumerable: true
                 }});
-                // Also delete from prototype
-                delete navigator.__proto__.webdriver;
             }} catch(e) {{}}
 
             // --- Navigator overrides using proper prototype patching ---
@@ -828,6 +885,7 @@ class BrowserManager:
                     Navigator.prototype.getBattery = function() {{
                         return Promise.resolve(batteryData);
                     }};
+                    _maskAsNative(Navigator.prototype.getBattery, 'getBattery');
                 }}
             }} catch(e) {{}}
 
@@ -862,6 +920,7 @@ class BrowserManager:
                     // Add tiny random noise (0-100μs) to prevent timing fingerprint
                     return real + perfOffset + (Math.random() * 0.1);
                 }};
+                _maskAsNative(Performance.prototype.now, 'now');
             }} catch(e) {{}}
 
             // --- Canvas fingerprint noise (seed-based, per-profile stable) ---
@@ -913,35 +972,29 @@ class BrowserManager:
 
                 CanvasRenderingContext2D.prototype.getImageData = function(...args) {{
                     const imageData = origGetImageData.apply(this, args);
+                    // Skip noise on hidden canvases (SmartCaptcha Picasso uses display:none)
+                    try {{
+                        const canvas = this.canvas;
+                        if (canvas) {{
+                            const style = canvas.getAttribute('style') || '';
+                            if (style.indexOf('display') !== -1 && style.indexOf('none') !== -1) {{
+                                return imageData;
+                            }}
+                            if (canvas.offsetParent === null && canvas.width <= 300 && canvas.height <= 300) {{
+                                return imageData;
+                            }}
+                        }}
+                    }} catch(e2) {{}}
                     return addProfileNoise(imageData);
                 }};
+                _maskAsNative(CanvasRenderingContext2D.prototype.getImageData, 'getImageData');
 
-                // Deterministic sub-pixel rgba noise before toDataURL/toBlob
-                const _profileNoiseR = (CANVAS_SEED & 0xFF) / 25500;       // 0.00..0.01
-                const _profileNoiseG = ((CANVAS_SEED >> 8) & 0xFF) / 25500;
-                const _profileNoiseB = ((CANVAS_SEED >> 16) & 0xFF) / 25500;
-
-                HTMLCanvasElement.prototype.toDataURL = function(...args) {{
-                    try {{
-                        const ctx = this.getContext('2d');
-                        if (ctx) {{
-                            ctx.fillStyle = `rgba(${{(CANVAS_SEED & 0xF)}},${{((CANVAS_SEED >> 4) & 0xF)}},${{((CANVAS_SEED >> 8) & 0xF)}},${{_profileNoiseR}})`;
-                            ctx.fillRect(0, 0, 1, 1);
-                        }}
-                    }} catch(e) {{}}
-                    return origToDataURL.apply(this, args);
-                }};
-
-                HTMLCanvasElement.prototype.toBlob = function(cb, ...args) {{
-                    try {{
-                        const ctx = this.getContext('2d');
-                        if (ctx) {{
-                            ctx.fillStyle = `rgba(${{(CANVAS_SEED & 0xF)}},${{((CANVAS_SEED >> 4) & 0xF)}},${{((CANVAS_SEED >> 8) & 0xF)}},${{_profileNoiseG}})`;
-                            ctx.fillRect(0, 0, 1, 1);
-                        }}
-                    }} catch(e) {{}}
-                    return origToBlob.call(this, cb, ...args);
-                }};
+                // toDataURL/toBlob: do NOT modify canvas pixels before reading!
+                // SmartCaptcha Picasso renders patterns on hidden canvases and hashes
+                // the result. Any pixel modification corrupts the hash and triggers
+                // captcha rejection. We pass through to the original implementation.
+                HTMLCanvasElement.prototype.toDataURL = origToDataURL;
+                HTMLCanvasElement.prototype.toBlob = origToBlob;
             }} catch(e) {{}}
 
             // --- WebGL vendor/renderer + comprehensive parameters override ---
@@ -1043,6 +1096,7 @@ class BrowserManager:
                     }}
                     return origGetParam1.call(this, param);
                 }};
+                _maskAsNative(WebGLRenderingContext.prototype.getParameter, 'getParameter');
 
                 // --- Patch getParameter for WebGL2 ---
                 if (typeof WebGL2RenderingContext !== 'undefined') {{
@@ -1053,6 +1107,7 @@ class BrowserManager:
                         }}
                         return origGetParam2.call(this, param);
                     }};
+                    _maskAsNative(WebGL2RenderingContext.prototype.getParameter, 'getParameter');
                 }}
 
                 // --- Patch getSupportedExtensions ---
@@ -1062,11 +1117,13 @@ class BrowserManager:
                 WebGLRenderingContext.prototype.getSupportedExtensions = function() {{
                     return _wgl1Exts.length > 0 ? _wgl1Exts : origGetExts1.call(this);
                 }};
+                _maskAsNative(WebGLRenderingContext.prototype.getSupportedExtensions, 'getSupportedExtensions');
                 if (typeof WebGL2RenderingContext !== 'undefined') {{
                     const origGetExts2 = WebGL2RenderingContext.prototype.getSupportedExtensions;
                     WebGL2RenderingContext.prototype.getSupportedExtensions = function() {{
                         return _wgl2Exts.length > 0 ? _wgl2Exts : origGetExts2.call(this);
                     }};
+                    _maskAsNative(WebGL2RenderingContext.prototype.getSupportedExtensions, 'getSupportedExtensions');
                 }}
 
                 // --- Patch getContextAttributes ---
@@ -1340,37 +1397,9 @@ class BrowserManager:
                 }}
             }} catch(e) {{}}
 
-            // --- DOMRect fingerprint noise (seed-based) ---
-            try {{
-                const RECT_SEED = {canvas_seed} ^ 0xDEAD;
-                function rectRng(seed) {{
-                    return function() {{
-                        seed |= 0; seed = seed + 0x6D2B79F5 | 0;
-                        var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
-                        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-                        return ((t ^ t >>> 14) >>> 0) / 4294967296;
-                    }};
-                }}
-                const _rr = rectRng(RECT_SEED);
-                // Per-profile tiny offset (0 to 0.001 px)
-                const _rxOff = _rr() * 0.001;
-                const _ryOff = _rr() * 0.001;
-                const origGetBCR = Element.prototype.getBoundingClientRect;
-                Element.prototype.getBoundingClientRect = function() {{
-                    const r = origGetBCR.call(this);
-                    return new DOMRect(r.x + _rxOff, r.y + _ryOff, r.width + _rxOff, r.height + _ryOff);
-                }};
-                const origGetCR = Element.prototype.getClientRects;
-                Element.prototype.getClientRects = function() {{
-                    const rects = origGetCR.call(this);
-                    const out = [];
-                    for (let i = 0; i < rects.length; i++) {{
-                        const r = rects[i];
-                        out.push(new DOMRect(r.x + _rxOff, r.y + _ryOff, r.width + _rxOff, r.height + _ryOff));
-                    }}
-                    return out;
-                }};
-            }} catch(e) {{}}
+            // --- DOMRect: pass-through (no noise) ---
+            // Artificial DOMRect noise is detectable; competitor uses noise:0, doNotRound:true
+            // We simply leave getBoundingClientRect/getClientRects unpatched.
 
             // --- AudioContext fingerprint spoofing ---
             try {{
@@ -1421,6 +1450,7 @@ class BrowserManager:
                     }}
                     return origQuery.call(this, params);
                 }};
+                _maskAsNative(Permissions.prototype.query, 'query');
             }} catch(e) {{}}
 
             // --- Speech Synthesis voices mock ---
@@ -1634,10 +1664,25 @@ class BrowserManager:
             // --- navigator.userAgentData mock ---
             try {{
                 if (navigator.userAgentData) {{
-                    const _brands = [
-                        {{ brand: "Not/A)Brand", version: "8" }},
+                    const _brands = {'true' if is_yabrowser else 'false'} ? [
                         {{ brand: "Chromium", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '131'}" }},
-                        {{ brand: "Google Chrome", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '131'}" }}
+                        {{ brand: "YaBrowser", version: "{ya_major if ya_major else '24'}" }},
+                        {{ brand: "Yowser", version: "2" }},
+                        {{ brand: "Not_A Brand", version: "{ya_major if ya_major else '24'}" }}
+                    ] : [
+                        {{ brand: "Chromium", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '131'}" }},
+                        {{ brand: "Google Chrome", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '131'}" }},
+                        {{ brand: "Not-A.Brand", version: "99" }}
+                    ];
+                    const _fullBrands = {'true' if is_yabrowser else 'false'} ? [
+                        {{ brand: "Chromium", version: "{chrome_version}" }},
+                        {{ brand: "YaBrowser", version: "{ya_version if ya_version else chrome_version}" }},
+                        {{ brand: "Yowser", version: "2.5" }},
+                        {{ brand: "Not_A Brand", version: "{ya_version if ya_version else chrome_version}" }}
+                    ] : [
+                        {{ brand: "Chromium", version: "{chrome_version}" }},
+                        {{ brand: "Google Chrome", version: "{chrome_version}" }},
+                        {{ brand: "Not-A.Brand", version: "99.0.0.0" }}
                     ];
                     Object.defineProperty(navigator, 'userAgentData', {{
                         get: function() {{
@@ -1650,12 +1695,12 @@ class BrowserManager:
                                         brands: _brands,
                                         mobile: {'true' if is_mobile else 'false'},
                                         platform: "{platform_name}",
-                                        platformVersion: "15.0.0",
+                                        platformVersion: "10.0.0",
                                         architecture: "x86",
                                         bitness: "64",
                                         model: "",
-                                        uaFullVersion: "{chrome_version}",
-                                        fullVersionList: _brands.map(function(b) {{ return {{ brand: b.brand, version: "{chrome_version}" }}; }})
+                                        uaFullVersion: "{'%s' % (ya_version if ya_version else chrome_version)}",
+                                        fullVersionList: _fullBrands
                                     }});
                                 }},
                                 toJSON: function() {{
@@ -1665,6 +1710,28 @@ class BrowserManager:
                         }},
                         configurable: true
                     }});
+                }}
+            }} catch(e) {{}}
+
+            // --- mediaDevices.enumerateDevices mock ---
+            // Headless Chrome returns empty array; real browsers return at least 1 audio output
+            try {{
+                if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {{
+                    const _origEnum = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+                    const _patchedEnum = function() {{
+                        return _origEnum().then(function(devices) {{
+                            if (devices.length === 0) {{
+                                return [
+                                    {{ deviceId: "", kind: "audioinput", label: "", groupId: "" }},
+                                    {{ deviceId: "", kind: "audiooutput", label: "", groupId: "" }},
+                                    {{ deviceId: "", kind: "videoinput", label: "", groupId: "" }}
+                                ];
+                            }}
+                            return devices;
+                        }});
+                    }};
+                    _maskAsNative(_patchedEnum, 'enumerateDevices');
+                    navigator.mediaDevices.enumerateDevices = _patchedEnum;
                 }}
             }} catch(e) {{}}
 
@@ -1754,7 +1821,7 @@ class BrowserManager:
                             try {{
                                 // Shadow the iframe's navigator.webdriver too
                                 Object.defineProperty(win.navigator, 'webdriver', {{
-                                    get: () => undefined,
+                                    get: () => false,
                                     configurable: true
                                 }});
                             }} catch(e) {{}}

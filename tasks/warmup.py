@@ -30,6 +30,8 @@ from .celery_app import BaseTask
 # Fast mode: reduce all delays by this factor for higher throughput
 FAST_MODE = getattr(settings, 'fast_mode', False)
 
+logger = logging.getLogger(__name__)
+
 
 def recover_stuck_warming_profiles():
     """Reset profiles stuck in 'warming_up' after container restart.
@@ -48,8 +50,6 @@ def recover_stuck_warming_profiles():
 
 recover_stuck_warming_profiles()
 SPEED_FACTOR = 0.5 if FAST_MODE else 1.0  # 50% of normal time in fast mode
-
-logger = logging.getLogger(__name__)
 
 # === Warmup site pools ===
 

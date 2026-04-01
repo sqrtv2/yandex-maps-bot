@@ -48,34 +48,16 @@ def parse_yandex_maps_task(self, parse_task_id: int):
         # Create browser
         browser_manager = BrowserManager()
         
-        # Use a random profile for parsing
-        profile_data = {
-            'name': f'Parser-{parse_task_id}',
-            'user_agent': None,
-            'viewport_width': 1920,
-            'viewport_height': 1080,
-            'timezone': 'Europe/Moscow',
-            'language': 'ru-RU',
-        }
-        
-        # Get proxy if available
-        proxy_data = _get_random_proxy()
-        
-        browser_id = browser_manager.create_browser_session(profile_data, proxy_data)
-        driver = browser_manager.active_browsers.get(browser_id)
-        
-        if not driver:
-            raise Exception("Failed to create browser session")
-        
-        with get_db_session() as db:
-            task = db.query(ParseTask).filter(ParseTask.id == parse_task_id).first()
-            task.add_log("✅ Браузер запущен")
-            db.commit()
-        
+        # Generate a proper fingerprinted profile for parsing
+        from core.profile_generator import ProfileGenerator
+        from core.proxy_manager import ProxyManager
+        pg = ProfileGenerator()
+        proxy_manager = ProxyManager()
+
         # Build search URL if not provided
         if not search_url:
             search_url = build_search_url(search_query, region)
-        
+
         # Progress callback
         def on_progress(found, parsed):
             try:
@@ -87,22 +69,92 @@ def parse_yandex_maps_task(self, parse_task_id: int):
                         db.commit()
             except Exception:
                 pass
-        
-        # Run parser
-        companies = parse_yandex_maps_search(
-            driver, search_url, max_items=max_items, on_progress=on_progress
-        )
+
+        # Create captcha solver
+        from core.captcha_solver import CaptchaSolver
+        captcha_solver = CaptchaSolver()
+
+        # --- Retry loop with proxy rotation ---
+        MAX_PROXY_RETRIES = 5
+        exclude_proxy_ids = []
+        companies = []
+
+        for attempt in range(1, MAX_PROXY_RETRIES + 1):
+            profile_data = pg.generate_profile(f'Parser-{parse_task_id}-{attempt}')
+            profile_data['timezone'] = 'Europe/Moscow'
+            profile_data['language'] = 'ru-RU'
+
+            # Get proxy with exclusion of previously failed ones
+            proxy_data = proxy_manager.get_available_proxy(exclude_ids=exclude_proxy_ids or None)
+            proxy_label = f"{proxy_data['host']}:{proxy_data['port']}" if proxy_data else "без прокси"
+
+            with get_db_session() as db:
+                t = db.query(ParseTask).filter(ParseTask.id == parse_task_id).first()
+                if attempt == 1:
+                    t.add_log(f"✅ Прокси: {proxy_label}")
+                else:
+                    t.add_log(f"🔄 Попытка {attempt}/{MAX_PROXY_RETRIES}, новый прокси: {proxy_label}")
+                db.commit()
+
+            browser_id = browser_manager.create_browser_session(profile_data, proxy_data)
+            driver = browser_manager.active_browsers.get(browser_id)
+
+            if not driver:
+                with get_db_session() as db:
+                    t = db.query(ParseTask).filter(ParseTask.id == parse_task_id).first()
+                    t.add_log(f"❌ Не удалось создать браузер (попытка {attempt})")
+                    db.commit()
+                if proxy_data and proxy_data.get('id'):
+                    exclude_proxy_ids.append(proxy_data['id'])
+                continue
+
+            with get_db_session() as db:
+                t = db.query(ParseTask).filter(ParseTask.id == parse_task_id).first()
+                t.add_log("✅ Браузер запущен")
+                db.commit()
+
+            # Run parser
+            companies = parse_yandex_maps_search(
+                driver, search_url, max_items=max_items,
+                on_progress=on_progress, captcha_solver=captcha_solver
+            )
+
+            if companies:
+                # Success — break out of retry loop
+                break
+
+            # 0 results — log reason and try next proxy
+            with get_db_session() as db:
+                t = db.query(ParseTask).filter(ParseTask.id == parse_task_id).first()
+                t.add_log(f"⚠️ 0 результатов с прокси {proxy_label} — капча или блокировка")
+                db.commit()
+
+            # Close current browser before retrying
+            try:
+                browser_manager.close_browser_session(browser_id)
+            except Exception:
+                pass
+            browser_id = None
+
+            if proxy_data and proxy_data.get('id'):
+                exclude_proxy_ids.append(proxy_data['id'])
+
+            if attempt < MAX_PROXY_RETRIES:
+                wait_sec = 5 + random.uniform(2, 5)
+                logger.info(f"Waiting {wait_sec:.0f}s before retry with new proxy...")
+                time.sleep(wait_sec)
         
         # Extract emails from company websites (for those without email)
-        with get_db_session() as db:
-            task = db.query(ParseTask).filter(ParseTask.id == parse_task_id).first()
-            task.add_log(f"📧 Извлечение email с сайтов компаний...")
-            db.commit()
-        
-        try:
-            companies = extract_emails_from_websites(driver, companies)
-        except Exception as e:
-            logger.warning(f"⚠️ Email extraction from websites failed: {e}")
+        if companies and driver:
+            with get_db_session() as db:
+                task = db.query(ParseTask).filter(ParseTask.id == parse_task_id).first()
+                task.add_log(f"📧 Извлечение email с сайтов компаний...")
+                db.commit()
+            
+            try:
+                companies = extract_emails_from_websites(driver, companies)
+            except Exception as e:
+                logger.warning(f"⚠️ Email extraction from websites failed: {e}")
         
         # Save to database
         saved_count = 0
@@ -190,12 +242,13 @@ def parse_yandex_maps_task(self, parse_task_id: int):
 def _get_random_proxy():
     """Get a random active proxy from the database."""
     try:
+        from sqlalchemy.sql.expression import func
         from app.models import ProxyServer
         with get_db_session() as db:
             proxy = db.query(ProxyServer).filter(
                 ProxyServer.is_active == True,
                 ProxyServer.is_working == True,
-            ).order_by(ProxyServer.times_used).first()
+            ).order_by(func.random()).first()
             
             if proxy:
                 return {

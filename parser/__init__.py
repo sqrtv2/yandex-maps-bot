@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def parse_yandex_maps_search(driver, search_url: str, max_items: int = 100,
-                              on_progress=None) -> List[Dict]:
+                              on_progress=None, captcha_solver=None) -> List[Dict]:
     """
     Open Yandex Maps search results and collect company data via snippet clicks.
     """
@@ -32,10 +32,35 @@ def parse_yandex_maps_search(driver, search_url: str, max_items: int = 100,
     driver.get(search_url)
     time.sleep(5 + random.uniform(1, 3))
 
-    # Wait for search results
-    if not _wait_for_search_results(driver):
-        logger.warning("⚠️ Could not find search results on page")
-        return companies
+    # Log page state for debugging
+    try:
+        _title = driver.execute_script("return document.title")
+        _url = driver.current_url
+        logger.info(f"📄 Page loaded: title='{_title}', url={_url[:120]}")
+    except Exception:
+        pass
+
+    # Check for captcha and solve if needed
+    if not _wait_for_search_results(driver, timeout=10):
+        if captcha_solver and _check_and_solve_captcha(driver, captcha_solver):
+            logger.info("🔓 Captcha solved, waiting for search results...")
+            time.sleep(3 + random.uniform(1, 2))
+            # After solving, page may redirect — wait for results again
+            if not _wait_for_search_results(driver):
+                logger.warning("⚠️ Still no search results after captcha solve")
+                try:
+                    driver.save_screenshot("/app/screenshots/parser_no_results.png")
+                except Exception:
+                    pass
+                return companies
+        else:
+            logger.warning("⚠️ Could not find search results on page")
+            try:
+                driver.save_screenshot("/app/screenshots/parser_no_results.png")
+                logger.info("📸 Debug screenshot saved to /app/screenshots/parser_no_results.png")
+            except Exception:
+                pass
+            return companies
 
     logger.info("✅ Search results loaded")
 
@@ -46,19 +71,22 @@ def parse_yandex_maps_search(driver, search_url: str, max_items: int = 100,
     while len(companies) < max_items and scroll_round < max_rounds:
         scroll_round += 1
 
-        # Get all visible snippets
+        # Re-query snippets every iteration (DOM references go stale after card navigation)
         snippets = driver.find_elements(By.CSS_SELECTOR, ".search-business-snippet-view")
         if not snippets:
             snippets = driver.find_elements(By.CSS_SELECTOR, ".search-snippet-view")
 
-        # Find snippets with org IDs we haven't processed yet
-        new_snippets = []
+        # Find the FIRST new snippet we haven't processed yet
+        next_snippet = None
+        next_org_id = None
         for snip in snippets:
             org_id = _get_snippet_org_id(snip)
             if org_id and org_id not in seen_ids:
-                new_snippets.append((snip, org_id))
+                next_snippet = snip
+                next_org_id = org_id
+                break
 
-        if not new_snippets:
+        if not next_snippet:
             no_new_count += 1
             if no_new_count >= 3:
                 logger.info(f"📋 No more new results after {len(companies)} companies")
@@ -68,23 +96,19 @@ def parse_yandex_maps_search(driver, search_url: str, max_items: int = 100,
             continue
 
         no_new_count = 0
+        seen_ids.add(next_org_id)
 
-        for snip, org_id in new_snippets:
-            if len(companies) >= max_items:
-                break
-            seen_ids.add(org_id)
-
-            try:
-                company = _click_and_parse_card(driver, snip, org_id)
-                if company and company.get('name'):
-                    companies.append(company)
-                    logger.info(f"  ✅ [{len(companies)}/{max_items}] {company['name']}")
-                    if on_progress:
-                        on_progress(len(seen_ids), len(companies))
-                else:
-                    logger.warning(f"  ⚠️ No data for org {org_id}")
-            except Exception as e:
-                logger.warning(f"  ⚠️ Error parsing {org_id}: {e}")
+        try:
+            company = _click_and_parse_card(driver, next_snippet, next_org_id)
+            if company and company.get('name'):
+                companies.append(company)
+                logger.info(f"  ✅ [{len(companies)}/{max_items}] {company['name']}")
+                if on_progress:
+                    on_progress(len(seen_ids), len(companies))
+            else:
+                logger.warning(f"  ⚠️ No data for org {next_org_id}")
+        except Exception as e:
+            logger.warning(f"  ⚠️ Error parsing {next_org_id}: {e}")
 
             time.sleep(0.5 + random.uniform(0.3, 1))
 
@@ -107,6 +131,40 @@ def _wait_for_search_results(driver, timeout: int = 20) -> bool:
         return True
     except TimeoutException:
         return False
+
+
+def _check_and_solve_captcha(driver, captcha_solver, max_attempts: int = 3) -> bool:
+    """Detect and solve Yandex captcha if present. Returns True if solved."""
+    from tasks.yandex_maps import detect_captcha_or_block, handle_yandex_protection
+
+    for attempt in range(1, max_attempts + 1):
+        if not detect_captcha_or_block(driver):
+            logger.info("✅ No captcha detected")
+            return True
+
+        logger.warning(f"🔒 Captcha detected (attempt {attempt}/{max_attempts})")
+        try:
+            solved = handle_yandex_protection(
+                driver, captcha_solver,
+                max_kaleidoscope_attempts=3,
+                deadline=time.time() + 120,
+            )
+            if solved:
+                logger.info(f"🔓 Captcha solved on attempt {attempt}")
+                time.sleep(2 + random.uniform(1, 2))
+                # Check if we're still on captcha
+                if not detect_captcha_or_block(driver):
+                    return True
+                logger.warning("⚠️ Still on captcha after solve, retrying...")
+            else:
+                logger.warning(f"⚠️ Captcha solve failed on attempt {attempt}")
+        except Exception as e:
+            logger.error(f"❌ Captcha solve error: {e}")
+
+        time.sleep(3 + random.uniform(1, 3))
+
+    logger.error(f"❌ Failed to solve captcha after {max_attempts} attempts")
+    return False
 
 
 def _scroll_results(driver):

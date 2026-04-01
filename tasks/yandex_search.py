@@ -40,6 +40,24 @@ logger = logging.getLogger(__name__)
 # Set below --max-memory-per-child (8GB=~7600MB) to bail BEFORE Celery SIGKILL's us.
 MEMORY_BUDGET_MB = 6000  # 6 GB — leaves ~1.6 GB headroom
 
+# Wall-clock budget: max seconds for the entire search task.
+# Must be LESS than soft_time_limit (540s) to exit cleanly before Celery sends
+# SoftTimeLimitExceeded (which can't interrupt Playwright FFI calls).
+# 420s = 7 min: leaves 2 min buffer for cleanup + browser close.
+SEARCH_MAX_DURATION = 420
+
+
+def _check_wall_clock(start_time: float, label: str = "") -> bool:
+    """Check if wall-clock budget is exceeded.
+    Returns True if still within budget, raises Exception if over."""
+    elapsed = time.time() - start_time
+    if elapsed > SEARCH_MAX_DURATION:
+        raise Exception(
+            f"Wall-clock budget exceeded ({elapsed:.0f}s > {SEARCH_MAX_DURATION}s)"
+            + (f" at {label}" if label else "")
+        )
+    return True
+
 
 def _check_memory_budget() -> tuple:
     """Check current process RSS against memory budget.
@@ -2313,6 +2331,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
     _profile_dir_for_cleanup = None  # Track profile dir for cleanup even if browser_id is None
     params = search_params or {}
     proxy_data = None  # Initialize here so it's always in scope for error handlers
+    domain = None  # Initialize so error handler can reference it even if DB fails early
 
     try:
         start_time = time.time()
@@ -2452,6 +2471,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         from app.config import settings as _settings
         _profile_dir_for_cleanup = os.path.join(_settings.browser_user_data_dir, profile_data['name'])
 
+        _check_wall_clock(start_time, 'before browser launch')
         browser_id = browser_manager.create_browser_session(profile_data, proxy_data)
         driver = browser_manager.active_browsers[browser_id]
         driver.set_page_load_timeout(40)  # 40s instead of default 300s
@@ -2467,6 +2487,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
 
         # === Step 0: Entry point — 50/50 direct ya.ru vs through mail.ru ===
         # Real users arrive at Yandex via different paths: direct, bookmarks, or from other sites
+        _check_wall_clock(start_time, 'before entry point')
         _referrer_used = False
         _entry_method = random.choice(['direct', 'mail.ru'])
         
@@ -2504,6 +2525,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             _update_search_task_log(task_id, "🌐 Открываем Яндекс...")
 
         # === Step 1: Open Yandex ===
+        _check_wall_clock(start_time, 'before ya.ru')
         ya_loaded = _safe_get(driver, "https://ya.ru", timeout=40, label="ya.ru")
         if ya_loaded == 'dead':
             logger.warning("💀 Browser died navigating to ya.ru — recovering...")
@@ -2619,6 +2641,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             logger.info(f"🔍 [DIAG] No captcha indicators detected")
         
         if detect_captcha_or_block(driver):
+            _check_wall_clock(start_time, 'before home captcha solve')
             logger.warning(f"🚨 Captcha detected on Yandex homepage! Types: {detected_types}")
             if task_id:
                 _update_search_task_log(task_id, f"⚠️ Капча на главной Яндекса ({', '.join(detected_types) or 'unknown'}), решаем...")
@@ -2745,6 +2768,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         _human_mouse_move(driver, duration=random.uniform(0.8, 2.5))
 
         # === Step 2: Type keyword via keyboard emulation ===
+        _check_wall_clock(start_time, 'before typing keyword')
         if task_id:
             _update_search_task_log(task_id, f"⌨️ Вводим запрос: '{keyword}'")
 
@@ -3229,10 +3253,10 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             captcha_solver = CaptchaSolver()
             
             heavy_search_captcha = any(t in search_detected for t in ('kaleidoscope', 'silhouette', 'advanced_captcha'))
-            # showcaptcha_url is mostly unsolvable (PoW rejected); use 2 attempts to fail faster
+            # showcaptcha_url is fingerprint-based PoW — 1 attempt only, retry is useless
             # kaleidoscope/silhouette have better solve rates — give them 3 attempts
             is_showcaptcha = 'showcaptcha_url' in search_detected
-            max_search_captcha_attempts = 2 if is_showcaptcha else 3
+            max_search_captcha_attempts = 1 if is_showcaptcha else 3
 
             # Try solving with limited attempts
             solved2 = False
@@ -3358,6 +3382,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         _human_mouse_move(driver, duration=random.uniform(0.5, 1.5))
 
         # === Step 3: Find and click target ===
+        _check_wall_clock(start_time, 'before find-and-click')
         result = _find_and_click_target(driver, domain, max_pages=max_pages, keyword=keyword,
                                         task_start_time=start_time)
 
@@ -3652,32 +3677,43 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 logger.error(f"Max retries exceeded for browser crash (profile {profile_id})")
 
         # Retry on captcha failures with different proxy (captcha = proxy/fingerprint flagged)
+        # BUT: showcaptcha (PoW) failures are fingerprint-based — retrying with new proxy won't help
+        # because the headless browser fingerprint is what gets rejected, not the IP
         _captcha_fail = (
             'Captcha not solved' in error_str
             or 'Captcha blocked' in error_str
             or 'Captcha reappeared' in error_str
         )
+        _is_showcaptcha_fail = 'showcaptcha' in error_str
         if _captcha_fail:
-            logger.warning(f"🔄 Captcha failure — will retry with different proxy (profile {profile_id})")
-            if task_id:
-                _update_search_task_log(task_id, f"🔄 Капча не решена, повтор с другим прокси через 60с...")
-            # Close current browser before retry
-            if browser_manager and browser_id:
+            if _is_showcaptcha_fail:
+                # showcaptcha = fingerprint rejected by Yandex PoW — retry is useless
+                logger.warning(f"❌ showcaptcha failure — NOT retrying (fingerprint rejected, profile {profile_id})")
+                if task_id:
+                    _update_search_task_log(task_id, f"❌ showcaptcha не решена (fingerprint отклонён), без повтора")
+                # Don't retry — fall through to generic error handling
+            else:
+                # Other captcha types (kaleidoscope, silhouette) — retry may help
+                logger.warning(f"🔄 Captcha failure — will retry with different proxy (profile {profile_id})")
+                if task_id:
+                    _update_search_task_log(task_id, f"🔄 Капча не решена, повтор с другим прокси через 60с...")
+                # Close current browser before retry
+                if browser_manager and browser_id:
+                    try:
+                        browser_manager.close_browser_session(browser_id)
+                        browser_id = None
+                    except Exception:
+                        pass
+                # Exclude current proxy on retry
+                retry_params = dict(params) if params else {}
+                failed_proxy_id = proxy_data.get('id') if proxy_data else None
+                if failed_proxy_id:
+                    retry_params['exclude_proxy_ids'] = list(set(exclude_proxy_ids + [failed_proxy_id]))
                 try:
-                    browser_manager.close_browser_session(browser_id)
-                    browser_id = None
-                except Exception:
-                    pass
-            # Exclude current proxy on retry
-            retry_params = dict(params) if params else {}
-            failed_proxy_id = proxy_data.get('id') if proxy_data else None
-            if failed_proxy_id:
-                retry_params['exclude_proxy_ids'] = list(set(exclude_proxy_ids + [failed_proxy_id]))
-            try:
-                raise self.retry(exc=e, countdown=60, max_retries=2,
-                                 args=[profile_id, target_id, keyword, task_id, retry_params])
-            except self.MaxRetriesExceededError:
-                logger.error(f"Max retries exceeded for captcha failure (profile {profile_id})")
+                    raise self.retry(exc=e, countdown=60, max_retries=2,
+                                     args=[profile_id, target_id, keyword, task_id, retry_params])
+                except self.MaxRetriesExceededError:
+                    logger.error(f"Max retries exceeded for captcha failure (profile {profile_id})")
 
         # Retry on proxy tunnel failures (ERR_TUNNEL_CONNECTION_FAILED)
         if 'ERR_TUNNEL_CONNECTION_FAILED' in error_str or 'ERR_PROXY_CONNECTION_FAILED' in error_str:

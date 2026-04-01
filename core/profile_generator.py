@@ -53,16 +53,28 @@ class ProfileGenerator:
             (411, 731), (320, 568), (375, 667), (428, 926),
         ]
 
-        # Mobile device models for UA metadata
+        # Mobile device models for UA metadata — popular in Russia
         self.mobile_devices = [
-            {"model": "Pixel 7", "android": "14", "build": "AP2A.240805.005"},
-            {"model": "Pixel 8", "android": "14", "build": "AD1A.240530.047"},
-            {"model": "SM-S928B", "android": "14", "build": "UP1A.231005.007"},  # Samsung Galaxy S24 Ultra
-            {"model": "SM-A546B", "android": "14", "build": "UP1A.231005.007"},  # Samsung Galaxy A54
-            {"model": "SM-G998B", "android": "13", "build": "TP1A.220624.014"},  # Samsung Galaxy S21 Ultra
+            # Samsung
+            {"model": "SM-S928B", "android": "15", "build": "AP3A.250105.002"},  # Galaxy S24 Ultra
+            {"model": "SM-S926B", "android": "15", "build": "AP3A.250105.002"},  # Galaxy S24+
+            {"model": "SM-S921B", "android": "15", "build": "AP3A.250105.002"},  # Galaxy S24
+            {"model": "SM-A556B", "android": "15", "build": "AP3A.250105.002"},  # Galaxy A55
+            {"model": "SM-A546B", "android": "14", "build": "UP1A.231005.007"},  # Galaxy A54
+            {"model": "SM-S911B", "android": "14", "build": "UP1A.231005.007"},  # Galaxy S23
+            {"model": "SM-A155F", "android": "14", "build": "UP1A.231005.007"},  # Galaxy A15
+            # Xiaomi / Redmi / POCO
+            {"model": "2407FPN8EG", "android": "14", "build": "UKQ1.240118.001"},  # Xiaomi 14T
+            {"model": "23129RAA4G", "android": "14", "build": "UKQ1.231003.002"},  # Redmi Note 13 Pro+
+            {"model": "2312DRA50G", "android": "14", "build": "UKQ1.231003.002"},  # POCO X6 Pro
             {"model": "22101316G", "android": "14", "build": "UKQ1.231003.002"},  # Xiaomi 13
-            {"model": "2201117TG", "android": "13", "build": "TKQ1.220829.002"},  # Xiaomi 12
-            {"model": "CPH2451", "android": "13", "build": "TP1A.220905.001"},  # OPPO Reno 8
+            {"model": "2409BPN8EG", "android": "15", "build": "AP3A.250105.002"},  # Xiaomi 15
+            # Google Pixel
+            {"model": "Pixel 8", "android": "15", "build": "AP3A.250105.002"},
+            {"model": "Pixel 8a", "android": "15", "build": "AP3A.250105.002"},
+            {"model": "Pixel 9", "android": "15", "build": "AP3A.250105.002"},
+            # Realme
+            {"model": "RMX3890", "android": "14", "build": "UP1A.231005.007"},  # Realme GT5 Pro
             {"model": "RMX3630", "android": "14", "build": "UP1A.231005.007"},  # Realme 11 Pro
         ]
 
@@ -591,57 +603,54 @@ class ProfileGenerator:
             logger.error(f"Error generating profile: {e}")
             raise
 
-    # Modern Chrome UA templates matching actual Chrome 143-145 on server
+    # Desktop YaBrowser UA templates (Windows only)
     MODERN_CHROME_UAS = [
-        # Windows 10 / 11
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
-        # macOS
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
-        # Linux
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{cver} YaBrowser/{yver} Yowser/2.5 Safari/537.36",
     ]
 
-    # Mobile Chrome UA template (Android)
-    # {device} is replaced with model info from mobile_devices list
+    # Mobile YaBrowser UA templates (Android)
     MOBILE_CHROME_UAS = [
-        "Mozilla/5.0 (Linux; Android {android}; {model}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Mobile Safari/537.36",
+        "Mozilla/5.0 (Linux; Android {android}; {model}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{cver} YaBrowser/{yver} Mobile Safari/537.36",
     ]
 
-    # Chrome version ranges matching what's actually installed (143-145)
-    CHROME_VERSIONS = [
-        "143.0.7544.{patch}",
-        "144.0.7612.{patch}",
-        "145.0.7632.{patch}",
+    # YaBrowser version pairs: (Chrome base version, YaBrowser version)
+    # YaBrowser 25.x = Chromium 132-134, YaBrowser 26.x = Chromium 134-136
+    # download URL showed 26.3.0 in April 2026
+    YABROWSER_VERSIONS = [
+        ("132.0.6834.{patch}", "25.2.3.{ypatch}"),
+        ("132.0.6834.{patch}", "25.2.5.{ypatch}"),
+        ("134.0.6998.{patch}", "25.4.2.{ypatch}"),
+        ("134.0.6998.{patch}", "25.4.5.{ypatch}"),
+        ("134.0.6998.{patch}", "26.1.2.{ypatch}"),
+        ("136.0.7103.{patch}", "26.3.0.{ypatch}"),
+        ("136.0.7103.{patch}", "26.3.2.{ypatch}"),
     ]
 
     def _generate_user_agent(self, is_mobile: bool = False, device_info: dict = None) -> str:
-        """Generate realistic user agent matching actual installed Chrome version."""
-        version_template = random.choice(self.CHROME_VERSIONS)
+        """Generate realistic YaBrowser user agent."""
+        chrome_ver_tpl, ya_ver_tpl = random.choice(self.YABROWSER_VERSIONS)
         patch = random.randint(40, 120)
-        version = version_template.format(patch=patch)
+        ypatch = random.randint(100, 999)
+        chrome_version = chrome_ver_tpl.format(patch=patch)
+        ya_version = ya_ver_tpl.format(ypatch=ypatch)
 
         if is_mobile and device_info:
             template = random.choice(self.MOBILE_CHROME_UAS)
             return template.format(
-                ver=version,
+                cver=chrome_version,
+                yver=ya_version,
                 android=device_info['android'],
                 model=device_info['model']
             )
         else:
             template = random.choice(self.MODERN_CHROME_UAS)
-            return template.format(ver=version)
+            return template.format(cver=chrome_version, yver=ya_version)
 
     def _generate_platform(self, is_mobile: bool = False) -> str:
         """Generate platform string."""
         if is_mobile:
             return "Linux armv81"
-        platforms = [
-            "Win32", "MacIntel", "Linux x86_64", "Linux i686"
-        ]
-        return random.choice(platforms)
+        return "Win32"
 
     def _generate_screen_settings(self, is_mobile: bool = False) -> Dict:
         """Generate screen resolution and color depth."""

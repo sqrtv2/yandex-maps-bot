@@ -673,6 +673,15 @@ def queue_watchdog():
                 ).all()
 
                 for t in stale_ip:
+                    # Revoke the Celery task to actually kill the worker process
+                    # Without this, worker keeps running until hard time_limit SIGKILL
+                    if t.celery_task_id:
+                        try:
+                            from tasks.celery_app import celery_app as _celery
+                            _celery.control.revoke(t.celery_task_id, terminate=True, signal='SIGUSR1')
+                            logger.info(f"🐕 Watchdog revoked Celery task {t.celery_task_id} (DB task {t.id})")
+                        except Exception as _rev_err:
+                            logger.warning(f"⚠️ Watchdog could not revoke {t.celery_task_id}: {_rev_err}")
                     t.status = 'failed'
                     t.error_message = t.error_message or f'Watchdog: зависла в in_progress (>{IN_PROGRESS_MAX_MINUTES} мин)'
                     t.completed_at = now

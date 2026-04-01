@@ -14,6 +14,7 @@ services:
       - YANDEX_BOT_BROWSER_HEADLESS=true
       - YANDEX_BOT_YANDEX_SEARCH_API_KEY=${YANDEX_SEARCH_API_KEY:-}
       - YANDEX_BOT_YANDEX_SEARCH_FOLDER_ID=${YANDEX_SEARCH_FOLDER_ID:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/key.json
       - AUTH_USERNAME=admin
       - AUTH_PASSWORD=admin123
     volumes:
@@ -26,6 +27,7 @@ services:
       - ./app:/app/app
       - ./web:/app/web
       - ./parser:/app/parser
+      - ./key.json:/app/key.json:ro
     depends_on:
       - postgres
       - redis
@@ -46,7 +48,7 @@ services:
   celery_warmup:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=20 -Q default,warmup,proxy,maintenance -n warmup@%h --max-memory-per-child=4000000 --max-tasks-per-child=50
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=20 -Q default,warmup,proxy,maintenance -n warmup@%h --max-memory-per-child=16000000 --max-tasks-per-child=50
     shm_size: '16gb'
     healthcheck:
       test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d warmup@$$HOSTNAME --timeout=10 || exit 1"]
@@ -62,6 +64,7 @@ services:
       - YANDEX_BOT_SAVE_SCREENSHOTS=false
       - YANDEX_BOT_FAST_MODE=true
       - YANDEX_BOT_BROWSER_JS_HEAP=1024
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/key.json
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -71,6 +74,49 @@ services:
       - ./app:/app/app
       - ./web:/app/web
       - ./parser:/app/parser
+      - ./key.json:/app/key.json:ro
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+          cpus: '8'
+    networks:
+      - yandex_maps_network
+
+  # Second warmup worker for faster parallel warmup
+  celery_warmup2:
+    build: .
+    init: true
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=20 -Q warmup -n warmup2@%h --max-memory-per-child=16000000 --max-tasks-per-child=50
+    shm_size: '16gb'
+    environment:
+      - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
+      - YANDEX_BOT_REDIS_HOST=redis
+      - YANDEX_BOT_REDIS_PORT=6379
+      - YANDEX_BOT_DEBUG=false
+      - YANDEX_BOT_BROWSER_HEADLESS=true
+      - YANDEX_BOT_SAVE_SCREENSHOTS=false
+      - YANDEX_BOT_FAST_MODE=true
+      - YANDEX_BOT_BROWSER_JS_HEAP=1024
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/key.json
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./browser_profiles:/app/browser_profiles
+      - ./tasks:/app/tasks
+      - ./core:/app/core
+      - ./app:/app/app
+      - ./web:/app/web
+      - ./parser:/app/parser
+      - ./key.json:/app/key.json:ro
     depends_on:
       - postgres
       - redis
@@ -136,7 +182,7 @@ services:
   celery_yandex_search:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=20 -Q yandex_search -n yandex_search@%h --max-memory-per-child=4000000 --max-tasks-per-child=2
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=10 -Q yandex_search -n yandex_search@%h --max-memory-per-child=8000000 --max-tasks-per-child=2
     shm_size: '12gb'
     healthcheck:
       test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d yandex_search@$$HOSTNAME --timeout=10 || exit 1"]
