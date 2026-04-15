@@ -1556,6 +1556,7 @@ def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bo
     # Hard wall-clock alarm: guarantees the chunk exits before Celery's
     # time_limit sends SIGKILL. This breaks through ANY blocking Playwright
     # call (bounding_box, mouse.move, evaluate, etc.) when Chrome hangs.
+    CHUNK_MAX_DURATION = 720  # seconds — stop early, leave 180s buffer for cleanup
     _old_alarm_handler = signal.getsignal(signal.SIGALRM)
     def _chunk_alarm(signum, frame):
         raise TimeoutError(f"Chunk alarm: wall-clock budget ({CHUNK_MAX_DURATION}s) exceeded")
@@ -1669,8 +1670,6 @@ def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bo
         # Wall-clock budget: stop visiting new sites before hard time_limit kills us.
         # time_limit=900, soft_time_limit=840 — but Playwright blocking calls can't be
         # interrupted by SoftTimeLimitExceeded signal, so we must check manually.
-        CHUNK_MAX_DURATION = 720  # seconds — stop early, leave 180s buffer for cleanup
-
         def _chunk_time_remaining():
             return CHUNK_MAX_DURATION - (time.time() - start_time)
 
