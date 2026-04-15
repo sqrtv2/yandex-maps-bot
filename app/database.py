@@ -76,6 +76,7 @@ def create_tables():
         from .models.yandex_search_target import YandexSearchTarget
         from .models.search_position_history import SearchPositionHistory
         from .models.error_log import ErrorLog
+        from .models.drop_domain import DropDomain
 
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables created successfully")

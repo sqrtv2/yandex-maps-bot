@@ -61,6 +61,7 @@ def run_campaign_task(self, campaign_id: int):
 
         logger.info(f"Campaign {campaign_id}: {len(messages)} messages to send")
 
+        consecutive_fails = 0
         for msg in messages:
             # Check if campaign was paused
             db.refresh(campaign)
@@ -105,6 +106,7 @@ def run_campaign_task(self, campaign_id: int):
                 msg.smtp_account_id = smtp_account.id
                 campaign.sent_count = (campaign.sent_count or 0) + 1
                 smtp_account.sent_today = (smtp_account.sent_today or 0) + 1
+                consecutive_fails = 0
             else:
                 msg.status = MessageStatus.FAILED.value
                 msg.error_message = error[:1000] if error else None
@@ -115,6 +117,21 @@ def run_campaign_task(self, campaign_id: int):
                 if "Auth" in (error or "") or "authentication" in (error or "").lower():
                     smtp_account.is_active = False
                     smtp_account.last_error = error[:500]
+
+                # If SPAM rejection — pause campaign to avoid getting blocked
+                if "SPAM" in (error or "") or "spam" in (error or "").lower() or "554" in (error or ""):
+                    logger.warning(f"Campaign {campaign_id}: SPAM rejection detected, pausing")
+                    db.commit()
+                    campaign.status = MailingStatus.PAUSED.value
+                    db.commit()
+                    return
+
+                consecutive_fails += 1
+                if consecutive_fails >= 5:
+                    logger.warning(f"Campaign {campaign_id}: {consecutive_fails} consecutive failures, pausing")
+                    campaign.status = MailingStatus.PAUSED.value
+                    db.commit()
+                    return
 
             db.commit()
 

@@ -48,7 +48,7 @@ services:
   celery_warmup:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=20 -Q default,warmup,proxy,maintenance -n warmup@%h --max-memory-per-child=16000000 --max-tasks-per-child=50
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5 -Q default,warmup,proxy,maintenance -n warmup@%h --max-memory-per-child=16000000 --max-tasks-per-child=3
     shm_size: '16gb'
     healthcheck:
       test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d warmup@$$HOSTNAME --timeout=10 || exit 1"]
@@ -95,7 +95,7 @@ services:
   celery_warmup2:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=20 -Q warmup -n warmup2@%h --max-memory-per-child=16000000 --max-tasks-per-child=50
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=5 -Q warmup -n warmup2@%h --max-memory-per-child=16000000 --max-tasks-per-child=3
     shm_size: '16gb'
     environment:
       - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
@@ -137,7 +137,7 @@ services:
   celery_yandex_maps:
     build: .
     init: true
-    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=2 -Q yandex_maps -n yandex_maps@%h --max-memory-per-child=4000000
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=2 -Q yandex_maps,maps_scheduler -n yandex_maps@%h --max-memory-per-child=4000000 --max-tasks-per-child=2
     shm_size: '4gb'
     healthcheck:
       test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d yandex_maps@$$HOSTNAME --timeout=10 || exit 1"]
@@ -175,6 +175,51 @@ services:
         limits:
           memory: 16G
           cpus: '4'
+    networks:
+      - yandex_maps_network
+
+  # Celery worker for Drop Domains checker (4 parallel browsers)
+  celery_drop_domains:
+    build: .
+    init: true
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=8 -Q drop_domains -n drop_domains@%h --max-memory-per-child=4000000 --max-tasks-per-child=10
+    shm_size: '8gb'
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d drop_domains@$$HOSTNAME --timeout=10 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+    environment:
+      - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
+      - YANDEX_BOT_REDIS_HOST=redis
+      - YANDEX_BOT_REDIS_PORT=6379
+      - YANDEX_BOT_DEBUG=false
+      - YANDEX_BOT_BROWSER_HEADLESS=true
+      - YANDEX_BOT_SAVE_SCREENSHOTS=false
+      - YANDEX_BOT_FAST_MODE=true
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./browser_profiles:/app/browser_profiles
+      - ./tasks:/app/tasks
+      - ./core:/app/core
+      - ./app:/app/app
+      - ./web:/app/web
+      - ./parser:/app/parser
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 20G
+          cpus: '8'
     networks:
       - yandex_maps_network
 

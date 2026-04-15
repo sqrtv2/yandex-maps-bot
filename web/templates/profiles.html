@@ -127,6 +127,33 @@
     </div>
 </div>
 
+<!-- Warmup Activity Log -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card border-warning">
+            <div class="card-header bg-warning text-dark d-flex justify-content-between align-items-center">
+                <div>
+                    <h6 class="mb-0">
+                        <i class="bi bi-journal-text"></i> Лог активности прогрева
+                        <span class="badge bg-dark ms-2" id="activityActiveCount">0</span>
+                    </h6>
+                </div>
+                <div>
+                    <span class="badge bg-success me-1" id="activityCompletedBadge">Завершено: 0</span>
+                    <button class="btn btn-sm btn-outline-dark" onclick="loadWarmupActivityLog()">
+                        <i class="bi bi-arrow-clockwise"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="card-body p-0" style="max-height: 400px; overflow-y: auto;" id="activityLogBody">
+                <div class="text-center text-muted py-3">
+                    <div class="spinner-border spinner-border-sm" role="status"></div> Загрузка...
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- AI Persona Settings Card -->
 <div class="row mb-4">
     <div class="col-12">
@@ -520,6 +547,39 @@
     </div>
 </div>
 
+<!-- Cookies Export/Import Modal -->
+<div class="modal fade" id="cookiesModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header bg-warning text-dark">
+                <h5 class="modal-title">🍪 Cookies — <span id="cookiesProfileName"></span></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <!-- Export -->
+                <h6><i class="bi bi-download"></i> Экспорт cookies профиля</h6>
+                <div class="mb-2">
+                    <button class="btn btn-sm btn-primary me-1" onclick="exportCookies('json')">📋 JSON</button>
+                    <button class="btn btn-sm btn-secondary me-1" onclick="exportCookies('base64')">🔐 Base64</button>
+                    <button class="btn btn-sm btn-outline-success" onclick="copyCookies()">📋 Копировать</button>
+                    <span class="ms-2 small" id="cookiesCount"></span>
+                </div>
+                <textarea class="form-control font-monospace mb-3" id="cookiesOutput" rows="8" readonly placeholder="Нажмите JSON или Base64 для экспорта cookies профиля"></textarea>
+
+                <hr>
+
+                <!-- Import -->
+                <h6><i class="bi bi-upload"></i> Импорт cookies в профиль</h6>
+                <p class="text-muted small mb-2">Вставьте сюда строку Cookies в base64 или JSON формате</p>
+                <textarea class="form-control font-monospace mb-2" id="cookiesImportArea" rows="5" placeholder='[{"domain":".yandex.ru","name":"yandexuid","value":"123...","path":"/","secure":true}]'></textarea>
+                <button class="btn btn-success" onclick="importCookies()"><i class="bi bi-upload"></i> Импортировать</button>
+
+                <div class="mt-2"><span id="cookiesStatus"></span></div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script>
 // Global state
 let currentPage = 1;
@@ -540,6 +600,10 @@ document.addEventListener('DOMContentLoaded', function() {
     // Process monitor: check every 2 minutes
     updateProcessMonitor();
     setInterval(updateProcessMonitor, 120000);
+
+    // Warmup activity log: refresh every 15 seconds
+    loadWarmupActivityLog();
+    setInterval(loadWarmupActivityLog, 15000);
 
     // Add event listeners for real-time filtering
     document.getElementById('searchProfiles').addEventListener('input', debounce(applyFilters, 500));
@@ -647,7 +711,10 @@ function updateProfilesTable(profiles) {
 
     tbody.innerHTML = profiles.map(profile => `
         <tr data-profile-id="${profile.id}">
-            <td><span class="badge bg-light text-dark">${profile.id}</span></td>
+            <td><span class="badge bg-light text-dawarning btn-sm" onclick="showCookies(${profile.id}, '${profile.name}')" title="Cookies">
+                        <i class="bi bi-cookie"></i> 🍪
+                    </button>
+                    <button class="btn btn-outline-rk">${profile.id}</span></td>
             <td><strong>${profile.name}</strong></td>
             <td><span class="badge bg-${getStatusColor(profile.status)}">${profile.status}</span></td>
             <td><small title="${profile.user_agent || 'Auto-generated'}">${
@@ -679,6 +746,9 @@ function updateProfilesTable(profiles) {
                     <button class="btn btn-outline-primary btn-sm" onclick="startWarmup(${profile.id})"
                             title="Start Warmup" ${profile.warmup_completed ? 'disabled' : ''}>
                         <i class="bi bi-play"></i>
+                    </button>
+                    <button class="btn btn-outline-warning btn-sm" onclick="showCookies(${profile.id}, '${profile.name}')" title="Cookies">
+                        <i class="bi bi-cookie"></i> 🍪
                     </button>
                     <button class="btn btn-outline-info btn-sm" onclick="editProfile(${profile.id})" title="Edit">
                         <i class="bi bi-pencil"></i>
@@ -1009,6 +1079,65 @@ function showMonitorNotification(type, message) {
     setTimeout(() => { if (notification.parentNode) notification.remove(); }, 6000);
 }
 
+// ── Warmup Activity Log ─────────────────────────────────────────────
+function loadWarmupActivityLog() {
+    fetch('/api/warmup-activity-log')
+        .then(r => r.json())
+        .then(data => renderWarmupActivityLog(data))
+        .catch(err => {
+            console.log('Activity log error:', err);
+            document.getElementById('activityLogBody').innerHTML =
+                '<div class="text-center text-muted py-3">Ошибка загрузки</div>';
+        });
+}
+
+function renderWarmupActivityLog(data) {
+    const body = document.getElementById('activityLogBody');
+    const activeCount = document.getElementById('activityActiveCount');
+    const completedBadge = document.getElementById('activityCompletedBadge');
+
+    activeCount.textContent = data.summary.active_tasks;
+    completedBadge.textContent = 'Завершено: ' + data.summary.recently_completed;
+
+    if (!data.events || data.events.length === 0) {
+        body.innerHTML = '<div class="text-center text-muted py-3"><i class="bi bi-pause-circle"></i> Нет активности прогрева</div>';
+        return;
+    }
+
+    let html = '<table class="table table-sm table-hover mb-0" style="font-size: 0.85rem;">';
+    html += '<thead class="table-light"><tr>';
+    html += '<th style="width:30px"></th><th>Профиль</th><th>Действие</th><th>Воркер</th><th style="width:90px">Время</th>';
+    html += '</tr></thead><tbody>';
+
+    for (const ev of data.events) {
+        const rowClass = ev.type === 'active' ? 'table-warning' : '';
+        const profileLabel = ev.profile_name || ('Profile-' + ev.profile_id);
+        const workerBadge = ev.worker
+            ? `<span class="badge bg-secondary">${ev.worker}</span>`
+            : '';
+
+        let timeCell = '';
+        if (ev.type === 'active') {
+            timeCell = ev.elapsed
+                ? `<span class="badge bg-warning text-dark"><i class="bi bi-clock"></i> ${ev.elapsed}</span>`
+                : '<span class="badge bg-warning text-dark spin-dot">●</span>';
+        } else {
+            timeCell = `<small class="text-muted">${ev.elapsed}</small>`;
+        }
+
+        html += `<tr class="${rowClass}">`;
+        html += `<td>${ev.icon}</td>`;
+        html += `<td><strong>${profileLabel}</strong> <small class="text-muted">#${ev.profile_id}</small></td>`;
+        html += `<td>${ev.message}</td>`;
+        html += `<td>${workerBadge}</td>`;
+        html += `<td>${timeCell}</td>`;
+        html += '</tr>';
+    }
+
+    html += '</tbody></table>';
+    body.innerHTML = html;
+}
+
 // ============================================================
 
 
@@ -1171,7 +1300,86 @@ function showEnhancedNotification(result) {
 
 function showWarmupStartedNotification(profileId) {
     const notification = document.createElement('div');
-    notification.className = 'alert alert-info alert-dismissible fade show position-fixed';
+ 
+
+// ===== Cookies Export / Import =====
+let _cookiesProfileId = null;
+
+function showCookies(profileId, profileName) {
+    _cookiesProfileId = profileId;
+    document.getElementById('cookiesProfileName').textContent = profileName || '#' + profileId;
+    document.getElementById('cookiesOutput').value = '';
+    document.getElementById('cookiesImportArea').value = '';
+    document.getElementById('cookiesStatus').textContent = '';
+    document.getElementById('cookiesCount').textContent = '';
+    new bootstrap.Modal(document.getElementById('cookiesModal')).show();
+}
+
+async function exportCookies(format) {
+    if (!_cookiesProfileId) return;
+    const statusEl = document.getElementById('cookiesStatus');
+    const outputEl = document.getElementById('cookiesOutput');
+    const countEl = document.getElementById('cookiesCount');
+    statusEl.textContent = 'Загрузка...';
+    statusEl.className = 'text-info';
+    outputEl.value = '';
+    try {
+        const resp = await fetch(`/api/profiles/${_cookiesProfileId}/cookies?format=${format}`);
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || 'Error');
+        countEl.textContent = `${data.cookies_count} cookies`;
+        if (format === 'base64') {
+            outputEl.value = data.cookies;
+        } else {
+            outputEl.value = JSON.stringify(data.cookies, null, 2);
+        }
+        statusEl.textContent = `✅ Экспортировано ${data.cookies_count} cookies (${format})`;
+        statusEl.className = 'text-success';
+    } catch(e) {
+        statusEl.textContent = '❌ ' + e.message;
+        statusEl.className = 'text-danger';
+    }
+}
+
+function copyCookies() {
+    const el = document.getElementById('cookiesOutput');
+    el.select();
+    document.execCommand('copy');
+    document.getElementById('cookiesStatus').textContent = '📋 Скопировано!';
+    document.getElementById('cookiesStatus').className = 'text-success';
+}
+
+async function importCookies() {
+    if (!_cookiesProfileId) return;
+    const input = document.getElementById('cookiesImportArea').value.trim();
+    const statusEl = document.getElementById('cookiesStatus');
+    if (!input) { statusEl.textContent = '⚠️ Вставьте cookies'; statusEl.className = 'text-warning'; return; }
+
+    let body = {};
+    // Detect format: starts with [ or { → JSON, otherwise → base64
+    if (input.startsWith('[') || input.startsWith('{')) {
+        body.cookies = input;
+    } else {
+        body.cookies_base64 = input;
+    }
+
+    statusEl.textContent = 'Импорт...';
+    statusEl.className = 'text-info';
+    try {
+        const resp = await fetch(`/api/profiles/${_cookiesProfileId}/cookies`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || 'Error');
+        statusEl.textContent = `✅ Импортировано ${data.imported_count} cookies`;
+        statusEl.className = 'text-success';
+    } catch(e) {
+        statusEl.textContent = '❌ ' + e.message;
+        statusEl.className = 'text-danger';
+    }
+}   notification.className = 'alert alert-info alert-dismissible fade show position-fixed';
     notification.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 400px;';
     notification.innerHTML = `
         <i class="bi bi-fire"></i>
@@ -1207,6 +1415,85 @@ function deleteProfile(profileId) {
 
 function editProfile(profileId) {
     alert('Edit functionality coming soon!');
+}
+
+// ===== Cookies Export / Import =====
+let _cookiesProfileId = null;
+
+function showCookies(profileId, profileName) {
+    _cookiesProfileId = profileId;
+    document.getElementById('cookiesProfileName').textContent = profileName || '#' + profileId;
+    document.getElementById('cookiesOutput').value = '';
+    document.getElementById('cookiesImportArea').value = '';
+    document.getElementById('cookiesStatus').textContent = '';
+    document.getElementById('cookiesCount').textContent = '';
+    new bootstrap.Modal(document.getElementById('cookiesModal')).show();
+}
+
+async function exportCookies(format) {
+    if (!_cookiesProfileId) return;
+    const statusEl = document.getElementById('cookiesStatus');
+    const outputEl = document.getElementById('cookiesOutput');
+    const countEl = document.getElementById('cookiesCount');
+    statusEl.textContent = 'Загрузка...';
+    statusEl.className = 'text-info';
+    outputEl.value = '';
+    try {
+        const resp = await fetch(`/api/profiles/${_cookiesProfileId}/cookies?format=${format}`);
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || 'Error');
+        countEl.textContent = `${data.cookies_count} cookies`;
+        if (format === 'base64') {
+            outputEl.value = data.cookies;
+        } else {
+            outputEl.value = JSON.stringify(data.cookies, null, 2);
+        }
+        statusEl.textContent = `✅ Экспортировано ${data.cookies_count} cookies (${format})`;
+        statusEl.className = 'text-success';
+    } catch(e) {
+        statusEl.textContent = '❌ ' + e.message;
+        statusEl.className = 'text-danger';
+    }
+}
+
+function copyCookies() {
+    const el = document.getElementById('cookiesOutput');
+    el.select();
+    document.execCommand('copy');
+    document.getElementById('cookiesStatus').textContent = '📋 Скопировано!';
+    document.getElementById('cookiesStatus').className = 'text-success';
+}
+
+async function importCookies() {
+    if (!_cookiesProfileId) return;
+    const input = document.getElementById('cookiesImportArea').value.trim();
+    const statusEl = document.getElementById('cookiesStatus');
+    if (!input) { statusEl.textContent = '⚠️ Вставьте cookies'; statusEl.className = 'text-warning'; return; }
+
+    let body = {};
+    // Detect format: starts with [ or { → JSON, otherwise → base64
+    if (input.startsWith('[') || input.startsWith('{')) {
+        body.cookies = input;
+    } else {
+        body.cookies_base64 = input;
+    }
+
+    statusEl.textContent = 'Импорт...';
+    statusEl.className = 'text-info';
+    try {
+        const resp = await fetch(`/api/profiles/${_cookiesProfileId}/cookies`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || 'Error');
+        statusEl.textContent = `✅ Импортировано ${data.imported_count} cookies`;
+        statusEl.className = 'text-success';
+    } catch(e) {
+        statusEl.textContent = '❌ ' + e.message;
+        statusEl.className = 'text-danger';
+    }
 }
 
 // --- Bulk progress listener (WebSocket) ---

@@ -7,6 +7,8 @@ import logging
 import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.header import Header
+from email.utils import formataddr
 from datetime import datetime, date
 
 from sqlalchemy.orm import Session
@@ -72,11 +74,23 @@ def send_email(
     try:
         msg = MIMEMultipart("alternative")
         from_display = sender_name or smtp_account.name or smtp_account.email
-        msg["From"] = f"{from_display} <{smtp_account.email}>"
+        msg["From"] = formataddr((str(Header(from_display, "utf-8")), smtp_account.email))
         msg["To"] = to_email
         msg["Subject"] = subject
+        msg["List-Unsubscribe"] = f"<mailto:{smtp_account.email}?subject=unsubscribe>"
+        msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+        msg["Precedence"] = "bulk"
 
-        # Plain text part
+        # Auto-generate plain text from HTML if not provided
+        if not body_text and body_html:
+            import html as _html
+            _tmp = re.sub(r'<br\s*/?>|</p>|</div>|</tr>|</li>', '\n', body_html)
+            _tmp = re.sub(r'<[^>]+>', '', _tmp)
+            body_text = _html.unescape(_tmp).strip()
+            # Collapse multiple blank lines
+            body_text = re.sub(r'\n{3,}', '\n\n', body_text)
+
+        # Plain text part (must go first in multipart/alternative)
         if body_text:
             msg.attach(MIMEText(body_text, "plain", "utf-8"))
 

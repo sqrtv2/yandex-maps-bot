@@ -1,0 +1,377 @@
+{% extends "base.html" %}
+
+{% block title %}Drop Domains — backorder.ru{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2">Drop Domains (backorder.ru)</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <div class="btn-group me-2">
+            <button type="button" class="btn btn-sm btn-success" onclick="importDomains()" id="btnImport">
+                <i class="bi bi-cloud-download"></i> Импорт CSV
+            </button>
+            <button type="button" class="btn btn-sm btn-primary" onclick="toggleCheck()" id="btnCheck">
+                <i class="bi bi-search"></i> Проверить на картах
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="loadAll()">
+                <i class="bi bi-arrow-clockwise"></i> Обновить
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Stats -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card bg-primary text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="statTotal">0</div>
+                        <div class="small">Всего доменов</div>
+                    </div>
+                    <div class="ms-auto"><i class="bi bi-globe h2"></i></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-info text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="statChecked">0</div>
+                        <div class="small">Проверено</div>
+                    </div>
+                    <div class="ms-auto"><i class="bi bi-check-circle h2"></i></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-success text-white">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="statFound">0</div>
+                        <div class="small">Найдено на картах</div>
+                    </div>
+                    <div class="ms-auto"><i class="bi bi-geo-alt h2"></i></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-warning text-dark">
+            <div class="card-body">
+                <div class="d-flex">
+                    <div>
+                        <div class="h5" id="statUnchecked">0</div>
+                        <div class="small">Не проверено</div>
+                    </div>
+                    <div class="ms-auto"><i class="bi bi-hourglass h2"></i></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Progress bar -->
+<div class="mb-3">
+    <div class="d-flex justify-content-between small text-muted mb-1">
+        <span id="progressLabel">Проверка: 0 / 0</span>
+        <span id="progressPercent">0%</span>
+    </div>
+    <div class="progress" style="height: 20px;">
+        <div class="progress-bar bg-success" id="progressFound" style="width:0%" title="Найдено на картах">0</div>
+        <div class="progress-bar bg-secondary" id="progressNotFound" style="width:0%" title="Не найдено">0</div>
+    </div>
+    <div class="d-flex justify-content-between small text-muted mt-1">
+        <span><span class="badge bg-success">&nbsp;</span> Найдено &nbsp; <span class="badge bg-secondary">&nbsp;</span> Не найдено &nbsp; <span class="badge bg-light text-dark border">&nbsp;</span> Осталось</span>
+        <span id="progressEta"></span>
+    </div>
+</div>
+
+<!-- Filters -->
+<div class="row mb-3">
+    <div class="col-md-3">
+        <select class="form-select form-select-sm" id="filterChecked">
+            <option value="">Все</option>
+            <option value="false">Не проверено</option>
+            <option value="true">Проверено</option>
+        </select>
+    </div>
+    <div class="col-md-3">
+        <select class="form-select form-select-sm" id="filterMaps">
+            <option value="">Все результаты</option>
+            <option value="true">Найдено на картах</option>
+            <option value="false">Не найдено</option>
+        </select>
+    </div>
+    <div class="col-md-3">
+        <select class="form-select form-select-sm" id="filterBatch">
+            <option value="">Все батчи</option>
+        </select>
+    </div>
+    <div class="col-md-3">
+        <input type="text" class="form-control form-control-sm" id="filterSearch" placeholder="Поиск по домену...">
+    </div>
+</div>
+
+<!-- Table -->
+<div class="table-responsive">
+    <table class="table table-sm table-hover" id="domainsTable">
+        <thead class="table-dark">
+            <tr>
+                <th>#</th>
+                <th>Домен</th>
+                <th>Hotness</th>
+                <th>Цена</th>
+                <th>TIC</th>
+                <th>Линки</th>
+                <th>Возр.</th>
+                <th>Удал.</th>
+                <th>Карты</th>
+                <th>Категория</th>
+                <th>Город</th>
+                <th>Рейт.</th>
+                <th>Отз.</th>
+                <th>⭐</th>
+            </tr>
+        </thead>
+        <tbody id="domainsBody">
+            <tr><td colspan="14" class="text-center text-muted">Загрузка...</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<!-- Pagination -->
+<nav class="d-flex justify-content-between align-items-center mt-2">
+    <div class="text-muted small" id="pageInfo">—</div>
+    <ul class="pagination pagination-sm mb-0" id="pagination"></ul>
+</nav>
+
+<div id="statusMsg" class="mt-2 text-muted small"></div>
+
+<script>
+let currentPage = 1;
+let totalPages = 1;
+let searchTimer = null;
+
+async function loadAll() {
+    await Promise.all([loadStats(), loadDomains()]);
+}
+
+let checkRunning = false;
+
+async function loadStats() {
+    try {
+        const r = await fetch('/api/drop-domains/stats');
+        const d = await r.json();
+        document.getElementById('statTotal').textContent = d.total;
+        document.getElementById('statChecked').textContent = d.checked;
+        document.getElementById('statFound').textContent = d.found_on_maps;
+        document.getElementById('statUnchecked').textContent = d.unchecked;
+
+        // Update running state
+        checkRunning = d.running || false;
+        updateCheckButton();
+
+        // Progress bar
+        const total = d.total || 1;
+        const checked = d.checked || 0;
+        const found = d.found_on_maps || 0;
+        const notFound = checked - found;
+        const pctFound = (found / total * 100).toFixed(1);
+        const pctNotFound = (notFound / total * 100).toFixed(1);
+        const pctTotal = (checked / total * 100).toFixed(1);
+        document.getElementById('progressFound').style.width = pctFound + '%';
+        document.getElementById('progressFound').textContent = found > 0 ? found : '';
+        document.getElementById('progressNotFound').style.width = pctNotFound + '%';
+        document.getElementById('progressNotFound').textContent = notFound > 0 ? notFound : '';
+        document.getElementById('progressLabel').textContent = `Проверка: ${checked} / ${d.total}`;
+        document.getElementById('progressPercent').textContent = pctTotal + '%';
+        // ETA estimate
+        if (d.unchecked > 0 && checked > 0) {
+            const rate = 15; // ~15 domains/min with 8 workers
+            const minsLeft = Math.ceil(d.unchecked / rate);
+            const hrs = Math.floor(minsLeft / 60);
+            const mins = minsLeft % 60;
+            document.getElementById('progressEta').textContent = `~${hrs}ч ${mins}м осталось`;
+        } else if (d.unchecked === 0) {
+            document.getElementById('progressEta').textContent = 'Готово!';
+        } else {
+            document.getElementById('progressEta').textContent = '';
+        }
+
+        const sel = document.getElementById('filterBatch');
+        const cur = sel.value;
+        sel.innerHTML = '<option value="">Все батчи</option>';
+        (d.batches || []).forEach(b => {
+            sel.innerHTML += `<option value="${b.date}">${b.date} (${b.count})</option>`;
+        });
+        sel.value = cur;
+    } catch(e) { console.error('Stats error', e); }
+}
+
+async function loadDomains(page) {
+    if (page) currentPage = page;
+    try {
+        const params = new URLSearchParams();
+        const checked = document.getElementById('filterChecked').value;
+        const maps = document.getElementById('filterMaps').value;
+        const batch = document.getElementById('filterBatch').value;
+        const search = document.getElementById('filterSearch').value.trim();
+        if (checked) params.set('checked', checked);
+        if (maps) params.set('maps_found', maps);
+        if (batch) params.set('batch_date', batch);
+        if (search) params.set('search', search);
+        params.set('page', currentPage);
+        params.set('per_page', 100);
+
+        const r = await fetch('/api/drop-domains?' + params.toString());
+        const data = await r.json();
+        totalPages = data.pages || 1;
+        renderTable(data.items || [], data.total, data.page, data.per_page);
+        renderPagination(data.page, data.pages, data.total);
+    } catch(e) { console.error('Load error', e); }
+}
+
+function renderTable(domains, total, page, perPage) {
+    const tbody = document.getElementById('domainsBody');
+    if (!domains.length) {
+        tbody.innerHTML = '<tr><td colspan="14" class="text-center text-muted">Нет доменов</td></tr>';
+        document.getElementById('pageInfo').textContent = '0 доменов';
+        return;
+    }
+    const offset = ((page || 1) - 1) * (perPage || 100);
+    tbody.innerHTML = domains.map((d, i) => {
+        const hotBadge = d.hotness >= 3 ? 'bg-danger' : d.hotness >= 2 ? 'bg-warning text-dark' : 'bg-secondary';
+        const mapsBadge = d.maps_checked ? (d.maps_found ? '<span class="badge bg-success">Да</span>' : '<span class="badge bg-secondary">Нет</span>') : '<span class="badge bg-light text-dark">—</span>';
+        const star = d.is_interesting ? '⭐' : '';
+        return `<tr class="${d.is_interesting ? 'table-warning' : ''}">
+            <td>${offset + i + 1}</td>
+            <td><a href="https://${d.domain}" target="_blank" class="text-decoration-none">${d.domain}</a></td>
+            <td><span class="badge ${hotBadge}">${d.hotness}</span></td>
+            <td>${d.price ? d.price.toLocaleString() + '₽' : '—'}</td>
+            <td>${d.yandex_tic || '—'}</td>
+            <td>${d.links || '—'}</td>
+            <td>${d.domain_age || '—'}</td>
+            <td>${d.delete_date || '—'}</td>
+            <td>${mapsBadge}</td>
+            <td>${d.maps_category || '—'}</td>
+            <td>${d.maps_city || '—'}</td>
+            <td>${d.maps_rating ? d.maps_rating.toFixed(1) : '—'}</td>
+            <td>${d.maps_reviews || '—'}</td>
+            <td><button class="btn btn-sm btn-link p-0" onclick="toggleStar(${d.id})">${star || '☆'}</button></td>
+        </tr>`;
+    }).join('');
+}
+
+function renderPagination(page, pages, total) {
+    const info = document.getElementById('pageInfo');
+    info.textContent = `Стр. ${page} из ${pages} (${total} доменов)`;
+    const ul = document.getElementById('pagination');
+    if (pages <= 1) { ul.innerHTML = ''; return; }
+    let html = '';
+    html += `<li class="page-item ${page <= 1 ? 'disabled' : ''}"><a class="page-link" href="#" onclick="loadDomains(${page-1});return false">‹</a></li>`;
+    // Show pages around current
+    let start = Math.max(1, page - 3);
+    let end = Math.min(pages, page + 3);
+    if (start > 1) html += `<li class="page-item"><a class="page-link" href="#" onclick="loadDomains(1);return false">1</a></li><li class="page-item disabled"><span class="page-link">…</span></li>`;
+    for (let p = start; p <= end; p++) {
+        html += `<li class="page-item ${p === page ? 'active' : ''}"><a class="page-link" href="#" onclick="loadDomains(${p});return false">${p}</a></li>`;
+    }
+    if (end < pages) html += `<li class="page-item disabled"><span class="page-link">…</span></li><li class="page-item"><a class="page-link" href="#" onclick="loadDomains(${pages});return false">${pages}</a></li>`;
+    html += `<li class="page-item ${page >= pages ? 'disabled' : ''}"><a class="page-link" href="#" onclick="loadDomains(${page+1});return false">›</a></li>`;
+    ul.innerHTML = html;
+}
+
+// Debounced search
+document.getElementById('filterSearch').addEventListener('input', function() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { currentPage = 1; loadDomains(); }, 400);
+});
+// Reset page on filter change
+document.querySelectorAll('#filterChecked,#filterMaps,#filterBatch').forEach(el => {
+    el.addEventListener('change', () => { currentPage = 1; loadDomains(); });
+});
+
+async function importDomains() {
+    const btn = document.getElementById('btnImport');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Загрузка...';
+    document.getElementById('statusMsg').textContent = 'Скачивание CSV с backorder.ru...';
+    try {
+        const r = await fetch('/api/drop-domains/import', {method: 'POST'});
+        const d = await r.json();
+        if (r.ok) {
+            document.getElementById('statusMsg').textContent = `Импорт: ${d.imported} доменов, пропущено: ${d.skipped}, батч: ${d.batch_date}`;
+            loadAll();
+        } else {
+            document.getElementById('statusMsg').textContent = 'Ошибка: ' + (d.detail || 'unknown');
+        }
+    } catch(e) {
+        document.getElementById('statusMsg').textContent = 'Ошибка сети: ' + e.message;
+    }
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-cloud-download"></i> Импорт CSV';
+}
+
+function updateCheckButton() {
+    const btn = document.getElementById('btnCheck');
+    if (checkRunning) {
+        btn.className = 'btn btn-sm btn-danger';
+        btn.innerHTML = '<i class="bi bi-stop-circle"></i> Остановить проверку';
+    } else {
+        btn.className = 'btn btn-sm btn-primary';
+        btn.innerHTML = '<i class="bi bi-search"></i> Проверить на картах';
+    }
+}
+
+async function toggleCheck() {
+    if (checkRunning) {
+        await stopCheck();
+    } else {
+        await startCheck();
+    }
+}
+
+async function startCheck() {
+    try {
+        const r = await fetch('/api/drop-domains/check', {method: 'POST'});
+        const d = await r.json();
+        document.getElementById('statusMsg').textContent = d.message || 'Check started';
+        checkRunning = true;
+        updateCheckButton();
+        loadStats();
+    } catch(e) {
+        document.getElementById('statusMsg').textContent = 'Error: ' + e.message;
+    }
+}
+
+async function stopCheck() {
+    try {
+        const r = await fetch('/api/drop-domains/stop', {method: 'POST'});
+        const d = await r.json();
+        document.getElementById('statusMsg').textContent = d.message || 'Stopped';
+        checkRunning = false;
+        updateCheckButton();
+    } catch(e) {
+        document.getElementById('statusMsg').textContent = 'Error: ' + e.message;
+    }
+}
+
+async function toggleStar(id) {
+    try {
+        await fetch(`/api/drop-domains/${id}/toggle-interesting`, {method: 'POST'});
+        loadDomains();
+    } catch(e) { console.error(e); }
+}
+
+// Load on page ready
+loadAll();
+// Auto-refresh stats every 30s to update progress bar
+setInterval(loadStats, 30000);
+</script>
+{% endblock %}

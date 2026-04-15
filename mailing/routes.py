@@ -418,3 +418,19 @@ async def get_available_filters(db: Session = Depends(get_db)):
         'regions': sorted([r[0] for r in regions if r[0]]),
         'categories': sorted([c[0] for c in categories if c[0]]),
     }
+
+
+@router.get("/api/mailing/default-template")
+async def get_default_template():
+    """Return the default email template for new campaigns."""
+    import os
+    template_path = os.path.join(os.path.dirname(__file__), "default_template.html")
+    body_html = ""
+    if os.path.exists(template_path):
+        with open(template_path, "r", encoding="utf-8") as f:
+            body_html = f.read()
+    return {
+        "body_html": body_html,
+        "subject": "Предложение для {company_name}",
+        "sender_name": "Анатолий",
+    }

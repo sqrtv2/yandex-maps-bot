@@ -80,7 +80,7 @@ def _update_task_log(profile_id: int, target_url: str, message: str, status: str
 logger = logging.getLogger(__name__)
 
 
-@shared_task(base=BaseTask, bind=True, max_retries=2, default_retry_delay=30, soft_time_limit=180, time_limit=210)
+@shared_task(base=BaseTask, bind=True, max_retries=2, default_retry_delay=30, soft_time_limit=420, time_limit=480)
 def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit_parameters: Dict = None, task_id: int = None):
     """
     Visit a Yandex Maps profile and perform realistic interactions.
@@ -94,6 +94,10 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
     browser_manager = None
     browser_id = None
     _profile_dir_for_cleanup = None  # Track profile dir for cleanup even if browser_id is None
+
+    # Immediately mark task as in_progress so the scheduler doesn't think it's stuck pending
+    if task_id:
+        _update_task_log(profile_id, target_url, f"⏳ Задача принята воркером", status='in_progress', task_id=task_id)
 
     try:
         # Validate parameters
@@ -152,7 +156,7 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
             db.commit()
 
         logger.info(f"Starting Yandex Maps visit for profile {profile_id}: {target_url}")
-        _update_task_log(profile_id, target_url, f"🚀 Запуск визита профилем {profile_data_from_db['name']}", status='in_progress', task_id=task_id)
+        _update_task_log(profile_id, target_url, f"🚀 Запуск визита профилем {profile_data_from_db['name']}", task_id=task_id)
 
         # Initialize managers
         browser_manager = BrowserManager()
@@ -385,20 +389,6 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
         logger.error(f"Error visiting Yandex Maps profile {profile_id}: {e}")
         _update_task_log(profile_id, target_url, f"❌ Ошибка: {str(e)[:200]}", status='failed', error=str(e)[:500], task_id=task_id)
         
-        # Update target failure stats
-        try:
-            with get_db_session() as db:
-                from app.models import YandexMapTarget
-                target_obj = db.query(YandexMapTarget).filter(YandexMapTarget.url == target_url).first()
-                if target_obj:
-                    target_obj.total_visits = (target_obj.total_visits or 0) + 1
-                    target_obj.failed_visits = (target_obj.failed_visits or 0) + 1
-                    target_obj.today_visits = (target_obj.today_visits or 0) + 1
-                    target_obj.today_failed = (target_obj.today_failed or 0) + 1
-                    db.commit()
-        except:
-            pass
-
         # Update profile with failure
         try:
             with get_db_session() as db:
@@ -450,6 +440,20 @@ def visit_yandex_maps_profile_task(self, profile_id: int, target_url: str, visit
         if not is_resource_error and self.request.retries < self.max_retries:
             # Use different proxy on retry
             raise self.retry(exc=e)
+
+        # Final failure (no more retries) — update target failure stats
+        try:
+            with get_db_session() as db:
+                from app.models import YandexMapTarget
+                target_obj = db.query(YandexMapTarget).filter(YandexMapTarget.url == target_url).first()
+                if target_obj:
+                    target_obj.total_visits = (target_obj.total_visits or 0) + 1
+                    target_obj.failed_visits = (target_obj.failed_visits or 0) + 1
+                    target_obj.today_visits = (target_obj.today_visits or 0) + 1
+                    target_obj.today_failed = (target_obj.today_failed or 0) + 1
+                    db.commit()
+        except:
+            pass
 
         raise e
 
@@ -786,16 +790,16 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidos
         return False
 
 
-def _solve_showcaptcha_fast(driver, max_wait: int = 20) -> bool:
+def _solve_showcaptcha_fast(driver, max_wait: int = 45) -> bool:
     """Handle Yandex showcaptchaFAST — a JS-only captcha with no checkbox/form.
     
     showcaptchaFAST pages have NO <body>, NO form, NO checkbox. They load
     tmgrdfrend.fp.js which collects browser fingerprint, computes PoW, and
     auto-submits a form via JS. The page auto-redirects to the original search
-    results after PoW completes (typically 5-15 seconds).
+    results after PoW completes (typically 5-15 seconds, but can take up to 37s).
     
     Strategy: Just wait for the JS to complete and redirect. No interaction needed.
-    Wait reduced to 20s — if PoW fingerprint is rejected it won't pass even with more time.
+    Wait set to 45s — PoW computation on slow proxies can take up to 37 seconds.
     """
     logger.info("🚀 showcaptchaFAST detected — waiting for JS auto-redirect (no checkbox needed)...")
     

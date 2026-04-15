@@ -166,7 +166,7 @@ def check_credentials(username: str, password: str) -> bool:
 
 
 # Public paths that don't require auth
-PUBLIC_PATHS = {"/login", "/health", "/api/health"}
+PUBLIC_PATHS = {"/login", "/health", "/api/health", "/api/warmup-health"}
 
 
 def requires_auth(request: Request) -> Optional[RedirectResponse]:

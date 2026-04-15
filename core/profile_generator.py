@@ -558,7 +558,7 @@ class ProfileGenerator:
 
                 # Advanced settings
                 "hardware_concurrency": random.choice([4, 6, 8]) if is_mobile else random.choice([2, 4, 6, 8, 12, 16]),
-                "device_memory": random.choice([4, 6, 8]) if is_mobile else random.choice([2, 4, 8, 16, 32]),
+                "device_memory": random.choice([4, 6, 8]) if is_mobile else random.choice([4, 8, 16]),
                 "max_touch_points": random.choice([5, 10]) if is_mobile else 0,
 
                 # Chrome-specific settings

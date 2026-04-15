@@ -74,6 +74,10 @@ class Settings(BaseSettings):
             'task_acks_late': True,
         }
 
+    # Telegram alerts (optional — for warmup watchdog notifications)
+    telegram_bot_token: str = Field(default="", description="Telegram bot token for alerts")
+    telegram_chat_id: str = Field(default="", description="Telegram chat/user ID for alerts")
+
     # Security
     secret_key: str = Field(
         default="your-secret-key-change-this-in-production",

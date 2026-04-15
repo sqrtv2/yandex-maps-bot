@@ -33,12 +33,28 @@ celery_app.conf.update(
         'tasks.yandex_search.schedule_search_visits': {'queue': 'yandex_search'},
         'tasks.yandex_search.daily_search_stats_reset': {'queue': 'yandex_search'},
         'tasks.yandex_scheduler.queue_watchdog': {'queue': 'yandex_search'},
+        # Maps scheduler/maintenance run fast (<1s) — route to dedicated
+        # 'maps_scheduler' queue that maps worker also listens on, so they
+        # execute immediately without competing with warmup/search queues.
+        'tasks.yandex_maps.schedule_visits': {'queue': 'maps_scheduler'},
+        'tasks.yandex_maps.daily_stats_reset': {'queue': 'maps_scheduler'},
+        'tasks.yandex_maps.cleanup_used_profiles': {'queue': 'maps_scheduler'},
+        # Warmup schedulers/maintenance go to 'default' so they don't get stuck
+        # behind thousands of warmup_profile_task entries
+        'tasks.warmup.auto_schedule_initial_warmup': {'queue': 'default'},
+        'tasks.warmup.auto_maintain_profile_pool': {'queue': 'default'},
+        'tasks.warmup.periodic_rewarmup': {'queue': 'default'},
+        'tasks.warmup.auto_fix_stuck_processes': {'queue': 'default'},
+        'tasks.warmup.cleanup_orphaned_chrome_processes': {'queue': 'default'},
+        'tasks.warmup.warmup_watchdog': {'queue': 'default'},
+        'tasks.warmup.generate_warmup_sites_task': {'queue': 'default'},
         'tasks.warmup.*': {'queue': 'warmup'},
         'tasks.yandex_maps.*': {'queue': 'yandex_maps'},
         'tasks.yandex_search.*': {'queue': 'yandex_search'},
         'tasks.proxy.*': {'queue': 'proxy'},
         'tasks.maintenance.*': {'queue': 'maintenance'},
         'tasks.parser.*': {'queue': 'parser'},
+        'tasks.drop_domains.*': {'queue': 'drop_domains'},
     },
 
     # Worker settings
@@ -106,7 +122,7 @@ celery_app.conf.update(
         },
         'yandex-search-scheduler': {
             'task': 'tasks.yandex_search.schedule_search_visits',
-            'schedule': crontab(minute='*/5'),
+            'schedule': crontab(minute='*/1'),
         },
         'yandex-search-daily-stats-reset': {
             'task': 'tasks.yandex_search.daily_search_stats_reset',
@@ -122,11 +138,15 @@ celery_app.conf.update(
         },
         'cleanup-orphaned-chrome': {
             'task': 'tasks.warmup.cleanup_orphaned_chrome_processes',
-            'schedule': crontab(minute='*/10'),
+            'schedule': crontab(minute='*/2'),
         },
         'auto-maintain-profile-pool': {
             'task': 'tasks.warmup.auto_maintain_profile_pool',
             'schedule': crontab(minute='*/5'),
+        },
+        'warmup-watchdog': {
+            'task': 'tasks.warmup.warmup_watchdog',
+            'schedule': crontab(minute='*/3'),
         },
     }
 )
@@ -139,7 +159,9 @@ celery_app.autodiscover_tasks([
     'tasks.yandex_search',
     'tasks.proxy',
     'tasks.maintenance',
+    'tasks.drop_domains',
     'parser',
+    'mailing',
 ])
 
 
@@ -204,6 +226,14 @@ def _reseed_random_on_fork(**kwargs):
     # NOTE: Do NOT clean SingletonLock files here — other workers may have active browsers.
     # Lock files are cleaned per-profile in BrowserManager.create_browser_session() instead.
 
+    # Clean up orphaned Chrome/node-driver from dead workers.
+    # This is SAFE: only kills processes whose parent worker is no longer alive.
+    try:
+        from core.browser_manager import cleanup_orphaned_chrome
+        cleanup_orphaned_chrome()
+    except Exception as e:
+        logger.warning("⚠️ Failed to cleanup orphaned chrome on fork: %s", e)
+
 
 @signals.worker_process_shutdown.connect
 def _cleanup_playwright_on_process_exit(**kwargs):
@@ -251,15 +281,13 @@ def _reap_zombies_after_task(**kwargs):
         pass
     except Exception:
         pass
-    # Periodically clean up truly orphaned Chrome (every ~20 tasks)
-    # Uses the SAFE version that only kills Chrome with no live parent worker
-    import random
-    if random.random() < 0.05:
-        try:
-            from core.browser_manager import cleanup_orphaned_chrome
-            cleanup_orphaned_chrome()
-        except Exception:
-            pass
+    # Clean up orphaned Chrome after every task completion.
+    # Uses the SAFE version that only kills Chrome with no live parent worker.
+    try:
+        from core.browser_manager import cleanup_orphaned_chrome
+        cleanup_orphaned_chrome()
+    except Exception:
+        pass
 
 
 @signals.task_failure.connect

@@ -175,15 +175,27 @@
                             </a>
                         </li>
                         <li class="nav-item">
-                            <a class="nav-link {% if 'domains' in request.url.path %}active{% endif %}" href="/domains">
+                            <a class="nav-link {% if 'domains' in request.url.path and 'drop' not in request.url.path %}active{% endif %}" href="/domains">
                                 <i class="bi bi-globe"></i>
                                 Domain Management
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if 'drop-domains' in request.url.path %}active{% endif %}" href="/drop-domains">
+                                <i class="bi bi-lightning"></i>
+                                Drop Domains
                             </a>
                         </li>
                         <li class="nav-item">
                             <a class="nav-link {% if 'parser' in request.url.path %}active{% endif %}" href="/parser">
                                 <i class="bi bi-building"></i>
                                 Парсер компаний
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if 'mailing' in request.url.path %}active{% endif %}" href="/mailing">
+                                <i class="bi bi-envelope-paper"></i>
+                                Email рассылка
                             </a>
                         </li>
                     </ul>

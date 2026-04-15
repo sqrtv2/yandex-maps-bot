@@ -31,9 +31,9 @@ def _cleanup_stale_yandex_visit_tasks():
             now = datetime.utcnow()
             fixed = 0
             
-            # In-progress yandex_visit tasks older than 7 minutes are stuck
-            # (hard time_limit is 210s = 3.5 min, so 7 min is generous)
-            stale_threshold = timedelta(minutes=7)
+            # In-progress yandex_visit tasks older than 12 minutes are stuck
+            # (hard time_limit is 480s = 8 min, so 12 min is generous)
+            stale_threshold = timedelta(minutes=12)
             stale_in_progress = db.query(Task).filter(
                 Task.task_type == 'yandex_visit',
                 Task.status == 'in_progress',
@@ -43,7 +43,7 @@ def _cleanup_stale_yandex_visit_tasks():
             
             for t in stale_in_progress:
                 t.status = 'failed'
-                t.error_message = t.error_message or 'Автоматически отменена: задача зависла (>7 мин, вероятно OOM-kill)'
+                t.error_message = t.error_message or 'Автоматически отменена: задача зависла (>12 мин, вероятно OOM-kill)'
                 t.completed_at = now
                 t.add_log('🧹 Автоочистка: задача зависла в in_progress (Chrome/worker убит OOM)')
                 fixed += 1
@@ -93,14 +93,22 @@ def schedule_yandex_visits():
 
     logger.info("🔄 Starting Yandex Maps visit scheduler")
     
-    # Don't flood the queue — check how many tasks are already queued
+    # Don't flood the queue — check how many tasks are pending/in_progress in DB
+    # (Redis llen misses tasks with countdown that haven't entered the queue yet)
+    MAX_PENDING_TASKS = 6  # concurrency=2, ~5-7 min per task → 6 is ~2 cycles buffer
+    pending_task_count = 0
     try:
-        queue_len = r.llen('yandex_maps') or 0
-        if queue_len > 20:
-            logger.warning(f"⏭️ Yandex Maps queue already has {queue_len} tasks, skipping scheduling")
-            return {'status': 'skipped', 'reason': f'queue_full ({queue_len})', 'scheduled': 0}
+        with get_db_session() as _db:
+            pending_task_count = _db.query(Task).filter(
+                Task.task_type == 'yandex_visit',
+                Task.status.in_(['pending', 'in_progress'])
+            ).count()
+        if pending_task_count >= MAX_PENDING_TASKS:
+            logger.info(f"⏭️ Already {pending_task_count} pending/in_progress yandex_visit tasks (max {MAX_PENDING_TASKS}), skipping")
+            return {'status': 'skipped', 'reason': f'pending_full ({pending_task_count})', 'scheduled': 0}
+        logger.info(f"📊 {pending_task_count} pending/in_progress tasks (max {MAX_PENDING_TASKS})")
     except Exception as qe:
-        logger.warning(f"Could not check queue length: {qe}")
+        logger.warning(f"Could not check pending task count: {qe}")
     
     try:
         with get_db_session() as db:
@@ -206,11 +214,16 @@ def schedule_yandex_visits():
                     if target.is_action_enabled('map'):
                         visit_params['actions'].append('view_map')
                     
-                    # Schedule concurrent visits
+                    # Schedule concurrent visits, respecting global capacity
+                    remaining_capacity = MAX_PENDING_TASKS - pending_task_count - scheduled_count
+                    if remaining_capacity <= 0:
+                        logger.info(f"⏭️ Global task capacity reached ({scheduled_count} scheduled this round), stopping")
+                        break
                     concurrent_visits = min(
                         visits_to_schedule,
                         target.concurrent_visits,
-                        len(available_profiles)
+                        len(available_profiles),
+                        remaining_capacity
                     )
                     
                     # Shuffle available profiles so we pick different ones each time
@@ -226,10 +239,6 @@ def schedule_yandex_visits():
                         # Mark this profile as used so no other target picks it
                         used_profile_ids_this_round.add(profile.id)
                         
-                        # Spread visits across the entire 5-minute window (0-280s)
-                        # so they don't all start at once — looks more natural
-                        delay_seconds = random.randint(0, 280)
-                        
                         # Create Task record for UI visibility
                         task_record = Task(
                             name=f"Visit {target.title}",
@@ -242,18 +251,18 @@ def schedule_yandex_visits():
                         db.flush()  # get task_record.id
                         
                         # Schedule the visit task with task_id for log tracking
+                        # No countdown — tasks with countdown get lost when
+                        # worker forks restart (max-tasks-per-child=2)
                         visit_yandex_maps_profile_task.apply_async(
                             args=[profile.id, target.url, visit_params],
                             kwargs={'task_id': task_record.id},
-                            countdown=delay_seconds,
                             queue='yandex_maps'
                         )
                         
                         scheduled_count += 1
                         logger.info(
                             f"✅ Scheduled visit #{i+1}/{concurrent_visits} "
-                            f"for {target.title} using profile {profile.id} "
-                            f"(delay: {delay_seconds}s)"
+                            f"for {target.title} using profile {profile.id}"
                         )
                     
                     # Update target's last scheduled time (will be committed when task succeeds)
@@ -644,15 +653,16 @@ def queue_watchdog():
 
         # --- 1. Check all queues ---
         queues_to_watch = ['yandex_maps', 'yandex_search', 'default', 'warmup']
-        # Warmup tasks are slow (~25 min each) so large queue is normal — never purge
-        queues_skip_purge = {'warmup'}
+        # Warmup queue: allow larger backlog but still purge if unreasonably large
+        WARMUP_QUEUE_MAX = 200  # 20 workers × ~10 tasks ahead = reasonable buffer
         for queue_name in queues_to_watch:
             qlen = r.llen(queue_name) or 0
             results[f'queue_{queue_name}'] = qlen
 
-            if qlen > QUEUE_MAX and queue_name not in queues_skip_purge:
+            max_for_queue = WARMUP_QUEUE_MAX if queue_name == 'warmup' else QUEUE_MAX
+            if qlen > max_for_queue:
                 logger.warning(
-                    f"🚨 Queue '{queue_name}' overflow: {qlen} tasks (max {QUEUE_MAX}). Purging..."
+                    f"🚨 Queue '{queue_name}' overflow: {qlen} tasks (max {max_for_queue}). Purging..."
                 )
                 r.delete(queue_name)
                 results[f'purged_{queue_name}'] = qlen

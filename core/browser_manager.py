@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 # Shared Playwright instance (reused across BrowserManager instances within the same process)
 _playwright_instance: Optional[Playwright] = None
 
+# Directory for proxy auth Chrome extensions (one per proxy, reused across sessions)
+_PROXY_AUTH_EXT_DIR = os.path.join(tempfile.gettempdir(), 'pw_proxy_auth_extensions')
+
 
 def _get_playwright() -> Playwright:
     """Get or create the shared Playwright instance."""
@@ -38,6 +41,66 @@ def _get_playwright() -> Playwright:
         _playwright_instance = sync_playwright().start()
         logger.info("✅ Playwright instance started")
     return _playwright_instance
+
+
+def _create_proxy_auth_extension(host: str, port: str, username: str, password: str) -> str:
+    """Create a Chrome extension that handles proxy authentication.
+    
+    Some proxies respond to unauthenticated CONNECT with 407 + Connection:close,
+    which breaks Playwright's Fetch-based auth (can't retry on closed connection).
+    This extension uses chrome.webRequest.onAuthRequired to provide credentials
+    natively, bypassing the issue entirely.
+    
+    Returns the path to the extension directory (reused if already exists for same proxy).
+    """
+    import hashlib
+    ext_id = hashlib.md5(f"{host}:{port}:{username}".encode()).hexdigest()[:12]
+    ext_dir = os.path.join(_PROXY_AUTH_EXT_DIR, f"proxy_auth_{ext_id}")
+    
+    manifest_path = os.path.join(ext_dir, "manifest.json")
+    bg_path = os.path.join(ext_dir, "background.js")
+    
+    # Reuse existing extension if it already exists
+    if os.path.exists(manifest_path) and os.path.exists(bg_path):
+        return ext_dir
+    
+    os.makedirs(ext_dir, exist_ok=True)
+    
+    manifest = {
+        "version": "1.0.0",
+        "manifest_version": 2,
+        "name": "Proxy Auth Helper",
+        "permissions": ["proxy", "webRequest", "webRequestBlocking", "<all_urls>"],
+        "background": {"scripts": ["background.js"]},
+        "minimum_chrome_version": "76.0.0"
+    }
+    
+    # Escape special chars in credentials for JS string literals
+    safe_user = username.replace("\\", "\\\\").replace("'", "\\'")
+    safe_pass = password.replace("\\", "\\\\").replace("'", "\\'")
+    
+    background_js = f"""
+chrome.webRequest.onAuthRequired.addListener(
+    function(details) {{
+        return {{
+            authCredentials: {{
+                username: '{safe_user}',
+                password: '{safe_pass}'
+            }}
+        }};
+    }},
+    {{urls: ['<all_urls>']}},
+    ['blocking']
+);
+""".strip()
+    
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2)
+    with open(bg_path, 'w') as f:
+        f.write(background_js)
+    
+    logger.info(f"🔐 Created proxy auth extension at {ext_dir}")
+    return ext_dir
 
 
 def _kill_process_tree(pid: int):
@@ -69,63 +132,108 @@ def _kill_process_tree(pid: int):
 
 
 def cleanup_orphaned_chrome():
-    """Kill only truly orphaned Chrome processes (whose Playwright driver parent is dead).
+    """Kill Chrome processes whose owning Celery worker is dead.
     
-    SAFE: Does NOT kill Chrome processes that are actively used by other workers.
-    Only kills Chrome processes whose parent Node.js driver (or Celery worker) no longer exists.
+    When a ForkPoolWorker is SIGKILL'd, its Playwright node-driver and Chrome
+    children survive (reparented to celery main process or init). This function
+    detects them by checking the full parent chain:
+      Chrome → node-driver → ???
+    If the chain leads to a LIVE ForkPoolWorker, Chrome is active.
+    If it leads to the celery MainProcess, init, or a dead PID — it's orphaned.
     """
     killed = 0
     try:
-        # Find all Chrome processes and check if their parent chain includes a live Celery worker
-        for pid_dir in os.listdir('/proc'):
-            if not pid_dir.isdigit():
-                continue
-            pid = int(pid_dir)
+        import psutil
+        
+        # Build set of live ForkPoolWorker PIDs
+        live_worker_pids = set()
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
-                cmdline_path = f'/proc/{pid}/cmdline'
-                with open(cmdline_path, 'r') as f:
-                    cmdline = f.read()
-                if 'chrom' not in cmdline.lower():
-                    continue
-                # This is a Chrome process. Check if its parent chain leads to a live process.
-                # Walk up the parent tree: chrome → node (playwright driver) → python (celery worker)
-                ppid = pid
-                is_orphan = True
-                for _ in range(5):  # max 5 levels up
-                    try:
-                        with open(f'/proc/{ppid}/stat', 'r') as f:
-                            stat = f.read()
-                        ppid = int(stat.split(')')[1].split()[1])  # PPID field
-                        if ppid <= 1:
-                            # Parent is init/docker-init — this process is orphaned
-                            is_orphan = True
-                            break
-                        # Check if parent is a Celery worker or Node.js driver
-                        with open(f'/proc/{ppid}/cmdline', 'r') as f:
-                            parent_cmd = f.read()
-                        if 'celery' in parent_cmd.lower():
-                            is_orphan = False
-                            break
-                        if 'run-driver' in parent_cmd:
-                            # Node.js driver — check its parent too
-                            continue
-                    except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
-                        # Parent process doesn't exist — orphaned
-                        is_orphan = True
-                        break
-                
-                if is_orphan:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                        killed += 1
-                    except (ProcessLookupError, PermissionError):
-                        pass
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                cmdline = ' '.join(proc.info.get('cmdline') or [])
+                # ForkPoolWorker processes have 'celery' in cmdline and are children of main
+                if 'celery' in cmdline.lower() and 'ForkPoolWorker' in (proc.name() or ''):
+                    live_worker_pids.add(proc.info['pid'])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+        
+        # If we can't detect workers by name, try by process tree
+        if not live_worker_pids:
+            for proc in psutil.process_iter(['pid', 'cmdline']):
+                try:
+                    cmdline = ' '.join(proc.info.get('cmdline') or [])
+                    if 'celery' in cmdline.lower():
+                        p = psutil.Process(proc.info['pid'])
+                        # Workers are children of the main celery process
+                        # Main process has ppid = docker-init (1) or entrypoint
+                        # Workers have ppid = main celery process
+                        parent = p.parent()
+                        if parent and 'celery' in ' '.join(parent.cmdline()).lower():
+                            live_worker_pids.add(proc.info['pid'])
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        
+        logger.info(f"🔍 cleanup_orphaned_chrome: {len(live_worker_pids)} live workers detected")
+        
+        # Find node-driver processes whose parent worker is dead
+        orphan_node_pids = set()
+        for proc in psutil.process_iter(['pid', 'cmdline', 'ppid']):
+            try:
+                cmdline = ' '.join(proc.info.get('cmdline') or [])
+                if 'run-driver' not in cmdline:
+                    continue
+                # This is a Playwright node-driver. Its parent should be a live worker.
+                ppid = proc.info.get('ppid', 0)
+                if ppid not in live_worker_pids:
+                    orphan_node_pids.add(proc.info['pid'])
+                    logger.info(f"🧹 Orphaned node-driver PID={proc.info['pid']} (parent {ppid} not a live worker)")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        
+        # Kill all orphaned node-drivers and their entire process trees (Chrome included)
+        for node_pid in orphan_node_pids:
+            try:
+                parent = psutil.Process(node_pid)
+                children = parent.children(recursive=True)
+                for child in children:
+                    try:
+                        child.kill()
+                        killed += 1
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                try:
+                    parent.kill()
+                    killed += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                psutil.wait_procs(children + [parent], timeout=3)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        
+        # Also kill any Chrome with ppid=1 (truly orphaned, no parent at all)
+        for proc in psutil.process_iter(['pid', 'name', 'ppid']):
+            try:
+                name = (proc.info.get('name') or '').lower()
+                if 'chrome' not in name:
+                    continue
+                if proc.info.get('ppid', 0) <= 1:
+                    try:
+                        proc.kill()
+                        killed += 1
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+                
+    except ImportError:
+        # psutil not available — fallback
+        try:
+            subprocess.run(['pkill', '-9', '-f', 'chrome.*--no-sandbox'], capture_output=True, timeout=5)
+        except Exception:
+            pass
     except Exception as e:
         logger.warning(f"Error in cleanup_orphaned_chrome: {e}")
     if killed:
-        logger.info(f"🧹 Cleaned up {killed} orphaned Chrome processes")
+        logger.info(f"🧹 Cleaned up {killed} orphaned Chrome/node-driver processes")
     return killed
 
 
@@ -272,7 +380,7 @@ class BrowserManager:
             browser_id = f"browser_{int(time.time())}_{random.randint(1000, 9999)}"
 
             # Repair profile directory
-            profile_dir = os.path.join(settings.browser_user_data_dir, profile_data["name"])
+            profile_dir = os.path.abspath(os.path.join(settings.browser_user_data_dir, profile_data["name"]))
             self.repair_profile_dir(profile_dir)
             singleton_lock = os.path.join(profile_dir, "SingletonLock")
             if os.path.exists(singleton_lock) or os.path.islink(singleton_lock):
@@ -360,7 +468,7 @@ class BrowserManager:
                     navigator_vendor=True,
                     sec_ch_ua=False,  # DISABLED: we set YaBrowser brands ourselves via CDP + JS
                     # Features we already handle with profile-specific values — DISABLED:
-                    navigator_webdriver=False,      # our CDP script uses profile data
+                    navigator_webdriver=True,       # ENABLED: double protection with our CDP script
                     navigator_hardware_concurrency=False,  # profile-specific
                     navigator_languages=False,       # profile-specific (ru-RU)
                     navigator_platform=False,        # profile-specific
@@ -413,16 +521,22 @@ class BrowserManager:
             self.browser_profiles[browser_id] = profile_data
 
             # Track PIDs for cleanup
-            pids = {'chrome_pid': None, 'profile_dir': profile_dir}
+            pids = {'chrome_pid': None, 'node_driver_pid': None, 'profile_dir': profile_dir}
             try:
                 pid = driver.browser_pid
                 if pid:
                     pids['chrome_pid'] = pid
             except Exception:
                 pass
+            try:
+                nd_pid = driver.node_driver_pid
+                if nd_pid:
+                    pids['node_driver_pid'] = nd_pid
+            except Exception:
+                pass
             self.browser_pids[browser_id] = pids
 
-            logger.info(f"Created browser session: {browser_id} (chrome_pid={pids['chrome_pid']})")
+            logger.info(f"Created browser session: {browser_id} (chrome_pid={pids['chrome_pid']}, node_driver={pids['node_driver_pid']})")
             return browser_id
 
         except Exception as e:
@@ -450,6 +564,10 @@ class BrowserManager:
             # WebRTC: prevent real IP leak through STUN/TURN
             "--enforce-webrtc-ip-permission-check",
             "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+            # WebGL: use SwiftShader for software rendering (no GPU on server)
+            "--use-gl=angle",
+            "--use-angle=swiftshader",
+            "--enable-unsafe-swiftshader",
         ]
         
         from app.config import settings as _settings
@@ -467,7 +585,6 @@ class BrowserManager:
             ("--disable-background-timer-throttling", 0.7),
             ("--disable-backgrounding-occluded-windows", 0.6),
             ("--disable-renderer-backgrounding", 0.65),
-            ("--disable-software-rasterizer", 0.4),
             ("--disable-component-extensions-with-background-pages", 0.5),
             ("--disable-features=TranslateUI,BlinkGenPropertyTrees", 0.6),
             ("--disable-features=TranslateUI", 0.3),  # Lighter variant
@@ -674,10 +791,11 @@ class BrowserManager:
         """
         try:
             webgl_data = profile_data.get("webgl_fingerprint", {})
-            hw_concurrency = profile_data.get('hardware_concurrency', 4)
+            is_mobile = profile_data.get("is_mobile", False)
+            hw_concurrency = profile_data.get('hardware_concurrency', 8 if is_mobile else 4)
             dev_memory = profile_data.get('device_memory', 8)
             platform = profile_data.get("platform", "Win32")
-            max_touch = profile_data.get('max_touch_points', 0)
+            max_touch = profile_data.get('max_touch_points', 5 if is_mobile else 0)
             webgl_vendor = webgl_data.get("unmaskedVendor", "Google Inc. (NVIDIA)")
             webgl_renderer = webgl_data.get("unmaskedRenderer", "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB Direct3D11 vs_5_0 ps_5_0, D3D11)")
             
@@ -692,8 +810,6 @@ class BrowserManager:
             viewport_data = profile_data.get("viewport", {})
             viewport_width = viewport_data.get("width", 1366)
             viewport_height = viewport_data.get("height", 768)
-            
-            is_mobile = profile_data.get("is_mobile", False)
 
             # WebGPU profile data
             webgpu_data = profile_data.get("webgpu_fingerprint", {})
@@ -727,7 +843,7 @@ class BrowserManager:
             import re as _re
             _ua = profile_data.get("user_agent", "")
             _cv_match = _re.search(r'Chrome/(\d+[\.\d]*)', _ua)
-            chrome_version = _cv_match.group(1) if _cv_match else "131.0.0.0"
+            chrome_version = _cv_match.group(1) if _cv_match else "136.0.7103.50"
             _ya_match = _re.search(r'YaBrowser/(\d+[\.\d]*)', _ua)
             ya_version = _ya_match.group(1) if _ya_match else ""
             ya_major = ya_version.split('.')[0] if ya_version else ""
@@ -779,9 +895,25 @@ class BrowserManager:
             // --- Remove webdriver flag ---
             // Real Chrome sets navigator.webdriver = false (not undefined!)
             // Must override on prototype so iframes inherit the value.
+            // Delete first, then redefine — prevents Playwright/CDP from re-enabling.
             try {{
+                // Delete existing property on prototype
+                delete Navigator.prototype.webdriver;
+                // Also delete on instance if present
+                if ('webdriver' in navigator) {{
+                    delete navigator.webdriver;
+                }}
+                // Redefine on prototype with getter returning false
+                const _webdriverGetter = function() {{ return false; }};
+                _maskAsNative(_webdriverGetter, 'get webdriver');
                 Object.defineProperty(Navigator.prototype, 'webdriver', {{
-                    get: () => false,
+                    get: _webdriverGetter,
+                    configurable: true,
+                    enumerable: true
+                }});
+                // Also define on instance for extra safety
+                Object.defineProperty(navigator, 'webdriver', {{
+                    get: _webdriverGetter,
                     configurable: true,
                     enumerable: true
                 }});
@@ -1665,13 +1797,13 @@ class BrowserManager:
             try {{
                 if (navigator.userAgentData) {{
                     const _brands = {'true' if is_yabrowser else 'false'} ? [
-                        {{ brand: "Chromium", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '131'}" }},
-                        {{ brand: "YaBrowser", version: "{ya_major if ya_major else '24'}" }},
+                        {{ brand: "Chromium", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '136'}" }},
+                        {{ brand: "YaBrowser", version: "{ya_major if ya_major else '26'}" }},
                         {{ brand: "Yowser", version: "2" }},
-                        {{ brand: "Not_A Brand", version: "{ya_major if ya_major else '24'}" }}
+                        {{ brand: "Not_A Brand", version: "{ya_major if ya_major else '26'}" }}
                     ] : [
-                        {{ brand: "Chromium", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '131'}" }},
-                        {{ brand: "Google Chrome", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '131'}" }},
+                        {{ brand: "Chromium", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '136'}" }},
+                        {{ brand: "Google Chrome", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '136'}" }},
                         {{ brand: "Not-A.Brand", version: "99" }}
                     ];
                     const _fullBrands = {'true' if is_yabrowser else 'false'} ? [
@@ -1834,18 +1966,19 @@ class BrowserManager:
             }} catch(e) {{}}
             """
 
-            # Inject via CDP — runs BEFORE page JS on every navigation
-            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': stealth_script
-            })
-            logger.info("✅ Stealth fingerprint scripts injected via CDP (pre-page-load)")
+            # Inject via Playwright context.add_init_script — runs BEFORE page JS on every navigation
+            # NOTE: Page.addScriptToEvaluateOnNewDocument via CDP does NOT work in persistent context
+            # because the CDP session targets the page, not the browser context.
+            # context.add_init_script() is the correct Playwright API for this.
+            driver._context.add_init_script(stealth_script)
+            logger.info("✅ Stealth fingerprint scripts injected via context.add_init_script (pre-page-load)")
 
         except Exception as e:
-            logger.error(f"Error injecting fingerprint scripts via CDP: {e}")
-            # Fallback: inject via execute_script (less reliable but better than nothing)
+            logger.error(f"Error injecting fingerprint scripts via add_init_script: {e}")
+            # Fallback: inject via execute_script (works on current page only, not new navigations)
             try:
                 driver.execute_script(stealth_script)
-                logger.warning("⚠️ Fingerprint scripts injected via execute_script (fallback)")
+                logger.warning("⚠️ Fingerprint scripts injected via execute_script (fallback — current page only)")
             except Exception as e2:
                 logger.error(f"Fallback fingerprint injection also failed: {e2}")
 
@@ -1861,10 +1994,32 @@ class BrowserManager:
             try:
                 driver.get(url)
             except TimeoutException:
-                logger.warning(f"Page load timeout ({timeout}s) for {url}, checking if page is usable...")
+                logger.warning(f"Page load timeout ({timeout}s) for {url}, stopping pending navigation...")
+                # CRITICAL: Use CDP Page.stopLoading BEFORE any evaluate() calls.
+                # After goto() timeout, Playwright keeps navigation pending internally.
+                # Any page.evaluate() will wait for navigation to settle first,
+                # causing an INFINITE HANG that leads to Celery SIGKILL.
                 try:
-                    state = driver.execute_script("return document.readyState")
-                    current = driver.current_url
+                    driver.execute_cdp_cmd("Page.stopLoading")
+                except Exception:
+                    pass
+                # Now it's safe to check if page is usable
+                try:
+                    page = getattr(driver, '_page', None)
+                    if page:
+                        old_to = page._timeout_settings._timeout if hasattr(page, '_timeout_settings') else None
+                        try:
+                            page.set_default_timeout(5000)
+                            state = page.evaluate("() => document.readyState")
+                            current = page.url
+                        finally:
+                            try:
+                                page.set_default_timeout(old_to if old_to is not None else 30000)
+                            except Exception:
+                                pass
+                    else:
+                        state = driver.execute_script("return document.readyState")
+                        current = driver.current_url
                     if state in ("interactive", "complete") and current and current != "about:blank" and current != "data:,":
                         logger.info(f"Page is usable (readyState={state}, url={current[:100]})")
                         return True
@@ -2086,31 +2241,45 @@ class BrowserManager:
             return None
 
     def close_browser_session(self, browser_id: str):
-        """Close browser session and clean up Chrome processes."""
+        """Close browser session and clean up Chrome processes.
+        
+        Strategy: Kill Chrome by PID/profile-dir FIRST, then try graceful Playwright close.
+        This prevents the common scenario where context.close() hangs on a dead proxy,
+        the worker gets SIGKILL'd by Celery, and Chrome processes survive as orphans.
+        """
         pids = self.browser_pids.pop(browser_id, {})
         chrome_pid = pids.get('chrome_pid')
+        node_driver_pid = pids.get('node_driver_pid')
         profile_dir = pids.get('profile_dir', '')
         
-        logger.info(f"🔒 Closing browser {browser_id} (chrome_pid={chrome_pid}, dir={profile_dir})")
+        logger.info(f"🔒 Closing browser {browser_id} (chrome_pid={chrome_pid}, node_driver={node_driver_pid}, dir={profile_dir})")
         
-        # Step 1: Try graceful close via Playwright
+        # Step 1: Kill Chrome processes by PID FIRST (before graceful close)
+        # This ensures Chrome dies even if context.close() blocks on dead proxy
+        if chrome_pid:
+            _kill_process_tree(chrome_pid)
+        
+        # Step 2: Kill ALL Chrome processes by profile directory
+        # This catches Chrome children even when chrome_pid was None
+        if profile_dir:
+            self._kill_chrome_by_profile_dir(profile_dir)
+        
+        # Step 3: Try graceful close via Playwright (context.close after Chrome is already dead)
+        # This is fast since Chrome is already killed — just cleans up Playwright internal state.
+        # Stop any pending navigation first to prevent driver.quit() from hanging.
         try:
             if browser_id in self.active_browsers:
                 driver = self.active_browsers[browser_id]
+                try:
+                    driver.execute_cdp_cmd("Page.stopLoading")
+                except Exception:
+                    pass
                 try:
                     driver.quit()
                 except Exception as quit_error:
                     logger.warning(f"driver.quit() failed for {browser_id}: {quit_error}")
         except Exception as e:
             logger.warning(f"Error during graceful close for {browser_id}: {e}")
-        
-        # Step 2: Kill Chrome process tree by PID
-        if chrome_pid:
-            _kill_process_tree(chrome_pid)
-        
-        # Step 3: Kill ALL Chrome processes by profile directory
-        if profile_dir:
-            self._kill_chrome_by_profile_dir(profile_dir)
         
         # Step 4: Remove stale SingletonLock
         if profile_dir:
@@ -2129,28 +2298,45 @@ class BrowserManager:
         logger.info(f"✅ Browser session {browser_id} fully closed")
 
     def _kill_chrome_by_profile_dir(self, profile_dir: str):
-        """Find and kill ALL Chrome processes that use a specific profile directory."""
+        """Find and kill ALL Chrome AND node-driver processes that use a specific profile directory."""
         killed = 0
+        # Resolve to absolute path — Chrome cmdline always uses absolute paths
+        abs_profile_dir = os.path.abspath(profile_dir)
         try:
             import psutil
+            node_driver_pids = set()
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                 try:
                     name = (proc.info.get('name') or '').lower()
                     if 'chrome' not in name and 'chromedriver' not in name:
                         continue
                     cmdline = ' '.join(proc.info.get('cmdline') or [])
-                    if profile_dir in cmdline:
+                    if abs_profile_dir in cmdline:
+                        # Track the node-driver parent of this Chrome
+                        try:
+                            parent = psutil.Process(proc.info['pid']).parent()
+                            if parent and 'run-driver' in ' '.join(parent.cmdline()):
+                                node_driver_pids.add(parent.pid)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
                         proc.kill()
                         killed += 1
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
+            # Also kill orphaned node-drivers whose Chrome we just killed
+            for nd_pid in node_driver_pids:
+                try:
+                    _kill_process_tree(nd_pid)
+                    killed += 1
+                except Exception:
+                    pass
             if killed:
-                logger.info(f"🔪 Killed {killed} Chrome processes for {os.path.basename(profile_dir)}")
+                logger.info(f"🔪 Killed {killed} Chrome/node-driver processes for {os.path.basename(profile_dir)}")
         except ImportError:
             # psutil not available — use pkill
             try:
                 subprocess.run(
-                    ['pkill', '-9', '-f', profile_dir],
+                    ['pkill', '-9', '-f', abs_profile_dir],
                     capture_output=True, timeout=5
                 )
             except:

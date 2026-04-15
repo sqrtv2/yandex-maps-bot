@@ -15,6 +15,7 @@ from .parsed_company import ParsedCompany
 from .parse_task import ParseTask, ParseTaskStatus
 from .keyword_frequency import KeywordFrequency
 from .error_log import ErrorLog
+from .drop_domain import DropDomain
 
 __all__ = [
     "BrowserProfile",
@@ -34,5 +35,6 @@ __all__ = [
     "ParseTask",
     "ParseTaskStatus",
     "KeywordFrequency",
-    "ErrorLog"
+    "ErrorLog",
+    "DropDomain"
 ]

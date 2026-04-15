@@ -1,0 +1,718 @@
+{% extends "base.html" %}
+
+{% block title %}Email рассылка{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2"><i class="bi bi-envelope-paper"></i> Email рассылка</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <button class="btn btn-success me-2" data-bs-toggle="modal" data-bs-target="#newCampaignModal">
+            <i class="bi bi-plus-circle"></i> Новая кампания
+        </button>
+        <button class="btn btn-primary me-2" data-bs-toggle="modal" data-bs-target="#smtpModal">
+            <i class="bi bi-envelope-at"></i> SMTP аккаунты
+        </button>
+        <button class="btn btn-outline-secondary" onclick="loadAll()">
+            <i class="bi bi-arrow-clockwise"></i> Обновить
+        </button>
+    </div>
+</div>
+
+<!-- Stats Cards -->
+<div class="row mb-4" id="statsRow">
+    <div class="col-md-2">
+        <div class="card text-bg-primary stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">SMTP аккаунты</div>
+                        <div class="fs-4 fw-bold"><span id="statAccounts">0</span> / <span id="statActiveAccounts">0</span></div>
+                    </div>
+                    <i class="bi bi-envelope-at fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-bg-success stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">Отправлено</div>
+                        <div class="fs-4 fw-bold" id="statSent">0</div>
+                    </div>
+                    <i class="bi bi-check-circle fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-bg-warning stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">В очереди</div>
+                        <div class="fs-4 fw-bold" id="statPending">0</div>
+                    </div>
+                    <i class="bi bi-hourglass-split fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-bg-danger stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">Ошибки</div>
+                        <div class="fs-4 fw-bold" id="statFailed">0</div>
+                    </div>
+                    <i class="bi bi-x-circle fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-bg-info stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">Компаний с email</div>
+                        <div class="fs-4 fw-bold" id="statCompanies">0</div>
+                    </div>
+                    <i class="bi bi-building fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="card text-bg-secondary stats-card">
+            <div class="card-body py-2">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <div class="text-uppercase small">Квота на сегодня</div>
+                        <div class="fs-4 fw-bold" id="statQuota">0</div>
+                    </div>
+                    <i class="bi bi-speedometer2 fs-2 opacity-50"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Campaigns Section -->
+<div class="card mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-megaphone"></i> Кампании</h5>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover table-sm mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th>ID</th>
+                        <th>Название</th>
+                        <th>Тема письма</th>
+                        <th>Фильтры</th>
+                        <th>Статус</th>
+                        <th>Прогресс</th>
+                        <th>Создано</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody id="campaignsBody">
+                    <tr><td colspan="8" class="text-center text-muted py-3">Загрузка...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Campaign Messages (shown when clicking on campaign) -->
+<div class="card d-none" id="messagesCard">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-envelope"></i> Сообщения кампании: <span id="messagesTitle">-</span></h5>
+        <div class="d-flex gap-2">
+            <select class="form-select form-select-sm" id="msgStatusFilter" style="width: 150px;" onchange="loadMessages()">
+                <option value="">Все</option>
+                <option value="pending">В очереди</option>
+                <option value="sent">Отправлено</option>
+                <option value="failed">Ошибка</option>
+                <option value="skipped">Пропущено</option>
+            </select>
+            <button class="btn btn-sm btn-outline-secondary" onclick="hideMessages()">
+                <i class="bi bi-x-lg"></i>
+            </button>
+        </div>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover table-sm mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th>ID</th>
+                        <th>Email получателя</th>
+                        <th>Компания</th>
+                        <th>Статус</th>
+                        <th>SMTP</th>
+                        <th>Отправлено</th>
+                        <th>Ошибка</th>
+                    </tr>
+                </thead>
+                <tbody id="messagesBody">
+                    <tr><td colspan="7" class="text-center text-muted py-3">-</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div class="card-footer">
+        <small class="text-muted" id="messagesInfo">-</small>
+    </div>
+</div>
+
+<!-- SMTP Accounts Modal -->
+<div class="modal fade" id="smtpModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-envelope-at"></i> SMTP аккаунты</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <!-- Bulk import -->
+                <div class="card mb-3">
+                    <div class="card-header py-2">
+                        <h6 class="mb-0">Массовый импорт</h6>
+                    </div>
+                    <div class="card-body">
+                        <div class="mb-2">
+                            <textarea class="form-control" id="bulkSmtpText" rows="4" 
+                                placeholder="Формат:&#10;email@yandex.ru&#10;password&#10;email2@mail.ru&#10;password2"></textarea>
+                        </div>
+                        <div class="d-flex justify-content-between">
+                            <small class="text-muted">Каждый email на отдельной строке, пароль на следующей. SMTP-сервер определяется автоматически.</small>
+                            <button class="btn btn-sm btn-success" onclick="bulkImportSmtp()">
+                                <i class="bi bi-upload"></i> Импорт
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Add single account -->
+                <div class="card mb-3">
+                    <div class="card-header py-2">
+                        <h6 class="mb-0">Добавить аккаунт</h6>
+                    </div>
+                    <div class="card-body">
+                        <div class="row g-2">
+                            <div class="col-md-4">
+                                <input type="email" class="form-control form-control-sm" id="smtpEmail" placeholder="email@yandex.ru">
+                            </div>
+                            <div class="col-md-3">
+                                <input type="password" class="form-control form-control-sm" id="smtpPassword" placeholder="Пароль приложения">
+                            </div>
+                            <div class="col-md-2">
+                                <input type="text" class="form-control form-control-sm" id="smtpServer" placeholder="smtp.yandex.ru">
+                            </div>
+                            <div class="col-md-1">
+                                <input type="number" class="form-control form-control-sm" id="smtpPort" placeholder="465" value="465">
+                            </div>
+                            <div class="col-md-2">
+                                <button class="btn btn-sm btn-success w-100" onclick="addSmtpAccount()">
+                                    <i class="bi bi-plus"></i> Добавить
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Accounts table -->
+                <div class="table-responsive">
+                    <table class="table table-hover table-sm mb-0">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Email</th>
+                                <th>SMTP сервер</th>
+                                <th>Порт</th>
+                                <th>Лимит / Отправлено</th>
+                                <th>Статус</th>
+                                <th>Действия</th>
+                            </tr>
+                        </thead>
+                        <tbody id="smtpAccountsBody">
+                            <tr><td colspan="6" class="text-center text-muted py-3">Загрузка...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- New Campaign Modal -->
+<div class="modal fade" id="newCampaignModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-megaphone"></i> Новая кампания</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="row">
+                    <div class="col-md-6">
+                        <div class="mb-3">
+                            <label class="form-label">Название кампании <span class="text-danger">*</span></label>
+                            <input type="text" class="form-control" id="campName" placeholder="Например: Рассылка медцентрам">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Имя отправителя</label>
+                            <input type="text" class="form-control" id="campSenderName" placeholder="Например: Иван Петров">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Тема письма <span class="text-danger">*</span></label>
+                            <input type="text" class="form-control" id="campSubject" placeholder="Предложение для {company_name}">
+                            <small class="text-muted">Переменные: {company_name}, {город}, {категория}</small>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <h6>Фильтры получателей</h6>
+                        <div class="mb-2">
+                            <label class="form-label">Поисковый запрос</label>
+                            <select class="form-select form-select-sm" id="campFilterQuery">
+                                <option value="">Все запросы</option>
+                            </select>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label">Регион</label>
+                            <select class="form-select form-select-sm" id="campFilterRegion">
+                                <option value="">Все регионы</option>
+                            </select>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label">Категория</label>
+                            <select class="form-select form-select-sm" id="campFilterCategory">
+                                <option value="">Все категории</option>
+                            </select>
+                        </div>
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <label class="form-label">Задержка мин. (сек)</label>
+                                <input type="number" class="form-control form-control-sm" id="campDelayMin" value="30">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label">Задержка макс. (сек)</label>
+                                <input type="number" class="form-control form-control-sm" id="campDelayMax" value="90">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Текст письма (HTML) <span class="text-danger">*</span></label>
+                    <textarea class="form-control" id="campBodyHtml" rows="8" 
+                        placeholder="<p>Здравствуйте, {company_name}!</p>&#10;&#10;<p>Ваш текст...</p>&#10;&#10;<p>С уважением,<br>Имя</p>"></textarea>
+                    <small class="text-muted">Переменные: {company_name} или {название}, {город}, {категория}</small>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Текст (plain text, необязательно)</label>
+                    <textarea class="form-control" id="campBodyText" rows="3" 
+                        placeholder="Текстовая версия письма (без HTML)"></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                <button type="button" class="btn btn-success" onclick="createCampaign()">
+                    <i class="bi bi-plus-circle"></i> Создать кампанию
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_head %}
+<style>
+    .status-draft { color: #6c757d; }
+    .status-running { color: #0d6efd; }
+    .status-paused { color: #ffc107; }
+    .status-completed { color: #198754; }
+    .status-failed { color: #dc3545; }
+    .msg-pending { color: #6c757d; }
+    .msg-sent { color: #198754; }
+    .msg-failed { color: #dc3545; }
+    .msg-skipped { color: #ffc107; }
+</style>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+let currentCampaignId = null;
+
+// ─── Init ──────────────────────────
+document.addEventListener('DOMContentLoaded', loadAll);
+
+function loadAll() {
+    loadStats();
+    loadCampaigns();
+}
+
+// ─── Stats ─────────────────────────
+async function loadStats() {
+    try {
+        const r = await fetch('/api/mailing/stats');
+        const d = await r.json();
+        document.getElementById('statAccounts').textContent = d.total_accounts;
+        document.getElementById('statActiveAccounts').textContent = d.active_accounts;
+        document.getElementById('statSent').textContent = d.total_sent;
+        document.getElementById('statPending').textContent = d.total_pending;
+        document.getElementById('statFailed').textContent = d.total_failed;
+        document.getElementById('statCompanies').textContent = d.companies_with_email;
+        document.getElementById('statQuota').textContent = d.daily_remaining;
+    } catch(e) {
+        console.error('Stats error:', e);
+    }
+}
+
+// ─── Campaigns ─────────────────────
+async function loadCampaigns() {
+    try {
+        const r = await fetch('/api/mailing/campaigns');
+        const campaigns = await r.json();
+        const tbody = document.getElementById('campaignsBody');
+        
+        if (!campaigns.length) {
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-3">Нет кампаний</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = campaigns.map(c => {
+            const statusBadge = {
+                'draft': '<span class="badge bg-secondary">Черновик</span>',
+                'running': '<span class="badge bg-primary"><i class="bi bi-play-fill"></i> Работает</span>',
+                'paused': '<span class="badge bg-warning text-dark">Пауза</span>',
+                'completed': '<span class="badge bg-success">Готово</span>',
+                'failed': '<span class="badge bg-danger">Ошибка</span>',
+            }[c.status] || c.status;
+
+            const total = c.total_recipients || 0;
+            const sent = c.sent_count || 0;
+            const failed = c.failed_count || 0;
+            const pct = total ? Math.round((sent / total) * 100) : 0;
+
+            let filters = [];
+            if (c.filter_search_query) filters.push(c.filter_search_query);
+            if (c.filter_region) filters.push(c.filter_region);
+            if (c.filter_category) filters.push(c.filter_category);
+            const filtersStr = filters.length ? filters.join(', ') : '<span class="text-muted">все</span>';
+
+            let actions = `<button class="btn btn-sm btn-outline-info me-1" onclick="showMessages(${c.id}, '${escHtml(c.name)}')" title="Сообщения"><i class="bi bi-envelope"></i></button>`;
+            if (c.status === 'draft' || c.status === 'paused') {
+                actions += `<button class="btn btn-sm btn-outline-success me-1" onclick="startCampaign(${c.id})" title="Запустить"><i class="bi bi-play-fill"></i></button>`;
+            }
+            if (c.status === 'running') {
+                actions += `<button class="btn btn-sm btn-outline-warning me-1" onclick="pauseCampaign(${c.id})" title="Пауза"><i class="bi bi-pause-fill"></i></button>`;
+            }
+            actions += `<button class="btn btn-sm btn-outline-danger" onclick="deleteCampaign(${c.id})" title="Удалить"><i class="bi bi-trash"></i></button>`;
+
+            const dt = c.created_at ? new Date(c.created_at).toLocaleString('ru-RU') : '-';
+
+            return `<tr>
+                <td>${c.id}</td>
+                <td><strong>${escHtml(c.name)}</strong></td>
+                <td>${escHtml(c.subject)}</td>
+                <td>${filtersStr}</td>
+                <td>${statusBadge}</td>
+                <td>
+                    <div class="d-flex align-items-center gap-2">
+                        <div class="progress flex-grow-1" style="height:6px; min-width:60px;">
+                            <div class="progress-bar bg-success" style="width:${pct}%"></div>
+                        </div>
+                        <small>${sent}/${total}</small>
+                        ${failed ? `<small class="text-danger">(${failed} err)</small>` : ''}
+                    </div>
+                </td>
+                <td><small>${dt}</small></td>
+                <td>${actions}</td>
+            </tr>`;
+        }).join('');
+    } catch(e) {
+        console.error('Campaigns error:', e);
+    }
+}
+
+async function createCampaign() {
+    const data = {
+        name: document.getElementById('campName').value,
+        subject: document.getElementById('campSubject').value,
+        body_html: document.getElementById('campBodyHtml').value,
+        body_text: document.getElementById('campBodyText').value,
+        sender_name: document.getElementById('campSenderName').value,
+        filter_search_query: document.getElementById('campFilterQuery').value,
+        filter_region: document.getElementById('campFilterRegion').value,
+        filter_category: document.getElementById('campFilterCategory').value,
+        delay_min: parseInt(document.getElementById('campDelayMin').value) || 30,
+        delay_max: parseInt(document.getElementById('campDelayMax').value) || 90,
+    };
+
+    if (!data.name || !data.subject || !data.body_html) {
+        alert('Заполните обязательные поля: название, тема, текст письма');
+        return;
+    }
+
+    try {
+        const r = await fetch('/api/mailing/campaigns', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(data)
+        });
+        const result = await r.json();
+        if (!r.ok) { alert(result.detail || 'Ошибка'); return; }
+        bootstrap.Modal.getInstance(document.getElementById('newCampaignModal')).hide();
+        alert(`Кампания создана! Получателей: ${result.total_recipients}`);
+        loadAll();
+    } catch(e) {
+        alert('Ошибка: ' + e.message);
+    }
+}
+
+async function startCampaign(id) {
+    if (!confirm('Запустить рассылку?')) return;
+    try {
+        const r = await fetch(`/api/mailing/campaigns/${id}/start`, {method: 'POST'});
+        const result = await r.json();
+        if (!r.ok) { alert(result.detail || 'Ошибка'); return; }
+        loadAll();
+    } catch(e) { alert('Ошибка: ' + e.message); }
+}
+
+async function pauseCampaign(id) {
+    try {
+        const r = await fetch(`/api/mailing/campaigns/${id}/pause`, {method: 'POST'});
+        if (!r.ok) { const d = await r.json(); alert(d.detail || 'Ошибка'); return; }
+        loadAll();
+    } catch(e) { alert('Ошибка: ' + e.message); }
+}
+
+async function deleteCampaign(id) {
+    if (!confirm('Удалить кампанию и все её сообщения?')) return;
+    try {
+        const r = await fetch(`/api/mailing/campaigns/${id}`, {method: 'DELETE'});
+        if (!r.ok) { const d = await r.json(); alert(d.detail || 'Ошибка'); return; }
+        loadAll();
+    } catch(e) { alert('Ошибка: ' + e.message); }
+}
+
+// ─── Messages ──────────────────────
+async function showMessages(id, name) {
+    currentCampaignId = id;
+    document.getElementById('messagesTitle').textContent = name;
+    document.getElementById('messagesCard').classList.remove('d-none');
+    loadMessages();
+}
+
+function hideMessages() {
+    document.getElementById('messagesCard').classList.add('d-none');
+    currentCampaignId = null;
+}
+
+async function loadMessages() {
+    if (!currentCampaignId) return;
+    const status = document.getElementById('msgStatusFilter').value;
+    const url = `/api/mailing/campaigns/${currentCampaignId}/messages?limit=200${status ? '&status=' + status : ''}`;
+    try {
+        const r = await fetch(url);
+        const data = await r.json();
+        const tbody = document.getElementById('messagesBody');
+        
+        if (!data.messages || !data.messages.length) {
+            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">Нет сообщений</td></tr>';
+            document.getElementById('messagesInfo').textContent = `Всего: ${data.total || 0}`;
+            return;
+        }
+
+        tbody.innerHTML = data.messages.map(m => {
+            const statusBadge = {
+                'pending': '<span class="badge bg-secondary">В очереди</span>',
+                'sent': '<span class="badge bg-success">Отправлено</span>',
+                'failed': '<span class="badge bg-danger">Ошибка</span>',
+                'skipped': '<span class="badge bg-warning text-dark">Пропущено</span>',
+            }[m.status] || m.status;
+
+            const sentAt = m.sent_at ? new Date(m.sent_at).toLocaleString('ru-RU') : '-';
+
+            return `<tr>
+                <td>${m.id}</td>
+                <td>${escHtml(m.recipient_email)}</td>
+                <td>${escHtml(m.company_name || '-')}</td>
+                <td>${statusBadge}</td>
+                <td>${m.smtp_account_id || '-'}</td>
+                <td><small>${sentAt}</small></td>
+                <td><small class="text-danger">${escHtml(m.error_message || '')}</small></td>
+            </tr>`;
+        }).join('');
+
+        document.getElementById('messagesInfo').textContent = `Показано: ${data.messages.length} из ${data.total}`;
+    } catch(e) {
+        console.error('Messages error:', e);
+    }
+}
+
+// ─── SMTP Accounts ─────────────────
+async function loadSmtpAccounts() {
+    try {
+        const r = await fetch('/api/mailing/smtp-accounts');
+        const accounts = await r.json();
+        const tbody = document.getElementById('smtpAccountsBody');
+        
+        if (!accounts.length) {
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">Нет аккаунтов</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = accounts.map(a => {
+            const statusBadge = a.is_active
+                ? '<span class="badge bg-success">Активен</span>'
+                : `<span class="badge bg-danger" title="${escHtml(a.last_error || '')}">Ошибка</span>`;
+
+            return `<tr>
+                <td>${escHtml(a.email)}</td>
+                <td>${escHtml(a.smtp_server)}</td>
+                <td>${a.smtp_port}</td>
+                <td>${a.sent_today} / ${a.daily_limit}</td>
+                <td>${statusBadge}</td>
+                <td>
+                    <button class="btn btn-sm btn-outline-primary me-1" onclick="testSmtp(${a.id})" title="Тест"><i class="bi bi-plug"></i></button>
+                    <button class="btn btn-sm btn-outline-danger" onclick="deleteSmtp(${a.id})" title="Удалить"><i class="bi bi-trash"></i></button>
+                </td>
+            </tr>`;
+        }).join('');
+    } catch(e) {
+        console.error('SMTP error:', e);
+    }
+}
+
+// Load SMTP accounts when modal opens
+document.getElementById('smtpModal').addEventListener('show.bs.modal', loadSmtpAccounts);
+
+async function addSmtpAccount() {
+    const email = document.getElementById('smtpEmail').value.trim();
+    const password = document.getElementById('smtpPassword').value.trim();
+    if (!email || !password) { alert('Укажите email и пароль'); return; }
+
+    const data = {
+        email,
+        password,
+        smtp_server: document.getElementById('smtpServer').value.trim() || 'smtp.yandex.ru',
+        smtp_port: parseInt(document.getElementById('smtpPort').value) || 465,
+    };
+
+    try {
+        const r = await fetch('/api/mailing/smtp-accounts', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(data)
+        });
+        if (!r.ok) { const d = await r.json(); alert(d.detail || 'Ошибка'); return; }
+        document.getElementById('smtpEmail').value = '';
+        document.getElementById('smtpPassword').value = '';
+        loadSmtpAccounts();
+        loadStats();
+    } catch(e) { alert('Ошибка: ' + e.message); }
+}
+
+async function bulkImportSmtp() {
+    const text = document.getElementById('bulkSmtpText').value.trim();
+    if (!text) { alert('Вставьте список email/пароль'); return; }
+    
+    try {
+        const r = await fetch('/api/mailing/smtp-accounts/bulk', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({text})
+        });
+        const result = await r.json();
+        if (!r.ok) { alert(result.detail || 'Ошибка'); return; }
+        let msg = `Импортировано: ${result.created}`;
+        if (result.errors && result.errors.length) msg += `\nОшибки: ${result.errors.join(', ')}`;
+        alert(msg);
+        document.getElementById('bulkSmtpText').value = '';
+        loadSmtpAccounts();
+        loadStats();
+    } catch(e) { alert('Ошибка: ' + e.message); }
+}
+
+async function testSmtp(id) {
+    try {
+        const r = await fetch(`/api/mailing/smtp-accounts/${id}/test`, {method: 'POST'});
+        const result = await r.json();
+        alert(result.success ? 'Подключение успешно!' : `Ошибка: ${result.error}`);
+        loadSmtpAccounts();
+    } catch(e) { alert('Ошибка: ' + e.message); }
+}
+
+async function deleteSmtp(id) {
+    if (!confirm('Удалить SMTP аккаунт?')) return;
+    try {
+        const r = await fetch(`/api/mailing/smtp-accounts/${id}`, {method: 'DELETE'});
+        if (!r.ok) { const d = await r.json(); alert(d.detail || 'Ошибка'); return; }
+        loadSmtpAccounts();
+        loadStats();
+    } catch(e) { alert('Ошибка: ' + e.message); }
+}
+
+// ─── Filters for Campaign Modal ────
+document.getElementById('newCampaignModal').addEventListener('show.bs.modal', function() {
+    loadFilters();
+    loadDefaultTemplate();
+});
+
+async function loadDefaultTemplate() {
+    try {
+        const r = await fetch('/api/mailing/default-template');
+        if (!r.ok) return;
+        const d = await r.json();
+        const bodyEl = document.getElementById('campBodyHtml');
+        if (d.body_html && bodyEl && !bodyEl.value) bodyEl.value = d.body_html;
+        const subj = document.getElementById('campSubject');
+        if (d.subject && subj && !subj.value) subj.value = d.subject;
+        const sender = document.getElementById('campSenderName');
+        if (d.sender_name && sender && !sender.value) sender.value = d.sender_name;
+    } catch(e) { console.error('Default template error:', e); }
+}
+
+async function loadFilters() {
+    try {
+        const r = await fetch('/api/mailing/filters');
+        const f = await r.json();
+        
+        fillSelect('campFilterQuery', f.search_queries);
+        fillSelect('campFilterRegion', f.regions);
+        fillSelect('campFilterCategory', f.categories);
+    } catch(e) {
+        console.error('Filters error:', e);
+    }
+}
+
+function fillSelect(id, items) {
+    const sel = document.getElementById(id);
+    const current = sel.value;
+    // Keep first option (all)
+    while (sel.options.length > 1) sel.remove(1);
+    (items || []).forEach(v => {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = v;
+        sel.appendChild(opt);
+    });
+    sel.value = current;
+}
+
+// ─── Utils ─────────────────────────
+function escHtml(s) {
+    if (!s) return '';
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+</script>
+{% endblock %}

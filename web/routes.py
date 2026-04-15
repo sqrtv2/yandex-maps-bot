@@ -9,12 +9,14 @@ from typing import List, Dict, Any
 import os
 import logging
 import subprocess
+import random
 from datetime import datetime, timedelta
 
 from app.database import get_db
 from app.models import BrowserProfile, ProxyServer, Task, UserSettings, YandexMapTarget, ProfileTargetVisit
 from app.models.yandex_search_target import YandexSearchTarget
 from app.models.error_log import ErrorLog
+from app.models.drop_domain import DropDomain
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +416,529 @@ async def get_queue_details():
         return queues
     except Exception as e:
         logger.error(f"Error getting queue details: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Profiles CRUD & progress endpoints (used by profiles.html) ──────────
+
+@router.get("/api/profiles")
+async def get_profiles(
+    page: int = 1,
+    per_page: int = 50,
+    search: str = None,
+    status: str = None,
+    warmup_status: str = None,
+    db: Session = Depends(get_db),
+):
+    """Paginated profile list with optional filters."""
+    from sqlalchemy import func, case
+    try:
+        q = db.query(BrowserProfile)
+
+        if search:
+            q = q.filter(BrowserProfile.name.ilike(f"%{search}%"))
+        if status:
+            q = q.filter(BrowserProfile.status == status)
+        if warmup_status == "completed":
+            q = q.filter(BrowserProfile.warmup_completed == True)
+        elif warmup_status == "not_completed":
+            q = q.filter(BrowserProfile.warmup_completed == False)
+
+        total_count = q.count()
+        total_pages = max(1, (total_count + per_page - 1) // per_page)
+        page = max(1, min(page, total_pages))
+
+        profiles = (
+            q.order_by(BrowserProfile.id.desc())
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+            .all()
+        )
+
+        # Overall progress (reused by the header widget)
+        row = db.query(
+            func.count(BrowserProfile.id).label("total"),
+            func.sum(case((BrowserProfile.warmup_completed == True, 1), else_=0)).label("warmed"),
+            func.sum(case((BrowserProfile.status == "warming_up", 1), else_=0)).label("warming"),
+            func.sum(case(
+                (BrowserProfile.warmup_completed == False,
+                 case((BrowserProfile.status.notin_(["warming_up", "error"]), 1), else_=0)),
+                else_=0,
+            )).label("pending"),
+        ).first()
+
+        total = row.total or 0
+        warmed = int(row.warmed or 0)
+        warming_db = int(row.warming or 0)
+        pending = int(row.pending or 0)
+
+        # Check Celery active warmup tasks (works cross-container via Redis)
+        warmup_celery_tasks = 0
+        try:
+            from tasks.celery_app import celery_app
+            insp = celery_app.control.inspect(timeout=2)
+            active = insp.active() or {}
+            for w, tasks in active.items():
+                for t in tasks:
+                    tname = t.get('name', '') or ''
+                    if 'warmup' in tname:
+                        warmup_celery_tasks += 1
+        except Exception:
+            pass
+
+        warming = max(warming_db, warmup_celery_tasks)
+        pct = round(warmed * 100 / total, 1) if total else 0
+
+        if total == 0:
+            progress_status = "no_profiles"
+        elif warmed == total:
+            progress_status = "completed"
+        elif warming > 0:
+            progress_status = "in_progress"
+        elif warmed > 0:
+            progress_status = "partial"
+        else:
+            progress_status = "not_started"
+
+        overall_progress = {
+            "total_profiles": total,
+            "warmed_profiles": warmed,
+            "warming_profiles": warming,
+            "pending_profiles": pending,
+            "warmup_percentage": pct,
+            "status": progress_status,
+            "estimated_time_remaining": max(0, pending * 30) if pending else 0,
+            "can_start_bulk_warmup": pending > 0,
+        }
+
+        return {
+            "profiles": [p.to_dict() for p in profiles],
+            "pagination": {
+                "page": page,
+                "per_page": per_page,
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "has_prev": page > 1,
+                "has_next": page < total_pages,
+            },
+            "overall_progress": overall_progress,
+        }
+    except Exception as e:
+        logger.error(f"Error listing profiles: {e}")
+        raise HTTPException(status_code=500, detail="Failed to list profiles")
+
+
+@router.get("/api/profiles-overall-progress")
+async def get_profiles_overall_progress(db: Session = Depends(get_db)):
+    """Overall warmup progress for the progress bar widget."""
+    from sqlalchemy import func, case
+    try:
+        row = db.query(
+            func.count(BrowserProfile.id).label("total"),
+            func.sum(case((BrowserProfile.warmup_completed == True, 1), else_=0)).label("warmed"),
+            func.sum(case((BrowserProfile.status == "warming_up", 1), else_=0)).label("warming"),
+            func.sum(case(
+                (BrowserProfile.warmup_completed == False,
+                 case((BrowserProfile.status.notin_(["warming_up", "error"]), 1), else_=0)),
+                else_=0,
+            )).label("pending"),
+        ).first()
+
+        total = row.total or 0
+        warmed = int(row.warmed or 0)
+        warming_db = int(row.warming or 0)
+        pending = int(row.pending or 0)
+
+        # Also check Celery active warmup tasks (real indicator across containers)
+        warmup_celery_tasks = 0
+        try:
+            from tasks.celery_app import celery_app
+            insp = celery_app.control.inspect(timeout=2)
+            active = insp.active() or {}
+            for w, tasks in active.items():
+                for t in tasks:
+                    tname = t.get('name', '') or ''
+                    if 'warmup' in tname:
+                        warmup_celery_tasks += 1
+        except Exception:
+            pass
+
+        warming = max(warming_db, warmup_celery_tasks)
+        pct = round(warmed * 100 / total, 1) if total else 0
+
+        if total == 0:
+            status = "no_profiles"
+        elif warmed == total:
+            status = "completed"
+        elif warming > 0:
+            status = "in_progress"
+        elif warmed > 0:
+            status = "partial"
+        else:
+            status = "not_started"
+
+        return {
+            "total_profiles": total,
+            "warmed_profiles": warmed,
+            "warming_profiles": warming,
+            "pending_profiles": pending,
+            "warmup_percentage": pct,
+            "status": status,
+            "estimated_time_remaining": max(0, pending * 30) if pending else 0,
+            "can_start_bulk_warmup": pending > 0,
+        }
+    except Exception as e:
+        logger.error(f"Error getting overall progress: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/profiles")
+async def create_single_profile(request: Request, db: Session = Depends(get_db)):
+    """Create a single browser profile."""
+    try:
+        from core.profile_generator import ProfileGenerator
+
+        data = await request.json()
+        gen = ProfileGenerator()
+        generated = gen.generate_profile(profile_name=data.get("name"))
+
+        profile = BrowserProfile(
+            name=generated["name"],
+            user_agent=generated["user_agent"],
+            viewport_width=data.get("viewport_width") or generated["viewport"]["width"],
+            viewport_height=data.get("viewport_height") or generated["viewport"]["height"],
+            timezone=data.get("timezone") or generated["timezone"],
+            language=data.get("language") or generated["language"],
+            platform=generated["platform"],
+            canvas_fingerprint=generated.get("canvas_fingerprint"),
+            webgl_fingerprint=generated.get("webgl_fingerprint"),
+            audio_fingerprint=generated.get("audio_fingerprint"),
+            status="created",
+            is_active=True,
+        )
+        if data.get("user_agent"):
+            profile.user_agent = data["user_agent"]
+
+        db.add(profile)
+        db.commit()
+        db.refresh(profile)
+        return profile.to_dict()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error creating profile: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/profiles/{profile_id}")
+async def delete_profile(profile_id: int, db: Session = Depends(get_db)):
+    """Delete a single browser profile."""
+    try:
+        profile = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+        if not profile:
+            raise HTTPException(status_code=404, detail="Profile not found")
+
+        # Try to remove browser profile directory
+        import shutil
+        profile_dir = os.path.join("browser_profiles", str(profile_id))
+        abs_dir = os.path.abspath(profile_dir)
+        if os.path.isdir(abs_dir):
+            shutil.rmtree(abs_dir, ignore_errors=True)
+
+        db.delete(profile)
+        db.commit()
+        return {"status": "ok", "deleted_id": profile_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting profile {profile_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/profiles/{profile_id}/cookies")
+async def get_profile_cookies(profile_id: int, format: str = "json", db: Session = Depends(get_db)):
+    """Export cookies from a browser profile's Chrome Cookies SQLite file.
+    
+    Args:
+        format: 'json' for JSON array, 'base64' for base64-encoded JSON
+    """
+    try:
+        profile = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+        if not profile:
+            raise HTTPException(status_code=404, detail="Profile not found")
+
+        from app.config import settings as app_settings
+        import sqlite3
+        import json
+        import base64
+
+        cookies_path = os.path.join(app_settings.browser_user_data_dir, profile.name, "Default", "Cookies")
+        if not os.path.exists(cookies_path):
+            return {"profile_id": profile_id, "profile_name": profile.name,
+                    "cookies_count": 0, "cookies": [] if format == "json" else "",
+                    "message": "No cookies file found (profile not warmed up?)"}
+
+        # Copy to temp file to avoid locking issues with running browser
+        import shutil
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+        tmp.close()
+        shutil.copy2(cookies_path, tmp.name)
+
+        try:
+            conn = sqlite3.connect(tmp.name)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT host_key, name, path, encrypted_value, expires_utc,
+                       is_secure, is_httponly, samesite, creation_utc
+                FROM cookies ORDER BY host_key, name
+            """)
+            rows = cursor.fetchall()
+            conn.close()
+
+            cookies = []
+            for row in rows:
+                cookies.append({
+                    "domain": row["host_key"],
+                    "name": row["name"],
+                    "path": row["path"],
+                    "secure": bool(row["is_secure"]),
+                    "httpOnly": bool(row["is_httponly"]),
+                    "sameSite": ["none", "lax", "strict"][row["samesite"]] if row["samesite"] in (0, 1, 2) else "lax",
+                    "expirationDate": row["expires_utc"] / 1000000 - 11644473600 if row["expires_utc"] else 0,
+                })
+        finally:
+            os.unlink(tmp.name)
+
+        if format == "base64":
+            json_str = json.dumps(cookies, ensure_ascii=False)
+            encoded = base64.b64encode(json_str.encode()).decode()
+            return {"profile_id": profile_id, "profile_name": profile.name,
+                    "cookies_count": len(cookies), "cookies": encoded, "format": "base64"}
+
+        return {"profile_id": profile_id, "profile_name": profile.name,
+                "cookies_count": len(cookies), "cookies": cookies, "format": "json"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error exporting cookies for profile {profile_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/profiles/{profile_id}/cookies")
+async def import_profile_cookies(profile_id: int, request: Request, db: Session = Depends(get_db)):
+    """Import cookies into a browser profile.
+    
+    Accepts JSON body with either:
+      {"cookies": [...]}  - JSON array of cookie objects
+      {"cookies_base64": "..."} - base64-encoded JSON array
+    
+    Cookie objects should have: domain, name, value, path, secure, httpOnly, sameSite, expirationDate
+    """
+    try:
+        profile = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+        if not profile:
+            raise HTTPException(status_code=404, detail="Profile not found")
+
+        import json
+        import base64
+
+        data = await request.json()
+        cookies_raw = data.get("cookies")
+        cookies_b64 = data.get("cookies_base64")
+
+        if cookies_b64:
+            try:
+                decoded = base64.b64decode(cookies_b64).decode()
+                cookies = json.loads(decoded)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
+        elif cookies_raw:
+            if isinstance(cookies_raw, str):
+                try:
+                    cookies = json.loads(cookies_raw)
+                except json.JSONDecodeError as e:
+                    raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+            else:
+                cookies = cookies_raw
+        else:
+            raise HTTPException(status_code=400, detail="Provide 'cookies' (JSON) or 'cookies_base64' (base64)")
+
+        if not isinstance(cookies, list):
+            raise HTTPException(status_code=400, detail="Cookies must be a JSON array")
+
+        # Save to profile's cookies_data in DB
+        profile.cookies_data = cookies
+        db.commit()
+
+        return {"profile_id": profile_id, "profile_name": profile.name,
+                "imported_count": len(cookies), "status": "ok"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error importing cookies for profile {profile_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/profiles-bulk-create")
+async def bulk_create_profiles(request: Request, db: Session = Depends(get_db)):
+    """Bulk-create browser profiles."""
+    try:
+        from core.profile_generator import ProfileGenerator
+
+        data = await request.json()
+        count = min(int(data.get("count", 100)), 10000)
+        name_prefix = data.get("name_prefix", "Profile-")
+        mobile_pct = int(data.get("mobile_percentage", 0))
+
+        gen = ProfileGenerator()
+        created = []
+        mobile_count = 0
+        desktop_count = 0
+        batch_size = 500
+
+        # Find the next available number suffix
+        last_profile = (
+            db.query(BrowserProfile)
+            .filter(BrowserProfile.name.like(f"{name_prefix}%"))
+            .order_by(BrowserProfile.id.desc())
+            .first()
+        )
+        start_num = 1
+        if last_profile:
+            try:
+                start_num = int(last_profile.name.replace(name_prefix, "")) + 1
+            except (ValueError, TypeError):
+                start_num = last_profile.id + 1
+
+        for i in range(count):
+            is_mobile = (random.randint(1, 100) <= mobile_pct) if mobile_pct > 0 else False
+            profile_name = f"{name_prefix}{start_num + i}"
+            generated = gen.generate_profile(profile_name=profile_name, is_mobile=is_mobile)
+
+            profile = BrowserProfile(
+                name=generated["name"],
+                user_agent=generated["user_agent"],
+                viewport_width=generated["viewport"]["width"],
+                viewport_height=generated["viewport"]["height"],
+                timezone=generated["timezone"],
+                language=generated["language"],
+                platform=generated["platform"],
+                is_mobile=is_mobile,
+                canvas_fingerprint=generated.get("canvas_fingerprint"),
+                webgl_fingerprint=generated.get("webgl_fingerprint"),
+                audio_fingerprint=generated.get("audio_fingerprint"),
+                status="created",
+                is_active=True,
+            )
+            db.add(profile)
+            created.append(profile)
+            if is_mobile:
+                mobile_count += 1
+            else:
+                desktop_count += 1
+
+            if len(created) % batch_size == 0:
+                db.flush()
+
+        db.commit()
+        for p in created:
+            db.refresh(p)
+
+        first_id = created[0].id if created else 0
+        last_id = created[-1].id if created else 0
+
+        result = {
+            "created_count": len(created),
+            "first_id": first_id,
+            "last_id": last_id,
+            "mobile_count": mobile_count,
+            "desktop_count": desktop_count,
+            "warmup_started": False,
+            "warmup_sites_task_id": None,
+        }
+
+        # Optionally start warmup
+        if data.get("auto_start_warmup"):
+            try:
+                from tasks.warmup import warmup_profile_task
+                for p in created[:20]:
+                    warmup_profile_task.apply_async(args=[p.id], countdown=random.randint(2, 30))
+                result["warmup_started"] = True
+            except Exception as we:
+                logger.warning(f"Could not start warmup after bulk create: {we}")
+
+        return result
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error bulk-creating profiles: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/profiles-bulk-warmup")
+async def bulk_warmup_profiles(db: Session = Depends(get_db)):
+    """Start warmup for all pending profiles."""
+    try:
+        profiles = (
+            db.query(BrowserProfile)
+            .filter(
+                BrowserProfile.warmup_completed == False,
+                BrowserProfile.is_active == True,
+                BrowserProfile.status.in_(["created", "warmed"]),
+            )
+            .order_by(BrowserProfile.warmup_stage.asc(), BrowserProfile.id.asc())
+            .all()
+        )
+
+        started = 0
+        celery_available = False
+        try:
+            from tasks.warmup import warmup_profile_task
+            celery_available = True
+            for i, p in enumerate(profiles):
+                warmup_profile_task.apply_async(args=[p.id], countdown=random.randint(2, 15) + i * 2)
+                p.status = "warming_up"
+                started += 1
+            db.commit()
+        except ImportError:
+            logger.warning("Celery warmup task not available")
+
+        return {
+            "started_count": started,
+            "celery_available": celery_available,
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error starting bulk warmup: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/profiles-clear-all")
+async def clear_all_profiles(db: Session = Depends(get_db)):
+    """Delete ALL browser profiles and their directories."""
+    import shutil
+    try:
+        total = db.query(BrowserProfile).count()
+        db.query(BrowserProfile).delete()
+        db.commit()
+
+        files_deleted = 0
+        profiles_dir = os.path.abspath("browser_profiles")
+        if os.path.isdir(profiles_dir):
+            for entry in os.listdir(profiles_dir):
+                entry_path = os.path.join(profiles_dir, entry)
+                if os.path.isdir(entry_path):
+                    shutil.rmtree(entry_path, ignore_errors=True)
+                    files_deleted += 1
+
+        return {"deleted_count": total, "files_deleted": files_deleted}
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error clearing all profiles: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2010,13 +2535,31 @@ async def get_process_monitor(db: Session = Depends(get_db)):
         logger.error(f"Process monitor - stalled tasks check: {e}")
 
     # ── 7. Warmup progress stalled (no progress for long time) ──
+    # Count active warmup tasks via Celery inspect (works cross-container via Redis)
+    warmup_celery_tasks = 0
+    try:
+        if celery_worker_online:
+            from tasks.celery_app import celery_app as _celery_warmup_check
+            _insp = _celery_warmup_check.control.inspect(timeout=2)
+            _active = _insp.active() or {}
+            for _w, _tasks in _active.items():
+                for _t in _tasks:
+                    _tname = _t.get('name', '') or ''
+                    if 'warmup' in _tname:
+                        warmup_celery_tasks += 1
+    except Exception:
+        pass
+
     try:
         warming_count = db.query(BrowserProfile).filter(BrowserProfile.status == "warming_up").count()
         warmed_count = db.query(BrowserProfile).filter(BrowserProfile.warmup_completed == True).count()
         total_count = db.query(BrowserProfile).count()
 
-        if warming_count == 0 and warmed_count < total_count and total_count > 0 and celery_worker_online:
-            pending_count = total_count - warmed_count - warming_count
+        # Use Celery active warmup tasks as the real indicator (DB status resets quickly)
+        real_warming = max(warming_count, warmup_celery_tasks)
+
+        if real_warming == 0 and warmed_count < total_count and total_count > 0 and celery_worker_online:
+            pending_count = total_count - warmed_count
             if pending_count > 0:
                 alerts.append({
                     "level": "info",
@@ -2026,6 +2569,16 @@ async def get_process_monitor(db: Session = Depends(get_db)):
                     "action": None,
                     "data": None
                 })
+        elif warmup_celery_tasks > 0:
+            pending_count = total_count - warmed_count
+            alerts.append({
+                "level": "info",
+                "icon": "fire",
+                "title": f"🔥 Прогрев идёт: {warmup_celery_tasks} задач активно",
+                "message": f"Прогрето: {warmed_count}/{total_count}. Активных задач: {warmup_celery_tasks}. Ожидают: {pending_count}.",
+                "action": None,
+                "data": None
+            })
     except Exception as e:
         logger.error(f"Process monitor - warmup progress check: {e}")
 
@@ -2039,7 +2592,8 @@ async def get_process_monitor(db: Session = Depends(get_db)):
         "celery_worker": celery_worker_online,
         "celery_beat": celery_beat_running,
         "celery_active_tasks": celery_active_tasks,
-        "chrome_processes": chrome_count,
+        "warmup_active_tasks": warmup_celery_tasks,
+        "chrome_processes": chrome_count if chrome_count > 0 else warmup_celery_tasks,
         "chromedriver_processes": chromedriver_count,
         "checked_at": now.isoformat()
     }
@@ -2113,6 +2667,69 @@ async def restart_error_profiles(db: Session = Depends(get_db)):
         }
     except Exception as e:
         logger.error(f"Error restarting error profiles: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/profiles-reset-no-cookies")
+async def reset_profiles_without_cookies(db: Session = Depends(get_db)):
+    """Reset warmup status for profiles that have no cookies (failed warmup).
+    Checks the Chromium Cookies SQLite file on disk — counts actual cookie rows."""
+    try:
+        import sqlite3
+        import shutil
+        import tempfile
+        from app.config import settings as app_settings
+
+        profiles = db.query(BrowserProfile).filter(
+            BrowserProfile.is_active == True,
+            BrowserProfile.warmup_completed == True,
+        ).all()
+
+        reset_count = 0
+        skipped = 0
+        for p in profiles:
+            cookies_path = os.path.join(
+                app_settings.browser_user_data_dir, p.name, "Default", "Cookies"
+            )
+            cookie_count = 0
+            try:
+                if os.path.exists(cookies_path):
+                    # Copy to temp file to avoid SQLite lock conflicts
+                    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db")
+                    os.close(tmp_fd)
+                    try:
+                        shutil.copy2(cookies_path, tmp_path)
+                        conn = sqlite3.connect(tmp_path)
+                        cursor = conn.execute("SELECT count(*) FROM cookies")
+                        cookie_count = cursor.fetchone()[0]
+                        conn.close()
+                    finally:
+                        os.unlink(tmp_path)
+            except Exception:
+                pass
+
+            if cookie_count == 0:
+                p.warmup_completed = False
+                p.warmup_stage = 0
+                p.warmup_sessions_count = 0
+                p.warmup_time_spent = 0
+                p.first_warmup_at = None
+                p.status = "created"
+                p.updated_at = datetime.utcnow()
+                reset_count += 1
+            else:
+                skipped += 1
+
+        db.commit()
+
+        return {
+            "message": f"Сброшено {reset_count} профилей без кук. {skipped} профилей с куками оставлены.",
+            "reset_count": reset_count,
+            "kept_count": skipped,
+        }
+    except Exception as e:
+        logger.error(f"Error resetting profiles without cookies: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2696,7 +3313,24 @@ async def get_yandex_search_logs(db: Session = Depends(get_db), limit: int = 100
             Task.task_type == "yandex_search"
         ).order_by(Task.created_at.desc()).limit(limit).all()
 
-        return [t.to_dict() for t in tasks]
+        # Collect profile IDs and fetch is_mobile in one query
+        profile_ids = {t.profile_id for t in tasks if t.profile_id}
+        profile_info = {}
+        if profile_ids:
+            profiles = db.query(BrowserProfile.id, BrowserProfile.name, BrowserProfile.is_mobile).filter(
+                BrowserProfile.id.in_(profile_ids)
+            ).all()
+            profile_info = {p.id: {'name': p.name, 'is_mobile': p.is_mobile} for p in profiles}
+
+        result = []
+        for t in tasks:
+            d = t.to_dict()
+            pi = profile_info.get(t.profile_id, {})
+            d['profile_name'] = pi.get('name', '')
+            d['is_mobile'] = pi.get('is_mobile', False)
+            result.append(d)
+
+        return result
     except Exception as e:
         logger.error(f"Error getting search logs: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -3665,4 +4299,466 @@ async def get_error_logs_stats(
         }
     except Exception as e:
         logger.error(f"Error getting error stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Warmup Health (self-healing watchdog status) ─────────────────────────
+@router.get("/api/warmup-health")
+async def get_warmup_health(db: Session = Depends(get_db)):
+    """Warmup system health check with watchdog metrics.
+    
+    Returns real-time health info: recent completions, profile stage
+    distribution, watchdog state, and queue depth.
+    """
+    import redis as _rh
+    from app.config import settings as _sh
+    from sqlalchemy import func, case
+    import os
+
+    r = _rh.Redis(
+        host=os.environ.get('YANDEX_BOT_REDIS_HOST', _sh.redis_host),
+        port=int(os.environ.get('YANDEX_BOT_REDIS_PORT', _sh.redis_port)),
+        db=0, decode_responses=True,
+    )
+
+    # Watchdog state
+    total_completions = int(r.get("warmup:completions") or 0)
+    prev_completions = int(r.get("warmup:wd:prev_completions") or 0)
+    zero_runs = int(r.get("warmup:wd:zero_runs") or 0)
+
+    # Queue depth
+    queue_len = r.llen("warmup") or 0
+
+    # Profile stage distribution
+    stage_counts = dict(
+        db.query(
+            BrowserProfile.warmup_stage,
+            func.count(BrowserProfile.id),
+        )
+        .filter(BrowserProfile.is_active == True)
+        .group_by(BrowserProfile.warmup_stage)
+        .all()
+    )
+    status_counts = dict(
+        db.query(
+            BrowserProfile.status,
+            func.count(BrowserProfile.id),
+        )
+        .filter(BrowserProfile.is_active == True)
+        .group_by(BrowserProfile.status)
+        .all()
+    )
+
+    warmed = status_counts.get("warmed", 0)
+    warming = status_counts.get("warming_up", 0)
+    created = status_counts.get("created", 0)
+    error_count = status_counts.get("error", 0)
+    total = sum(status_counts.values())
+
+    # Determine health status
+    if zero_runs >= 3:
+        health = "critical"
+    elif zero_runs >= 1:
+        health = "degraded"
+    elif warming > 0 or warmed > 0:
+        health = "healthy"
+    else:
+        health = "idle"
+
+    return {
+        "health": health,
+        "total_profiles": total,
+        "warmed": warmed,
+        "warming_up": warming,
+        "created": created,
+        "error": error_count,
+        "stage_distribution": stage_counts,
+        "total_completions": total_completions,
+        "recent_completions": total_completions - prev_completions,
+        "watchdog_zero_runs": zero_runs,
+        "queue_depth": queue_len,
+        "telegram_configured": bool(
+            os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")
+        ),
+    }
+
+
+# ── Warmup Activity Log ─────────────────────────────────────────────────
+@router.get("/api/warmup-activity-log")
+async def get_warmup_activity_log(db: Session = Depends(get_db)):
+    """Live warmup activity: active Celery tasks + recent DB profile changes."""
+    try:
+        from sqlalchemy import func, case
+        import json as _json
+
+        events = []
+
+        # 1) Active Celery warmup tasks
+        try:
+            from tasks.celery_app import celery_app
+            insp = celery_app.control.inspect(timeout=3)
+            active = insp.active() or {}
+            for worker, tasks in active.items():
+                wname = worker.split("@")[0]
+                for t in tasks:
+                    tname = t.get("name", "") or ""
+                    if "warmup" not in tname:
+                        continue
+                    args = t.get("args", []) or []
+                    profile_id = args[0] if len(args) > 0 else None
+                    chunk_info = ""
+                    sites_info = ""
+                    # warmup_chunk_task args: (profile_id, stage, is_rewarmup, chunks, chunk_idx, total_chunks)
+                    if "chunk" in tname and len(args) >= 6:
+                        chunk_idx = args[4]  # 0-based
+                        total_c = args[5]
+                        chunk_info = f"chunk {chunk_idx + 1}/{total_c}"
+                        # Extract current chunk sites
+                        chunks = args[3] if len(args) > 3 else []
+                        if isinstance(chunks, list) and chunk_idx < len(chunks):
+                            cur = chunks[chunk_idx]
+                            cur_sites = cur.get("sites", []) if isinstance(cur, dict) else []
+                            if cur_sites:
+                                sites_info = ", ".join(s.replace("https://", "").replace("http://", "").split("/")[0] for s in cur_sites[:3])
+                                if len(cur_sites) > 3:
+                                    sites_info += f" +{len(cur_sites) - 3}"
+
+                    started = t.get("time_start")
+                    elapsed = ""
+                    if started:
+                        import time
+                        el = int(time.time() - started)
+                        elapsed = f"{el // 60}m {el % 60}s"
+
+                    profile_name = ""
+                    if profile_id:
+                        p = db.query(BrowserProfile.name).filter(BrowserProfile.id == profile_id).first()
+                        if p:
+                            profile_name = p.name
+
+                    events.append({
+                        "type": "active",
+                        "icon": "🔥",
+                        "worker": wname,
+                        "profile_id": profile_id,
+                        "profile_name": profile_name or f"Profile-{profile_id}",
+                        "message": f"Прогрев {chunk_info}".strip() + (f" → {sites_info}" if sites_info else ""),
+                        "elapsed": elapsed,
+                        "task_name": tname.split(".")[-1],
+                        "timestamp": None,
+                    })
+        except Exception as e:
+            logger.warning(f"Celery inspect failed in activity log: {e}")
+
+        # 2) Recently updated profiles (warmup activity in last 30 min)
+        cutoff = datetime.utcnow() - timedelta(minutes=30)
+        recent = db.query(BrowserProfile).filter(
+            BrowserProfile.updated_at >= cutoff,
+            BrowserProfile.warmup_stage > 0,
+        ).order_by(BrowserProfile.updated_at.desc()).limit(30).all()
+
+        for p in recent:
+            age = (datetime.utcnow() - p.updated_at).total_seconds()
+            if age < 60:
+                time_ago = f"{int(age)}s назад"
+            elif age < 3600:
+                time_ago = f"{int(age // 60)}m назад"
+            else:
+                time_ago = f"{int(age // 3600)}h {int((age % 3600) // 60)}m назад"
+
+            if p.warmup_completed:
+                icon = "✅"
+                msg = f"Прогрев завершён (stage {p.warmup_stage})"
+            elif p.status == "error":
+                icon = "❌"
+                msg = f"Ошибка на stage {p.warmup_stage}"
+            else:
+                icon = "📈"
+                msg = f"Stage {p.warmup_stage} пройден"
+
+            events.append({
+                "type": "completed",
+                "icon": icon,
+                "worker": "",
+                "profile_id": p.id,
+                "profile_name": p.name,
+                "message": msg,
+                "elapsed": time_ago,
+                "task_name": "",
+                "timestamp": p.updated_at.isoformat() if p.updated_at else None,
+            })
+
+        # 3) Summary stats
+        total = db.query(func.count(BrowserProfile.id)).scalar() or 0
+        warmed = db.query(func.count(BrowserProfile.id)).filter(BrowserProfile.warmup_completed == True).scalar() or 0
+        active_count = sum(1 for e in events if e["type"] == "active")
+
+        return {
+            "events": events,
+            "summary": {
+                "active_tasks": active_count,
+                "recently_completed": len(events) - active_count,
+                "total_profiles": total,
+                "warmed_profiles": warmed,
+            },
+        }
+    except Exception as e:
+        logger.error(f"Error getting warmup activity log: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# Drop Domains — backorder.ru domain checker
+# ============================================================
+
+@router.get("/drop-domains", response_class=HTMLResponse)
+async def drop_domains_page(request: Request):
+    """Drop domains checker page."""
+    return templates.TemplateResponse("drop_domains.html", {"request": request})
+
+
+@router.get("/api/drop-domains")
+async def get_drop_domains(
+    db: Session = Depends(get_db),
+    category: str = None,
+    maps_found: str = None,
+    batch_date: str = None,
+    checked: str = None,
+    search: str = None,
+    page: int = 1,
+    per_page: int = 100,
+):
+    """Get drop domains with optional filters and pagination."""
+    try:
+        from sqlalchemy import func
+        q = db.query(DropDomain).order_by(DropDomain.hotness.desc(), DropDomain.yandex_tic.desc())
+
+        if category:
+            q = q.filter(DropDomain.maps_category == category)
+        if maps_found == "true":
+            q = q.filter(DropDomain.maps_found == True)
+        elif maps_found == "false":
+            q = q.filter(DropDomain.maps_found == False, DropDomain.maps_checked == True)
+        if batch_date:
+            q = q.filter(DropDomain.batch_date == batch_date)
+        if checked == "true":
+            q = q.filter(DropDomain.maps_checked == True)
+        elif checked == "false":
+            q = q.filter(DropDomain.maps_checked == False)
+        if search:
+            q = q.filter(DropDomain.domain.ilike(f"%{search}%"))
+
+        total = q.count()
+        offset = (max(1, page) - 1) * per_page
+        domains = q.offset(offset).limit(per_page).all()
+
+        return {
+            "items": [d.to_dict() for d in domains],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "pages": (total + per_page - 1) // per_page,
+        }
+    except Exception as e:
+        logger.error(f"Error getting drop domains: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/drop-domains/stats")
+async def get_drop_domains_stats(db: Session = Depends(get_db)):
+    """Get drop domain statistics."""
+    try:
+        from sqlalchemy import func
+        from tasks.drop_domains import is_checking_running
+
+        total = db.query(func.count(DropDomain.id)).scalar() or 0
+        checked = db.query(func.count(DropDomain.id)).filter(DropDomain.maps_checked == True).scalar() or 0
+        found = db.query(func.count(DropDomain.id)).filter(DropDomain.maps_found == True).scalar() or 0
+        unchecked = total - checked
+
+        # Categories breakdown
+        categories = db.query(
+            DropDomain.maps_category, func.count(DropDomain.id)
+        ).filter(
+            DropDomain.maps_found == True,
+            DropDomain.maps_category.isnot(None)
+        ).group_by(DropDomain.maps_category).order_by(func.count(DropDomain.id).desc()).all()
+
+        # Batch dates
+        batches = db.query(
+            DropDomain.batch_date, func.count(DropDomain.id)
+        ).filter(
+            DropDomain.batch_date.isnot(None)
+        ).group_by(DropDomain.batch_date).order_by(DropDomain.batch_date.desc()).all()
+
+        return {
+            "total": total,
+            "checked": checked,
+            "unchecked": unchecked,
+            "found_on_maps": found,
+            "running": is_checking_running(),
+            "categories": [{"name": c[0], "count": c[1]} for c in categories],
+            "batches": [{"date": b[0], "count": b[1]} for b in batches],
+        }
+    except Exception as e:
+        logger.error(f"Error getting drop domain stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/drop-domains/import")
+async def import_drop_domains(db: Session = Depends(get_db)):
+    """Download CSV from backorder.ru and import domains."""
+    try:
+        import requests
+        import csv
+        import io
+
+        url = "https://backorder.ru/csv/?order=desc&tomorrow=1&by=hotness&page=1&items=50"
+        resp = requests.get(url, timeout=60, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; DomainChecker/1.0)"
+        })
+        resp.raise_for_status()
+
+        content = resp.content.decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(content), delimiter=";")
+
+        # Determine batch_date from first row's delete_date
+        batch_date = None
+        imported = 0
+        skipped = 0
+        rows = list(reader)
+
+        if rows:
+            batch_date = rows[0].get("delete_date", "")
+
+        # Get existing domains for this batch to skip duplicates
+        existing = set()
+        if batch_date:
+            existing = {
+                d.domain for d in
+                db.query(DropDomain.domain).filter(DropDomain.batch_date == batch_date).all()
+            }
+
+        for row in rows:
+            domain = (row.get("domainname") or "").strip()
+            if not domain or domain in existing:
+                skipped += 1
+                continue
+
+            # Only .ru/.рф domains
+            if not (domain.endswith(".ru") or domain.endswith(".рф") or ".xn--" in domain):
+                skipped += 1
+                continue
+
+            def safe_int(val, default=0):
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    return default
+
+            d = DropDomain(
+                domain=domain,
+                hotness=safe_int(row.get("hotness")),
+                price=safe_int(row.get("price")),
+                yandex_tic=safe_int(row.get("yandex_tic")),
+                links=safe_int(row.get("links")),
+                visitors=safe_int(row.get("visitors"), -1),
+                domain_age=safe_int(row.get("old")),
+                delete_date=row.get("delete_date", ""),
+                registrar=row.get("registrar", ""),
+                batch_date=batch_date,
+            )
+            db.add(d)
+            existing.add(domain)
+            imported += 1
+
+            # Commit in batches of 500
+            if imported % 500 == 0:
+                db.commit()
+
+        db.commit()
+
+        return {
+            "status": "ok",
+            "imported": imported,
+            "skipped": skipped,
+            "batch_date": batch_date,
+            "total_in_csv": len(rows),
+        }
+    except requests.RequestException as e:
+        logger.error(f"Error downloading backorder CSV: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to download CSV: {e}")
+    except Exception as e:
+        logger.error(f"Error importing drop domains: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/drop-domains/check")
+async def start_check_domains(db: Session = Depends(get_db)):
+    """Start checking unchecked domains on Yandex Maps (self-chaining waves)."""
+    try:
+        from sqlalchemy import func
+        from tasks.drop_domains import start_checking, is_checking_running
+
+        if is_checking_running():
+            return {"status": "ok", "message": "Already running"}
+
+        unchecked = db.query(func.count(DropDomain.id)).filter(
+            DropDomain.maps_checked == False
+        ).scalar() or 0
+
+        if unchecked == 0:
+            return {"status": "ok", "message": "All domains already checked", "unchecked": 0}
+
+        start_checking()
+
+        return {
+            "status": "ok",
+            "message": f"Started checking {unchecked} domains (8 parallel workers)",
+            "unchecked": unchecked,
+        }
+    except Exception as e:
+        logger.error(f"Error starting domain check: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/drop-domains/stop")
+async def stop_check_domains():
+    """Stop the running domain check process."""
+    try:
+        from tasks.drop_domains import stop_checking
+        stop_checking()
+        return {"status": "ok", "message": "Checking stopped"}
+    except Exception as e:
+        logger.error(f"Error stopping domain check: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/drop-domains/batch/{batch_date}")
+async def delete_batch(batch_date: str, db: Session = Depends(get_db)):
+    """Delete all domains from a specific batch."""
+    try:
+        count = db.query(DropDomain).filter(DropDomain.batch_date == batch_date).delete()
+        db.commit()
+        return {"status": "ok", "deleted": count}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/drop-domains/{domain_id}/toggle-interesting")
+async def toggle_interesting(domain_id: int, db: Session = Depends(get_db)):
+    """Toggle the is_interesting flag on a domain."""
+    try:
+        d = db.query(DropDomain).filter(DropDomain.id == domain_id).first()
+        if not d:
+            raise HTTPException(status_code=404, detail="Domain not found")
+        d.is_interesting = not d.is_interesting
+        db.commit()
+        return {"status": "ok", "is_interesting": d.is_interesting}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))

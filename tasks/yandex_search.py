@@ -8,6 +8,7 @@ import random
 import logging
 import math
 import re
+import signal
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, quote_plus
 from datetime import datetime, timedelta
@@ -28,6 +29,7 @@ from app.models.yandex_search_target import YandexSearchTarget
 from app.models.profile_search_visit import ProfileSearchVisit
 from app.models.search_position_history import SearchPositionHistory
 from core import BrowserManager, ProxyManager, CaptchaSolver
+from core.browser_manager import _kill_process_tree
 from core.capsola_solver import create_capsola_solver
 from app.config import settings
 from .celery_app import BaseTask
@@ -45,6 +47,236 @@ MEMORY_BUDGET_MB = 6000  # 6 GB — leaves ~1.6 GB headroom
 # SoftTimeLimitExceeded (which can't interrupt Playwright FFI calls).
 # 420s = 7 min: leaves 2 min buffer for cleanup + browser close.
 SEARCH_MAX_DURATION = 420
+
+# Hard-kill watchdog: kills Chrome/node-driver process tree BEFORE Celery's
+# time_limit sends SIGKILL (which can't be caught and skips cleanup).
+# Fires at WATCHDOG_KILL_AT seconds, which must be < time_limit (600s).
+WATCHDOG_KILL_AT = 560  # 9m20s — gives 40s for cleanup before 600s SIGKILL
+
+
+class _WatchdogTimeout(Exception):
+    """Raised by SIGUSR1 handler when watchdog kills processes."""
+    pass
+
+
+def _watchdog_signal_handler(signum, frame):
+    """SIGUSR1 handler: raises exception to unblock main thread after watchdog kill."""
+    raise _WatchdogTimeout("Watchdog: task timeout, processes killed")
+
+
+class _TaskWatchdog:
+    """Background thread that force-kills Chrome/node-driver when approaching time_limit.
+
+    Problem: When Chrome dies, the Playwright node-driver process may hang,
+    blocking the Python worker on pipe.read(). soft_time_limit (Python signal)
+    cannot interrupt C-level blocking calls. Celery then sends SIGKILL at
+    time_limit, which kills the worker without any cleanup.
+
+    Solution: This watchdog thread sleeps until WATCHDOG_KILL_AT seconds,
+    then kills the node-driver + Chrome process tree. This unblocks pipe.read(),
+    Python regains control, the finally block runs, and cleanup happens normally.
+    """
+
+    def __init__(self):
+        self._thread = None
+        self._cancelled = False
+        self._fired = False
+        self._chrome_pid = None
+        self._profile_dir = None
+        self._start_time = None
+        self._main_thread_id = None
+
+    @property
+    def fired(self):
+        """True if watchdog has killed processes (skip browser.close)."""
+        return self._fired
+
+    def start(self, start_time: float, profile_dir: str = None):
+        """Start the watchdog. Call after browser is created."""
+        import threading
+        self._start_time = start_time
+        self._profile_dir = profile_dir
+        self._cancelled = False
+        self._main_thread_id = threading.current_thread().ident
+        self._thread = threading.Thread(target=self._run, daemon=True, name='task-watchdog')
+        self._thread.start()
+
+    def cancel(self):
+        """Cancel the watchdog (call in finally block after successful cleanup)."""
+        self._cancelled = True
+
+    def _run(self):
+        """Watchdog loop: sleep until kill time, then nuke the process tree."""
+        while not self._cancelled:
+            elapsed = time.time() - self._start_time
+            remaining = WATCHDOG_KILL_AT - elapsed
+            if remaining > 0:
+                # Sleep in 1s increments so cancel takes effect quickly
+                time.sleep(min(remaining, 1.0))
+                continue
+
+            # Time's up — kill Chrome and node-driver by profile dir
+            if self._cancelled:
+                return
+            self._fired = True
+            logger.warning(f"⏰ WATCHDOG: {elapsed:.0f}s elapsed (limit {WATCHDOG_KILL_AT}s), "
+                           f"killing Chrome/node-driver for {self._profile_dir}")
+            self._force_kill()
+
+            # Keep re-injecting exceptions every 3s until task finishes or hard limit.
+            # After the first kill + inject, the main thread may unblock from one
+            # Playwright call but enter another blocking call in error handling.
+            # Repeated injections ensure each new stuck call gets interrupted.
+            max_reinject = 10  # ~30s of retries, well within the 40s window before SIGKILL
+            for i in range(max_reinject):
+                if self._cancelled:
+                    return
+                time.sleep(3)
+                if self._cancelled:
+                    return
+                # SIGUSR1 interrupts C-level read() syscalls
+                try:
+                    os.kill(os.getpid(), signal.SIGUSR1)
+                except Exception:
+                    pass
+                # ctypes injection interrupts Python-level blocking
+                if self._main_thread_id:
+                    try:
+                        import ctypes
+                        logger.warning(f"⏰ WATCHDOG: re-injecting _WatchdogTimeout (attempt {i+2})")
+                        ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                            ctypes.c_ulong(self._main_thread_id),
+                            ctypes.py_object(_WatchdogTimeout)
+                        )
+                    except Exception:
+                        pass
+            return
+
+    def _force_kill(self):
+        """Kill all Chrome AND node-driver processes associated with our profile."""
+        try:
+            import psutil
+            profile_dir = self._profile_dir
+            if not profile_dir:
+                return
+            abs_dir = os.path.abspath(profile_dir)
+            killed = 0
+
+            # Strategy: find node-driver FIRST (before killing Chrome),
+            # then kill node-driver tree (which kills Chrome too).
+            # This ensures pipe.read() is unblocked.
+            node_driver_pids = []
+            chrome_pids = []
+
+            # 1) Scan all processes: find Chrome with our profile, and their parent node-drivers
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    cmdline = ' '.join(proc.info.get('cmdline') or [])
+                    name = (proc.info.get('name') or '').lower()
+                    if ('chrome' in name or 'chromium' in name) and abs_dir in cmdline:
+                        chrome_pids.append(proc.info['pid'])
+                        # Find parent node-driver
+                        try:
+                            parent = psutil.Process(proc.info['pid']).parent()
+                            if parent:
+                                parent_cmd = ' '.join(parent.cmdline())
+                                if 'run-driver' in parent_cmd:
+                                    node_driver_pids.append(parent.pid)
+                                    logger.warning(f"⏰ WATCHDOG: found node-driver PID={parent.pid} (parent of chrome PID={proc.info['pid']})")
+                                else:
+                                    # Go one more level up
+                                    grandparent = parent.parent()
+                                    if grandparent:
+                                        gp_cmd = ' '.join(grandparent.cmdline())
+                                        if 'run-driver' in gp_cmd:
+                                            node_driver_pids.append(grandparent.pid)
+                                            logger.warning(f"⏰ WATCHDOG: found node-driver PID={grandparent.pid} (grandparent of chrome PID={proc.info['pid']})")
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+            logger.warning(f"⏰ WATCHDOG: found {len(chrome_pids)} chrome PIDs, {len(set(node_driver_pids))} node-driver PIDs for {os.path.basename(abs_dir)}")
+
+            # 2) Kill node-drivers first (this kills Chrome children too and unblocks pipe.read())
+            for pid in set(node_driver_pids):
+                try:
+                    logger.warning(f"⏰ WATCHDOG: killing node-driver tree PID={pid}")
+                    _kill_process_tree(pid)
+                    killed += 1
+                except Exception as e:
+                    logger.error(f"⏰ WATCHDOG: failed to kill node-driver PID={pid}: {e}")
+
+            # 3) Kill any remaining Chrome processes not covered by node-driver tree kill
+            for pid in chrome_pids:
+                try:
+                    if psutil.pid_exists(pid):
+                        logger.warning(f"⏰ WATCHDOG: killing remaining chrome PID={pid}")
+                        _kill_process_tree(pid)
+                        killed += 1
+                except Exception:
+                    pass
+
+            # 4) Last resort: if no node-driver found, find ALL run-driver processes
+            #    and kill those that no longer have Chrome children (orphaned)
+            if not node_driver_pids:
+                logger.warning(f"⏰ WATCHDOG: no node-driver found via parent traversal, scanning all run-driver processes")
+                for proc in psutil.process_iter(['pid', 'cmdline']):
+                    try:
+                        cmdline = ' '.join(proc.info.get('cmdline') or [])
+                        if 'run-driver' in cmdline:
+                            # Check if this node-driver's worker PID matches ours
+                            try:
+                                nd_parent = psutil.Process(proc.info['pid']).parent()
+                                if nd_parent and nd_parent.pid == os.getpid():
+                                    logger.warning(f"⏰ WATCHDOG: killing our node-driver PID={proc.info['pid']} (parent is our worker PID={os.getpid()})")
+                                    _kill_process_tree(proc.info['pid'])
+                                    killed += 1
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+
+            if killed:
+                logger.warning(f"⏰ WATCHDOG: killed {killed} processes for {os.path.basename(abs_dir)}")
+            else:
+                logger.warning(f"⏰ WATCHDOG: no processes found for {os.path.basename(abs_dir)}")
+
+            # After killing processes, unblock the main thread.
+            # Playwright's sync API blocks on threading.Event.wait() which
+            # doesn't notice pipe closure from killed node-driver.
+            # Strategy: 1) Try SIGUSR1 signal 2) Try async exception injection
+            time.sleep(2)  # Give pipe.read() a moment to unblock naturally
+
+            # Method 1: SIGUSR1 — works if main thread is in a signal-interruptible syscall
+            logger.warning(f"⏰ WATCHDOG: sending SIGUSR1 to self (PID={os.getpid()}) to unblock main thread")
+            os.kill(os.getpid(), signal.SIGUSR1)
+
+            time.sleep(1)
+
+            # Method 2: Inject async exception into main thread via ctypes
+            # This sets an exception to be raised at the next Python bytecode check
+            if self._main_thread_id:
+                try:
+                    import ctypes
+                    logger.warning(f"⏰ WATCHDOG: injecting _WatchdogTimeout into main thread (id={self._main_thread_id})")
+                    ret = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                        ctypes.c_ulong(self._main_thread_id),
+                        ctypes.py_object(_WatchdogTimeout)
+                    )
+                    if ret == 0:
+                        logger.warning("⏰ WATCHDOG: thread id not found for async exception")
+                    elif ret > 1:
+                        # Something went wrong, clear it
+                        ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                            ctypes.c_ulong(self._main_thread_id), None
+                        )
+                        logger.warning("⏰ WATCHDOG: multiple threads affected, cleared")
+                except Exception as ae:
+                    logger.error(f"⏰ WATCHDOG: async exception injection failed: {ae}")
+
+        except Exception as e:
+            logger.error(f"⏰ WATCHDOG: error during force kill: {e}")
 
 
 def _check_wall_clock(start_time: float, label: str = "") -> bool:
@@ -169,6 +401,10 @@ def _update_search_task_log(task_id: int, message: str, status: str = None,
         with get_db_session() as db:
             task_obj = db.query(Task).filter(Task.id == task_id).first()
             if task_obj:
+                # Don't resurrect tasks that were already terminated by cleanup/watchdog
+                if status == 'in_progress' and task_obj.status in ('failed', 'completed', 'not_found', 'cancelled'):
+                    logger.warning(f"Task {task_id} already {task_obj.status}, skipping in_progress update")
+                    return
                 task_obj.add_log(message)
                 if status:
                     task_obj.status = status
@@ -446,8 +682,12 @@ def _safe_get(driver, url, timeout=40, label="page"):
         return True
     except TimeoutException:
         logger.warning(f"⏱️ {label} timed out after {timeout}s, stopping page load: {url[:100]}")
+        # Use CDP Page.stopLoading to abort pending navigation.
+        # DO NOT use window.stop() via JS — after goto() timeout, the navigation
+        # is still pending internally and evaluate_handle() waits for it to settle
+        # BEFORE starting its own timeout, causing infinite hang with dead proxy.
         try:
-            driver.execute_script("window.stop()")
+            driver.execute_cdp_cmd("Page.stopLoading")
         except Exception:
             pass
         return False
@@ -461,6 +701,54 @@ def _safe_get(driver, url, timeout=40, label="page"):
 
 
 # === Shared analytics blocking configuration ===
+
+# URL patterns to block at network level (Playwright route uses Python regex)
+_ANALYTICS_ROUTE_PATTERNS = re.compile(
+    r'(mc\.yandex\.|metrika|metrica|webvisor|informer\.yandex|'
+    r'google-analytics\.com|googletagmanager\.com|analytics\.google\.com|'
+    r'top-fwz1\.mail\.ru|top\.mail\.ru|counter\.yadro\.ru|'
+    r'hotjar\.com|mouseflow\.com|clarity\.ms|'
+    r'connect\.facebook\.net|bat\.bing\.com|'
+    r'an\.yandex\.ru|yandexadexchange|ads\.adfox\.ru|'
+    r'rating\.openstat|pixel\.wp\.com|'
+    r'jivosite\.com|calltouch|callibri|envybox\.io|comagic\.ru|'
+    r'livetex\.ru|talk-me\.ru|chatra\.io|carrotquest\.io|'
+    r'pagead2\.googlesyndication|adservice\.google|doubleclick\.net)',
+    re.IGNORECASE
+)
+
+# Flag to track if route blocking is already set up on the context
+_route_blocking_set_up = set()  # set of context ids
+
+
+def _setup_playwright_route_blocking(driver):
+    """Set up Playwright context.route() to block analytics requests at network level.
+    
+    This is the RELIABLE way to block requests in modern Chrome (145+).
+    CDP Network.setBlockedURLs was deprecated in Chrome 99 and does nothing.
+    
+    context.route() intercepts requests BEFORE they are sent and aborts them.
+    Works across all pages/tabs in the context, survives navigation.
+    Only set up once per context.
+    """
+    try:
+        context = driver._context
+        ctx_id = id(context)
+        if ctx_id in _route_blocking_set_up:
+            return  # Already set up
+        
+        def _block_analytics(route):
+            try:
+                route.abort()
+            except Exception:
+                pass
+        
+        # Use regex pattern matching — Playwright route() accepts regex
+        context.route(_ANALYTICS_ROUTE_PATTERNS, _block_analytics)
+        _route_blocking_set_up.add(ctx_id)
+        logger.info("🛡️ Playwright route blocking set up (context-level, all analytics patterns)")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to set up Playwright route blocking: {e}")
 _ANALYTICS_BLOCKED_URLS = [
     # Yandex Metrika — all known endpoints
     '*mc.yandex.ru*',
@@ -710,30 +998,29 @@ _ANALYTICS_KILL_JS = """
 
 
 def _pre_inject_analytics_blocker(driver):
-    """Pre-inject analytics blocker via CDP before ANY page navigation.
+    """Pre-inject analytics blocker before ANY page navigation to target site.
     
-    Uses Page.addScriptToEvaluateOnNewDocument — this injects JS that runs
-    BEFORE any page scripts in ALL new documents (including new tabs).
-    Combined with Network.setBlockedURLs to block at network level.
+    Three layers of defense:
+    1. Playwright context.route() — blocks requests at network level (most reliable)
+    2. CDP Page.addScriptToEvaluateOnNewDocument — kills analytics JS objects before page scripts
+    3. Short page load timeout — allows fast abort via Page.stopLoading
     
     MUST be called BEFORE the click that navigates to the target site.
     """
+    # Layer 1: Playwright route blocking (reliable, works in Chrome 145+)
+    _setup_playwright_route_blocking(driver)
+    
     try:
         if hasattr(driver, 'execute_cdp_cmd'):
-            # 1. Pre-inject JS killer that runs before ANY page scripts
+            # Layer 2: Pre-inject JS killer that runs before ANY page scripts
             result = driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
                 'source': _ANALYTICS_KILL_JS
             })
             logger.info(f"🛡️ Pre-injected analytics killer via CDP (id={result.get('identifier', '?')})")
-            
-            # 2. Block analytics URLs at network level (requests never sent)
-            driver.execute_cdp_cmd('Network.enable', {})
-            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
-            logger.info(f"🛡️ Pre-blocked {len(_ANALYTICS_BLOCKED_URLS)} analytics URLs via CDP Network")
 
-            # 3. Set short page load timeout so we can abort fast
+            # Layer 3: Set short page load timeout so we can abort fast
             try:
-                driver.set_page_load_timeout(8)
+                driver.set_page_load_timeout(5)
             except Exception:
                 pass
         else:
@@ -743,21 +1030,9 @@ def _pre_inject_analytics_blocker(driver):
 
 
 def _block_analytics_on_target(driver):
-    """Block Yandex Metrika, Google Analytics, and other analytics/tracking scripts via CDP.
-    
-    This prevents analytics from loading and detecting bot behavior when visiting target sites.
-    Uses Network.setBlockedURLs (CDP) to block requests before they are made.
-    Also injects JS to neuter common analytics objects.
-    """
-    try:
-        if hasattr(driver, 'execute_cdp_cmd'):
-            driver.execute_cdp_cmd('Network.enable', {})
-            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
-            logger.info(f"🛡️ Blocked {len(_ANALYTICS_BLOCKED_URLS)} analytics/tracker URL patterns via CDP")
-        else:
-            logger.warning("⚠️ CDP not available, cannot block analytics URLs")
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to set blocked URLs via CDP: {e}")
+    """Block analytics on the target site — route blocking + JS neutralization."""
+    # Playwright route blocking should already be active, but ensure it
+    _setup_playwright_route_blocking(driver)
     
     # Also inject JS to neuter analytics objects on the current page
     try:
@@ -770,19 +1045,25 @@ def _block_analytics_on_target(driver):
 def _abort_page_load_fast(driver, wait_before_abort=None):
     """Abort page loading quickly to prevent analytics scripts from executing.
     
-    Strategy: wait just enough for the URL to change (redirect registered),
-    then call window.stop() to kill all pending requests including Metrika.
+    Uses CDP Page.stopLoading (immediate, doesn't depend on JS context)
+    followed by window.stop() as fallback.
     """
     if wait_before_abort is None:
-        wait_before_abort = random.uniform(0.3, 0.8)
+        wait_before_abort = random.uniform(0.1, 0.3)
     
     time.sleep(wait_before_abort)
     
+    # CDP Page.stopLoading — immediate, works even if JS context is blocked
     try:
-        driver.execute_script("window.stop();")
-        logger.info(f"🛑 Page load aborted after {wait_before_abort:.1f}s to prevent analytics")
-    except Exception as e:
-        logger.warning(f"⚠️ window.stop() failed: {e}")
+        driver.execute_cdp_cmd("Page.stopLoading")
+        logger.info(f"🛑 Page load aborted via CDP after {wait_before_abort:.1f}s")
+    except Exception:
+        # Fallback to JS
+        try:
+            driver.execute_script("window.stop();")
+            logger.info(f"🛑 Page load aborted via JS after {wait_before_abort:.1f}s")
+        except Exception as e:
+            logger.warning(f"⚠️ Page abort failed: {e}")
     
     # Re-inject analytics neutralization after stop
     try:
@@ -1023,7 +1304,10 @@ def _calculate_keyword_clicks(db, target_id: int, keyword: str, target_success_r
         # Current position = average of last 3 days
         recent_positions = ([r.absolute_position for r in found_3d] 
                            if found_3d else [r.absolute_position for r in found_7d[-3:]])
-        current_pos = sum(recent_positions) / len(recent_positions)
+        if not recent_positions:
+            # Fallback: use all found_14d positions
+            recent_positions = [r.absolute_position for r in found_14d]
+        current_pos = sum(recent_positions) / len(recent_positions) if recent_positions else 50.0
         
         # Previous position = average of days 4-7
         earlier_positions = [r.absolute_position for r in found_7d if r.checked_at < since_3d]
@@ -1465,8 +1749,20 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
         
         time.sleep(random.uniform(2, 4))
         
-        # === Safety check: if we're on ya.ru homepage (not search results), navigate to search ===
+        # === Detect Chrome network errors (proxy/DNS failure) ===
         current_url_check = driver.current_url.lower()
+        if 'chrome-error://' in current_url_check:
+            # Extract error type from page text if possible
+            _err_text = ''
+            try:
+                _err_text = driver.find_element(By.TAG_NAME, 'body').text[:300]
+            except Exception:
+                pass
+            _err_msg = f"Chrome network error on page {page_num}: {_err_text[:200]}" if _err_text else f"Chrome network error on page {page_num}"
+            logger.error(f"  🚫 {_err_msg} (URL={driver.current_url[:120]})")
+            raise Exception(_err_msg)
+        
+        # === Safety check: if we're on ya.ru homepage (not search results), navigate to search ===
         current_url_path = current_url_check.split('?')[0]
         if page_num == 1 and keyword and '/search' not in current_url_check and 'text=' not in current_url_check \
                 and 'showcaptcha' not in current_url_path and 'checkcaptcha' not in current_url_path:
@@ -1474,6 +1770,14 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
             encoded = quote_plus(keyword)
             _safe_get(driver, f"https://ya.ru/search/?text={encoded}", timeout=40, label="search redirect")
             time.sleep(random.uniform(4, 7))
+            # Re-check for chrome-error after redirect attempt
+            if 'chrome-error://' in driver.current_url.lower():
+                _err_text = ''
+                try:
+                    _err_text = driver.find_element(By.TAG_NAME, 'body').text[:300]
+                except Exception:
+                    pass
+                raise Exception(f"Chrome network error after redirect: {_err_text[:200]}")
         
         # Save current URL to verify pagination later
         url_before_scan = driver.current_url
@@ -1795,11 +2099,8 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                         _pre_inject_analytics_blocker(driver)
                         logger.info(f"   🔄 Direct navigation to: {direct_href[:100]}")
                         driver.get(direct_href)
-                        time.sleep(random.uniform(1.0, 2.0))
-                        try:
-                            driver.execute_script("window.stop();")
-                        except Exception:
-                            pass
+                        # Abort immediately — route blocking handles analytics
+                        _abort_page_load_fast(driver, wait_before_abort=random.uniform(0.3, 0.6))
                         try:
                             final_url = driver.current_url.lower()
                             final_host = urlparse(final_url).netloc.lower().replace('www.', '')
@@ -1899,9 +2200,9 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
             
             # === Wait for Yandex click redirect ===
             # Click goes yandex.ru/clck → target site.
-            # Pre-injected script + CDP blocks are already active.
+            # Playwright route blocking is already active (kills analytics requests).
             # We poll URL to detect when we leave Yandex, then abort immediately.
-            time.sleep(random.uniform(1.0, 2.0))
+            time.sleep(random.uniform(0.5, 1.0))
             
             # Check if new tab was opened
             windows_after = driver.window_handles
@@ -1910,21 +2211,16 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                 logger.info(f"   New tab opened, switching to it")
                 driver.switch_to.window(new_window)
                 
-                # Re-apply CDP network blocks on new tab context
+                # Immediately stop loading in new tab — analytics route blocking is context-wide
                 try:
-                    driver.execute_cdp_cmd('Network.enable', {})
-                    driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
-                    logger.info("   🛡️ CDP analytics blocks applied to new tab")
+                    driver.execute_cdp_cmd("Page.stopLoading")
+                    logger.info("   🛑 Page.stopLoading in new tab")
                 except Exception:
-                    pass
-                
-                # Immediately stop loading in new tab
-                try:
-                    driver.execute_script("window.stop();")
-                    logger.info("   🛑 window.stop() in new tab")
-                except Exception:
-                    pass
-                time.sleep(random.uniform(0.2, 0.5))
+                    try:
+                        driver.execute_script("window.stop();")
+                    except Exception:
+                        pass
+                time.sleep(random.uniform(0.1, 0.3))
             
             # Check if we left Yandex
             try:
@@ -1957,10 +2253,10 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
             
             if still_on_yandex:
                 # Poll URL — once off Yandex, immediately abort page load.
-                # Also check for new tabs — _safe_click may have opened target in a new tab
-                # while the current tab stays on SERP.
+                # Playwright route blocking handles analytics. We just need to stop
+                # the page from fully loading (stops remaining resource requests).
                 max_nav_checks = 5
-                nav_wait_each = random.uniform(0.8, 1.2)
+                nav_wait_each = random.uniform(0.4, 0.7)
                 used_fallback = False
                 for nav_i in range(max_nav_checks):
                     time.sleep(nav_wait_each)
@@ -1974,15 +2270,14 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                         new_window = [w for w in windows_now if w not in windows_before][-1]
                         logger.info(f"   New tab detected at check {nav_i+1}, switching to it")
                         driver.switch_to.window(new_window)
+                        # Route blocking is context-wide, just stop loading
                         try:
-                            driver.execute_cdp_cmd('Network.enable', {})
-                            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
+                            driver.execute_cdp_cmd("Page.stopLoading")
                         except Exception:
-                            pass
-                        try:
-                            driver.execute_script("window.stop();")
-                        except Exception:
-                            pass
+                            try:
+                                driver.execute_script("window.stop();")
+                            except Exception:
+                                pass
                         break
                     
                     try:
@@ -1991,11 +2286,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                         # Page is loading off Yandex — abort immediately
                         logger.info(f"   ⏳ URL timed out at poll {nav_i+1} — page loading, aborting...")
                         try:
-                            driver.execute_script("window.stop();")
-                        except Exception:
-                            pass
-                        try:
-                            driver.execute_script(_ANALYTICS_KILL_JS)
+                            driver.execute_cdp_cmd("Page.stopLoading")
                         except Exception:
                             pass
                         try:
@@ -2008,17 +2299,15 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                         break
                     if not _is_on_yandex(current_url):
                         logger.info(f"   ✅ Left Yandex after {(nav_i+1)*nav_wait_each:.1f}s: {current_url[:120]}")
-                        # IMMEDIATELY abort page load — kill Metrika
+                        # IMMEDIATELY abort page load via CDP (fastest method)
                         try:
-                            driver.execute_script("window.stop();")
-                            logger.info("   🛑 window.stop() — page load aborted")
+                            driver.execute_cdp_cmd("Page.stopLoading")
+                            logger.info("   🛑 Page.stopLoading — page load aborted")
                         except Exception:
-                            pass
-                        # Re-inject kill JS as safety net
-                        try:
-                            driver.execute_script(_ANALYTICS_KILL_JS)
-                        except Exception:
-                            pass
+                            try:
+                                driver.execute_script("window.stop();")
+                            except Exception:
+                                pass
                         break
                     if 'clck' in current_url:
                         logger.info(f"   ⏳ Still on /clck (check {nav_i+1}/{max_nav_checks})...")
@@ -2329,12 +2618,26 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
     browser_manager = None
     browser_id = None
     _profile_dir_for_cleanup = None  # Track profile dir for cleanup even if browser_id is None
+    _watchdog = _TaskWatchdog()  # Watchdog kills Chrome before SIGKILL
     params = search_params or {}
     proxy_data = None  # Initialize here so it's always in scope for error handlers
     domain = None  # Initialize so error handler can reference it even if DB fails early
 
     try:
         start_time = time.time()
+
+        # ── Mark task as in_progress IMMEDIATELY ──
+        # This MUST happen before any code that can fail or retry.
+        # Otherwise, failed tasks stay as 'pending' in DB even though Celery consumed
+        # the message, which blocks the scheduler ("buffer_full") for 15 minutes.
+        if task_id:
+            _update_search_task_log(task_id, f"🚀 Задача принята воркером", status='in_progress')
+
+        # Register SIGUSR1 handler for watchdog timeout
+        # When watchdog kills Chrome/node-driver, pipe.read() may not unblock.
+        # Watchdog then sends SIGUSR1 which raises _WatchdogTimeout in main thread.
+        _prev_sigusr1 = signal.getsignal(signal.SIGUSR1)
+        signal.signal(signal.SIGUSR1, _watchdog_signal_handler)
 
         # Load target config
         with get_db_session() as db:
@@ -2376,7 +2679,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
 
         logger.info(f"🔍 Search click-through: profile {profile_id}, keyword '{keyword}', domain '{domain}'")
         if task_id:
-            _update_search_task_log(task_id, f"🚀 Запуск: профиль {profile_data_from_db['name']}, ключ '{keyword}'", status='in_progress')
+            _update_search_task_log(task_id, f"� Профиль {profile_data_from_db['name']}, ключ '{keyword}', домен '{domain}'")
 
         # Initialize browser
         browser_manager = BrowserManager()
@@ -2463,6 +2766,10 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                          'system_fonts', 'codecs', 'keyboard_layout', 'fonts'):
                 if _key in _db_screen:
                     profile_data[_key] = _db_screen[_key]
+            # Restore hardware fingerprint values for consistency across sessions
+            for _hw_key in ('hardware_concurrency', 'device_memory', 'max_touch_points', 'do_not_track'):
+                if _hw_key in _db_screen:
+                    profile_data[_hw_key] = _db_screen[_hw_key]
         
         if is_mobile:
             logger.info(f"📱 Mobile profile detected: {profile_data_from_db['name']}")
@@ -2477,13 +2784,13 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         driver.set_page_load_timeout(40)  # 40s instead of default 300s
         driver.set_script_timeout(15)  # Prevent execute_script from hanging on dead renderer
 
-        # Block heavy resources from the very first page load via CDP
-        try:
-            driver.execute_cdp_cmd('Network.enable', {})
-            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': _ANALYTICS_BLOCKED_URLS})
-            logger.info(f"🚀 Pre-blocked {len(_ANALYTICS_BLOCKED_URLS)} heavy/analytics URLs from start")
-        except Exception as e:
-            logger.warning(f"⚠️ CDP resource blocking failed: {e}")
+        # Start watchdog AFTER browser is created — it will kill Chrome/node-driver
+        # if the task runs past WATCHDOG_KILL_AT, preventing SIGKILL without cleanup
+        _watchdog.start(start_time, _profile_dir_for_cleanup)
+
+        # NOTE: Network.enable + setBlockedURLs moved AFTER first navigation
+        # to avoid interfering with Playwright's internal Fetch.enable proxy auth handler.
+        # Calling Network.enable before first navigation breaks HTTPS CONNECT tunnel auth.
 
         # === Step 0: Entry point — 50/50 direct ya.ru vs through mail.ru ===
         # Real users arrive at Yandex via different paths: direct, bookmarks, or from other sites
@@ -2496,7 +2803,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             if task_id:
                 _update_search_task_log(task_id, f"🔗 Заходим через mail.ru...")
             
-            ref_loaded = _safe_get(driver, 'https://mail.ru', timeout=30, label="mail.ru entry")
+            ref_loaded = _safe_get(driver, 'https://mail.ru', timeout=15, label="mail.ru entry")
             if ref_loaded == 'dead':
                 logger.warning("💀 Browser died visiting mail.ru — recovering page...")
                 if hasattr(driver, 'recover_page') and driver.recover_page():
@@ -2515,7 +2822,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             else:
                 logger.warning(f"⏱️ mail.ru timed out, going direct to Yandex")
                 try:
-                    driver.execute_script("window.stop()")
+                    driver.execute_cdp_cmd("Page.stopLoading")
                 except Exception:
                     pass
         else:
@@ -2551,7 +2858,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         if not _init_title.strip():
             logger.warning("⚠️ ya.ru loaded but Title is EMPTY — page JS did not execute, retrying...")
             try:
-                driver.execute_script("window.stop()")
+                driver.execute_cdp_cmd("Page.stopLoading")
             except Exception:
                 pass
             time.sleep(1)
@@ -3082,9 +3389,9 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             
             time.sleep(random.uniform(4, 7))
             
-            # Stop any still-loading page to free the renderer
+            # Stop any still-loading page via CDP (not JS — avoids hang if navigation pending)
             try:
-                driver.execute_script("window.stop()")
+                driver.execute_cdp_cmd("Page.stopLoading")
             except Exception:
                 pass
             time.sleep(0.5)
@@ -3102,7 +3409,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 logger.warning("   Renderer timeout reading URL, waiting 10s...")
                 time.sleep(10)
                 try:
-                    driver.execute_script("window.stop()")
+                    driver.execute_cdp_cmd("Page.stopLoading")
                 except Exception:
                     pass
                 try:
@@ -3124,20 +3431,33 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     # Direct URL fallback (only for non-captcha redirects)
                     logger.info(f"   Falling back to direct URL search...")
                     encoded = quote_plus(keyword)
+                    _fallback2_ok = False
                     try:
-                        driver.set_page_load_timeout(40)
+                        driver.set_page_load_timeout(60)
                         driver.get(f"https://ya.ru/search/?text={encoded}")
+                        _fallback2_ok = True
                         time.sleep(random.uniform(4, 7))
                         logger.info(f"   After fallback URL: {driver.current_url[:120]}")
                     except TimeoutException:
-                        logger.warning(f"   Fallback URL timed out, continuing with current page...")
+                        logger.warning(f"   Fallback URL timed out — aborting task")
                     except Exception as e:
                         logger.warning(f"   Fallback URL error: {e}")
+                    if not _fallback2_ok:
+                        raise Exception("Search fallback navigation failed — proxy or renderer dead, will retry")
         else:
             # Last resort fallback: direct URL navigation
             logger.warning("⚠️ Could not find search input — using direct URL as fallback")
             encoded = quote_plus(keyword)
-            _safe_get(driver, f"https://ya.ru/search/?text={encoded}", timeout=40, label="search fallback")
+            fallback_ok = _safe_get(driver, f"https://ya.ru/search/?text={encoded}", timeout=60, label="search fallback")
+
+            if not fallback_ok:
+                # Fallback navigation failed (timeout or network error).
+                # Don't attempt recovery: 20+ blocking Playwright calls on dead
+                # renderer/proxy accumulate to 6+ minutes of hanging.
+                # Bail immediately — Celery will retry with a fresh proxy.
+                logger.error("💀 Search fallback failed — aborting task (proxy/renderer dead)")
+                raise Exception("Search fallback navigation failed — proxy or renderer dead, will retry")
+
             time.sleep(random.uniform(3, 5))
             # Wait for search results to render
             try:
@@ -3145,21 +3465,35 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             except Exception:
                 pass
 
+        # Check wall clock after all search input attempts
+        _check_wall_clock(start_time, 'after search input')
+        logger.info(f"⏱️ [TIMING] after search input check passed, elapsed={time.time()-start_time:.0f}s")
+
+        # Reset page load timeout to reasonable value after search section
+        # (_safe_get may have set it to 40s which makes refresh() hang on dead proxy)
+        driver.set_page_load_timeout(15)
+
         # Check for captcha on search results
-        # Stop loading to prevent renderer timeouts on slow proxies
+        # Stop loading via CDP (not JS) to avoid hanging on pending navigation
         try:
-            driver.execute_script("window.stop()")
-        except Exception:
-            pass
+            logger.info("⏱️ [TIMING] calling Page.stopLoading via CDP")
+            driver.execute_cdp_cmd("Page.stopLoading")
+            logger.info("⏱️ [TIMING] Page.stopLoading done")
+        except Exception as _ws_err:
+            logger.warning(f"⏱️ [TIMING] Page.stopLoading failed: {_ws_err}")
         
         try:
+            logger.info("⏱️ [TIMING] reading current_url")
             search_url_debug = driver.current_url
+            logger.info(f"⏱️ [TIMING] current_url done: {search_url_debug[:80]}")
+            logger.info("⏱️ [TIMING] reading title")
             search_title_debug = driver.title
+            logger.info(f"⏱️ [TIMING] title done: {search_title_debug[:50]}")
         except Exception as _diag_err:
             logger.warning(f"⚠️ Renderer timeout reading search page state: {str(_diag_err)[:80]}")
             time.sleep(5)
             try:
-                driver.execute_script("window.stop()")
+                driver.execute_cdp_cmd("Page.stopLoading")
             except Exception:
                 pass
             try:
@@ -3173,17 +3507,22 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         # Skip heavy screenshot here to preserve renderer health
         
         # === Force refresh if page didn't render (Title='' or Title='Яндекс') ===
+        _check_wall_clock(start_time, 'before refresh loop')
+        logger.info(f"⏱️ [TIMING] before refresh loop, elapsed={time.time()-start_time:.0f}s, title='{search_title_debug[:30]}'")
         if search_title_debug.strip() in ('', 'Яндекс') and not detect_captcha_or_block(driver):
-            for _refresh_attempt in range(1, 4):
+            for _refresh_attempt in range(1, 2):
                 logger.warning(f"🔄 Empty page detected (Title='{search_title_debug}'), forced refresh #{_refresh_attempt}...")
+                _check_wall_clock(start_time, f'refresh loop #{_refresh_attempt}')
                 try:
-                    # Stop pending loads before refresh to avoid renderer timeout
+                    # Stop pending loads before refresh via CDP (not JS — avoids navigation hang)
                     try:
-                        driver.execute_script("window.stop()")
+                        driver.execute_cdp_cmd("Page.stopLoading")
                     except Exception:
                         pass
                     time.sleep(0.5)
+                    logger.info("⏱️ [TIMING] calling driver.refresh()")
                     driver.refresh()
+                    logger.info("⏱️ [TIMING] driver.refresh() done")
                     time.sleep(random.uniform(4, 7))
                     try:
                         WebDriverWait(driver, 15).until(
@@ -3205,8 +3544,21 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     break
 
         # === Detect dead browser/proxy: still on ya.ru/ with empty Title after all retries ===
-        _post_refresh_url = driver.current_url
-        _post_refresh_title = driver.title
+        _check_wall_clock(start_time, 'after refresh loop')
+        try:
+            _post_refresh_url = driver.current_url
+            _post_refresh_title = driver.title
+        except Exception as _ctx_err:
+            # PoW JS redirect may destroy execution context — retry once after short wait
+            logger.warning(f"⚠️ Execution context lost (likely PoW redirect), retrying: {_ctx_err}")
+            time.sleep(2)
+            try:
+                _post_refresh_url = driver.current_url
+                _post_refresh_title = driver.title
+            except Exception:
+                # If still failing, use cached values
+                _post_refresh_url = search_url_debug
+                _post_refresh_title = search_title_debug
         if (_post_refresh_title.strip() in ('', 'Яндекс') 
                 and '/search' not in _post_refresh_url.lower()
                 and not detect_captcha_or_block(driver)):
@@ -3254,6 +3606,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             
             heavy_search_captcha = any(t in search_detected for t in ('kaleidoscope', 'silhouette', 'advanced_captcha'))
             # showcaptcha_url is fingerprint-based PoW — 1 attempt only, retry is useless
+            # UNLESS Yandex switches from captchafast → regular showcaptcha (checkbox) after PoW fail
             # kaleidoscope/silhouette have better solve rates — give them 3 attempts
             is_showcaptcha = 'showcaptcha_url' in search_detected
             max_search_captcha_attempts = 1 if is_showcaptcha else 3
@@ -3297,6 +3650,19 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 
                 if solved2:
                     break
+
+                # After showcaptchaFAST PoW failure, Yandex sometimes switches to regular
+                # showcaptcha (checkbox → silhouette). Detect this and grant an extra attempt.
+                if is_showcaptcha and max_search_captcha_attempts == 1:
+                    try:
+                        post_pow_url = driver.current_url.lower()
+                        if 'captchafast' not in post_pow_url and ('showcaptcha' in post_pow_url or 'captcha' in driver.title.lower()):
+                            logger.info("🔄 Yandex switched from captchaFAST → regular captcha after PoW fail — granting extra attempt")
+                            max_search_captcha_attempts = 2  # allow one more loop iteration
+                            is_showcaptcha = False  # next attempt will handle checkbox/silhouette
+                            continue
+                    except Exception:
+                        pass
                     
                 should_retry2 = search_captcha_attempt < max_search_captcha_attempts and solve_time2 < 90
                 if should_retry2:
@@ -3616,6 +3982,19 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         )
         raise
 
+    except _WatchdogTimeout:
+        # Watchdog killed Chrome and injected this exception.
+        # Don't try to use browser/driver — everything is dead.
+        logger.warning(f"⏰ Watchdog timeout caught for profile {profile_id}")
+        if task_id:
+            try:
+                _update_search_task_log(task_id, "⏰ Watchdog: задача превысила лимит времени",
+                                        status='failed', error='Watchdog: task timeout, processes killed',
+                                        exec_time=int(time.time() - start_time))
+            except Exception:
+                pass
+        return {'status': 'error', 'error': 'Watchdog: task timeout, processes killed', 'profile_id': profile_id}
+
     except Exception as e:
         error_str = str(e)
         logger.error(f"Error in search click-through for profile {profile_id}: {e}")
@@ -3657,7 +4036,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         if _browser_dead:
             logger.warning(f"🔄 Browser session crashed/dead — will retry (profile {profile_id})")
             if task_id:
-                _update_search_task_log(task_id, f"🔄 Браузер/прокси не работает, повторяем с другим прокси...")
+                _update_search_task_log(task_id, f"🔄 Браузер/прокси не работает, повторяем с другим прокси...", status='retry')
             # Close current browser before retry
             if browser_manager and browser_id:
                 try:
@@ -3696,7 +4075,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 # Other captcha types (kaleidoscope, silhouette) — retry may help
                 logger.warning(f"🔄 Captcha failure — will retry with different proxy (profile {profile_id})")
                 if task_id:
-                    _update_search_task_log(task_id, f"🔄 Капча не решена, повтор с другим прокси через 60с...")
+                    _update_search_task_log(task_id, f"🔄 Капча не решена, повтор с другим прокси через 60с...", status='retry')
                 # Close current browser before retry
                 if browser_manager and browser_id:
                     try:
@@ -3716,10 +4095,11 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     logger.error(f"Max retries exceeded for captcha failure (profile {profile_id})")
 
         # Retry on proxy tunnel failures (ERR_TUNNEL_CONNECTION_FAILED)
-        if 'ERR_TUNNEL_CONNECTION_FAILED' in error_str or 'ERR_PROXY_CONNECTION_FAILED' in error_str:
+        if 'ERR_TUNNEL_CONNECTION_FAILED' in error_str or 'ERR_PROXY_CONNECTION_FAILED' in error_str \
+                or 'Chrome network error' in error_str:
             logger.warning("🔄 Proxy tunnel failed — will retry with different proxy")
             if task_id:
-                _update_search_task_log(task_id, f"🔄 Прокси не работает, повторяем с другим прокси...")
+                _update_search_task_log(task_id, f"🔄 Прокси не работает, повторяем с другим прокси...", status='retry')
             # Close current browser before retry
             if browser_manager and browser_id:
                 try:
@@ -3774,8 +4154,21 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         return {'status': 'error', 'error': str(e), 'profile_id': profile_id}
 
     finally:
+        # Cancel watchdog — cleanup is happening normally, no need to force-kill
+        _watchdog.cancel()
+
+        # Restore previous SIGUSR1 handler
+        try:
+            signal.signal(signal.SIGUSR1, _prev_sigusr1)
+        except Exception:
+            pass
+
         # Close browser
-        if browser_manager and browser_id:
+        # If watchdog fired, Chrome/node-driver are already dead.
+        # Skip graceful close to avoid blocking on broken Playwright pipe.
+        if _watchdog.fired:
+            logger.info(f"🔒 Watchdog fired — skipping browser.close() (processes already killed)")
+        elif browser_manager and browser_id:
             try:
                 browser_manager.close_browser_session(browser_id)
             except Exception as close_err:
@@ -3801,8 +4194,8 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
 def schedule_search_visits():
     """
     Automatic scheduler for Yandex Search click-through visits.
-    Runs every 5 minutes via celery beat. Checks all active YandexSearchTarget
-    entries and schedules visits according to visits_per_day / intervals.
+    Runs every 1 minute via celery beat. Maintains a buffer of pending tasks
+    so workers always have work available (conveyor model, no idle gaps).
     """
     scheduler_logger = logging.getLogger(__name__ + '.scheduler')
     scheduler_logger.info("🔄 Starting Yandex Search visit scheduler")
@@ -3814,7 +4207,7 @@ def schedule_search_visits():
         import redis as _redis
         from app.config import settings as _s
         r = _redis.Redis(host=_s.redis_host, port=_s.redis_port)
-        if not r.set(lock_key, '1', nx=True, ex=60):
+        if not r.set(lock_key, '1', nx=True, ex=45):
             scheduler_logger.info("⏭️ Another search scheduler already running, skipping")
             return {'status': 'skipped', 'reason': 'duplicate', 'scheduled': 0}
     except Exception as le:
@@ -3823,22 +4216,27 @@ def schedule_search_visits():
     # Don't flood the queue — check both Redis queue AND active DB tasks
     try:
         queue_len = r.llen('yandex_search') or 0
-        if queue_len > 100:
-            scheduler_logger.warning(f"⏭️ yandex_search queue already has {queue_len} tasks, skipping")
+        if queue_len > 50:
+            scheduler_logger.info(f"⏭️ yandex_search queue already has {queue_len} tasks, skipping")
             return {'status': 'skipped', 'reason': f'queue_full ({queue_len})', 'scheduled': 0}
     except Exception as qe:
         scheduler_logger.warning(f"Could not check queue length: {qe}")
 
-    # ── Limit total concurrent tasks to avoid overloading proxies ──
+    # ── Conveyor model: keep a buffer of pending tasks so workers never idle ──
     # concurrency=20 in docker-compose limits actual simultaneous workers
-    # This limit controls how many tasks sit in queue (pending+in_progress)
-    # Keep slightly above concurrency so workers always have work ready
+    # BUFFER_TARGET = how many pending tasks to maintain (above in_progress)
+    # Workers finish a task → immediately grab next from buffer → no gap
     MAX_CONCURRENT_SEARCH_TASKS = 100
+    BUFFER_TARGET = 10  # keep ~10 pending tasks ready for workers (concurrency=10)
     try:
         with get_db_session() as db:
             active_count = db.query(Task).filter(
                 Task.task_type == 'yandex_search',
                 Task.status.in_(['in_progress', 'pending']),
+            ).count()
+            pending_count = db.query(Task).filter(
+                Task.task_type == 'yandex_search',
+                Task.status == 'pending',
             ).count()
             if active_count >= MAX_CONCURRENT_SEARCH_TASKS:
                 scheduler_logger.info(
@@ -3846,8 +4244,15 @@ def schedule_search_visits():
                 )
                 # Still run cleanup below, but skip scheduling
                 pass
+            elif pending_count >= BUFFER_TARGET:
+                scheduler_logger.info(
+                    f"⏭️ Buffer full: {pending_count} pending tasks (target={BUFFER_TARGET}), skipping"
+                )
+                # Still run cleanup below, but skip scheduling
+                pass
     except Exception as ce:
         active_count = 0
+        pending_count = 0
         scheduler_logger.warning(f"Could not check active task count: {ce}")
 
     # ── Cleanup zombie tasks ──
@@ -3860,18 +4265,21 @@ def schedule_search_visits():
             now = datetime.utcnow()
 
             # If a task is truly running, started_at must exist.
-            # Give it a grace period slightly above the task soft time limit.
-            in_progress_cutoff = now - timedelta(minutes=25)
+            # Give it a grace period slightly above the task hard time limit (600s).
+            in_progress_cutoff = now - timedelta(minutes=11)
+            from sqlalchemy import or_
             stale_in_progress = db.query(Task).filter(
                 Task.task_type == 'yandex_search',
                 Task.status == 'in_progress',
-                Task.started_at.isnot(None),
-                Task.started_at < in_progress_cutoff,
+                or_(
+                    (Task.started_at.isnot(None)) & (Task.started_at < in_progress_cutoff),
+                    (Task.started_at.is_(None)) & (Task.created_at < in_progress_cutoff),
+                ),
             ).all()
 
             # Pending tasks may sit in Redis if workers are busy. Only clean them
-            # if they are REALLY old (e.g., worker was down).
-            pending_cutoff = now - timedelta(minutes=90)
+            # if they are old enough that they surely won't be picked up.
+            pending_cutoff = now - timedelta(minutes=15)
             stale_pending = db.query(Task).filter(
                 Task.task_type == 'yandex_search',
                 Task.status == 'pending',
@@ -3920,14 +4328,24 @@ def schedule_search_visits():
                 Task.task_type == 'yandex_search',
                 Task.status.in_(['in_progress', 'pending']),
             ).count()
+            pending_count = db.query(Task).filter(
+                Task.task_type == 'yandex_search',
+                Task.status == 'pending',
+            ).count()
     except Exception as ce2:
         scheduler_logger.warning(f"Could not re-check active task count after cleanup: {ce2}")
 
-    # After cleanup, re-check active count and skip scheduling if still too many
+    # After cleanup, re-check: skip if hard limit reached OR buffer already full
     if active_count >= MAX_CONCURRENT_SEARCH_TASKS:
         return {
             'status': 'skipped',
             'reason': f'too_many_active ({active_count}/{MAX_CONCURRENT_SEARCH_TASKS})',
+            'scheduled': 0
+        }
+    if pending_count >= BUFFER_TARGET:
+        return {
+            'status': 'skipped',
+            'reason': f'buffer_full ({pending_count}/{BUFFER_TARGET} pending)',
             'scheduled': 0
         }
 
@@ -3955,21 +4373,49 @@ def schedule_search_visits():
                 scheduler_logger.warning("⚠️  No warmed profiles available")
                 return {'status': 'error', 'message': 'No warmed profiles available', 'scheduled': 0}
 
-            scheduler_logger.info(f"✅ Found {len(all_profile_ids)} warmed profiles")
+            # Exclude profiles that already have pending/in_progress tasks
+            # to prevent multiple concurrent tasks on the same Chrome profile
+            busy_profile_rows = db.query(Task.profile_id).filter(
+                Task.task_type == 'yandex_search',
+                Task.status.in_(['in_progress', 'pending']),
+                Task.profile_id.isnot(None),
+            ).distinct().all()
+            busy_profile_ids = set(row[0] for row in busy_profile_rows)
+            free_profile_ids = [pid for pid in all_profile_ids if pid not in busy_profile_ids]
+
+            scheduler_logger.info(
+                f"✅ Found {len(all_profile_ids)} warmed profiles, "
+                f"{len(busy_profile_ids)} busy, {len(free_profile_ids)} free"
+            )
+
+            if not free_profile_ids:
+                scheduler_logger.warning("⚠️  All warmed profiles are busy with pending/in_progress tasks")
+                return {'status': 'skipped', 'reason': 'all_profiles_busy', 'scheduled': 0}
+
+            # Track profiles assigned in THIS scheduler run (across all targets)
+            profiles_assigned_this_run = set()
 
             scheduled_count = 0
-            # How many more tasks we can schedule before hitting the global limit
-            slots_available = MAX_CONCURRENT_SEARCH_TASKS - active_count
+            # Conveyor: only add enough tasks to refill the buffer
+            # slots_available = how many NEW pending tasks to add
+            buffer_deficit = max(0, BUFFER_TARGET - pending_count)
+            hard_limit_remaining = max(0, MAX_CONCURRENT_SEARCH_TASKS - active_count)
+            slots_available = min(buffer_deficit, hard_limit_remaining)
+            scheduler_logger.info(
+                f"📊 Buffer: {pending_count} pending, deficit={buffer_deficit}, "
+                f"active={active_count}, slots_available={slots_available}"
+            )
+            if slots_available <= 0:
+                scheduler_logger.info("⏭️ No slots needed (buffer full)")
+                return {'status': 'skipped', 'reason': 'buffer_full', 'scheduled': 0}
             current_time = datetime.utcnow()
 
             # ═══ Phase 1: Gather budget data for ALL targets ═══
             target_schedule_data = []
             for target in targets:
                 try:
-                    should_visit, reason = target.should_visit_now(current_time)
-                    if not should_visit:
-                        scheduler_logger.info(f"⏭️  Skipping {target.domain}: {reason}")
-                        continue
+                    # Conveyor model: no interval gating — we schedule based on
+                    # click budget only. Buffer is refilled every minute.
 
                     keywords = target.get_active_keywords_list()
                     disabled_kws = target.get_disabled_keywords_set()
@@ -4014,14 +4460,35 @@ def schedule_search_visits():
                     
                     keyword_budgets = []
                     total_budget = 0
+                    
+                    # Count pending/in_progress tasks per keyword for this target
+                    # to prevent creating duplicate tasks while previous ones
+                    # haven't completed (race condition with search_position_history)
+                    pending_per_keyword = {}
+                    try:
+                        pending_tasks = db.query(Task).filter(
+                            Task.task_type == 'yandex_search',
+                            Task.status.in_(['pending', 'in_progress']),
+                        ).all()
+                        for pt in pending_tasks:
+                            p = pt.parameters or {}
+                            if p.get('target_id') == target.id:
+                                pk = p.get('keyword', '')
+                                pending_per_keyword[pk] = pending_per_keyword.get(pk, 0) + 1
+                    except Exception:
+                        pass
+                    
                     for kw in keywords:
                         fw = freq_weights.get(kw, 1.0)
                         kw_calc = _calculate_keyword_clicks(db, target.id, kw, target_success_rate=sr, freq_weight=fw)
-                        remaining = max(0, kw_calc["clicks_per_day"] - kw_calc["today_done"])
+                        # Subtract pending tasks from remaining to prevent double-scheduling
+                        pending_kw = pending_per_keyword.get(kw, 0)
+                        effective_done = kw_calc["today_done"] + pending_kw
+                        remaining = max(0, kw_calc["clicks_per_day"] - effective_done)
                         keyword_budgets.append({
                             "keyword": kw,
                             "clicks_per_day": kw_calc["clicks_per_day"],
-                            "today_done": kw_calc["today_done"],
+                            "today_done": effective_done,
                             "remaining": remaining,
                             "phase": kw_calc["phase"],
                             "position": kw_calc.get("current_position"),
@@ -4125,14 +4592,17 @@ def schedule_search_visits():
                     )
 
                     # ── Profile selection: 1 profile = 1 click per target ──
-                    # Exclude profiles that already clicked THIS target.
+                    # Exclude profiles that already clicked THIS target
+                    # AND profiles busy with pending/in_progress tasks
+                    # AND profiles already assigned in this scheduler run
                     already_clicked_ids = set(
                         row[0] for row in db.query(ProfileSearchVisit.profile_id).filter(
                             ProfileSearchVisit.search_target_id == target.id,
                             ProfileSearchVisit.status == 'completed',
                         ).all()
                     )
-                    available_ids = [pid for pid in all_profile_ids if pid not in already_clicked_ids]
+                    excluded_ids = already_clicked_ids | busy_profile_ids | profiles_assigned_this_run
+                    available_ids = [pid for pid in free_profile_ids if pid not in excluded_ids]
                     random.shuffle(available_ids)
 
                     if not available_ids:
@@ -4185,8 +4655,8 @@ def schedule_search_visits():
 
                 proportion = td['total_budget'] / grand_total if grand_total > 0 else 1.0 / len(target_schedule_data)
                 target_slots = max(1, round(slots_available * proportion))
-                # Cap per-domain tasks to avoid one domain dominating the round
-                MAX_TASKS_PER_DOMAIN = 16
+                # Cap per-domain tasks per scheduler run (conveyor: small batches, frequent refills)
+                MAX_TASKS_PER_DOMAIN = 10
                 target_slots = min(target_slots, len(candidates), len(available_ids), MAX_TASKS_PER_DOMAIN)
 
                 scheduler_logger.info(
@@ -4202,12 +4672,23 @@ def schedule_search_visits():
 
                 # Build per-keyword sub-queues for this target
                 # Each keyword gets its own queue to enable keyword-level interleaving
+                # IMPORTANT: each profile used at most ONCE (no modulo wrap-around)
+                # Filter available_ids against profiles already assigned to other targets in this run
+                target_available = [pid for pid in available_ids if pid not in profiles_assigned_this_run]
+                target_slots = min(target_slots, len(target_available))
                 keyword_queues = {}  # keyword -> list of tasks
                 profile_idx = 0
                 for i in range(target_slots):
+                    if profile_idx >= len(target_available):
+                        scheduler_logger.info(
+                            f"⚠️ {target.domain}: ran out of free profiles after {i} tasks "
+                            f"(had {len(target_available)} available)"
+                        )
+                        break
                     chosen = candidates[i]
                     kw = chosen['keyword']
-                    profile_id = available_ids[profile_idx % len(available_ids)]
+                    profile_id = target_available[profile_idx]
+                    profiles_assigned_this_run.add(profile_id)
                     profile_idx += 1
                     if kw not in keyword_queues:
                         keyword_queues[kw] = []
@@ -4236,10 +4717,10 @@ def schedule_search_visits():
                     break  # all queues exhausted
 
             total_tasks_planned = len(interleaved)
-            slot_width = 280 // max(total_tasks_planned, 1)
 
             scheduler_logger.info(
-                f"🔀 Interleaved {total_tasks_planned} tasks across {len(per_target_queues)} keyword queues"
+                f"🔀 Interleaved {total_tasks_planned} tasks across {len(per_target_queues)} keyword queues "
+                f"(buffer refill: {pending_count}→{pending_count + total_tasks_planned} pending)"
             )
 
             updated_targets = set()
@@ -4250,12 +4731,10 @@ def schedule_search_visits():
 
                 try:
                     keyword = chosen['keyword']
-                    delay_seconds = idx * slot_width + random.randint(0, max(slot_width - 5, 1))
 
                     scheduler_logger.info(
                         f"  📝 [{idx+1}/{total_tasks_planned}] {target.domain} keyword='{keyword}' "
-                        f"({chosen['reason']}, done {chosen['today_done']}/{chosen['clicks_per_day']}, "
-                        f"delay={delay_seconds}s)"
+                        f"({chosen['reason']}, done {chosen['today_done']}/{chosen['clicks_per_day']})"
                     )
 
                     task_record = Task(
@@ -4282,7 +4761,6 @@ def schedule_search_visits():
 
                     async_result = yandex_search_click_task.apply_async(
                         args=[profile_id, target.id, keyword, task_record.id, search_params],
-                        countdown=delay_seconds,
                         queue='yandex_search'
                     )
 
@@ -4295,8 +4773,7 @@ def schedule_search_visits():
                     updated_targets.add(target.id)
                     scheduler_logger.info(
                         f"✅ Scheduled search visit for {target.domain} keyword='{keyword}' "
-                        f"profile={profile_id} phase={chosen['phase']} "
-                        f"(delay: {delay_seconds}s)"
+                        f"profile={profile_id} phase={chosen['phase']}"
                     )
 
                 except Exception as e:
@@ -4306,10 +4783,8 @@ def schedule_search_visits():
                     )
                     continue
 
-            # Update last_visit_at for all targets that got tasks
-            for td in target_schedule_data:
-                if td['target'].id in updated_targets:
-                    td['target'].last_visit_at = current_time
+            # Conveyor model: last_visit_at no longer updated at scheduling time.
+            # Tasks go straight to queue, no interval-based gating needed.
             try:
                 db.commit()
             except Exception as commit_err:

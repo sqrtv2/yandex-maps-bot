@@ -767,9 +767,12 @@ function renderLogs(logs) {
             details = `<span class="${errClass}">${t.error_message.substring(0, 60)}</span>`;
         }
 
+        const deviceIcon = t.is_mobile ? '📱' : '🖥️';
+        const profileLabel = t.profile_name || `#${t.profile_id || (t.parameters && t.parameters.profile_id) || '—'}`;
+
         return `<tr>
             <td><small>${created}</small></td>
-            <td><small>#${t.profile_id || (t.parameters && t.parameters.profile_id) || '—'}</small></td>
+            <td><small>${deviceIcon} ${profileLabel}</small></td>
             <td><small><strong>${keyword}</strong> → ${domain}</small></td>
             <td>${statusBadge}</td>
             <td><small>${details}</small></td>

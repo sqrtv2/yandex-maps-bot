@@ -22,6 +22,24 @@ RUN apt-get update && apt-get install -y \
     fonts-liberation \
     fontconfig \
     cabextract \
+    dbus \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0t64 \
+    libatk-bridge2.0-0t64 \
+    libxkbcommon0 \
+    libatspi2.0-0t64 \
+    libasound2t64 \
+    libcups2t64 \
+    libdrm2 \
+    libgbm1 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libdbus-1-3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Microsoft core fonts (Arial, Times New Roman, Verdana, etc.)
@@ -39,10 +57,24 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright Chromium browser with all OS dependencies
-# Use shared path so it works for both root and appuser
+# Replace original playwright module with rebrowser-playwright (anti-CDP-detection patches)
+# rebrowser-playwright provides module rebrowser_playwright, symlink makes it available as playwright too
+RUN pip uninstall -y playwright && rm -rf /usr/local/lib/python3.11/site-packages/playwright && \
+    ln -s /usr/local/lib/python3.11/site-packages/rebrowser_playwright /usr/local/lib/python3.11/site-packages/playwright
+
+# Install Chromium browser via rebrowser-playwright (patched driver)
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
-RUN playwright install --with-deps chromium
+RUN python -m rebrowser_playwright install chromium
+
+# Download Chrome 145 for better Yandex SmartCaptcha fingerprint compatibility
+# rebrowser-playwright 1.52 ships Chromium 136, but Chrome 145 passes more checks.
+# browser_manager.py globs /opt/pw-browsers/chromium-*/chrome-linux*/chrome and uses the newest.
+RUN wget -q https://cdn.playwright.dev/chrome-for-testing-public/145.0.7632.6/linux64/chrome-linux64.zip -O /tmp/chrome145.zip && \
+    mkdir -p /opt/pw-browsers/chromium-1208 && \
+    cd /opt/pw-browsers/chromium-1208 && \
+    python -c "import zipfile; zipfile.ZipFile('/tmp/chrome145.zip').extractall('.')" && \
+    rm /tmp/chrome145.zip && \
+    chmod -R +x /opt/pw-browsers/chromium-1208/chrome-linux64/
 
 # Copy application code
 COPY . .
