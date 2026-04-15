@@ -13,6 +13,8 @@ Provides drop-in replacements for:
 Allows existing task code (~8,600 lines) to work with Playwright
 with ONLY import changes.
 """
+from __future__ import annotations
+
 import os
 import time
 import random
@@ -202,14 +204,24 @@ class PlaywrightElement:
 
     def find_element(self, by: str, value: str) -> 'PlaywrightElement':
         selector = _to_playwright_selector(by, value)
-        handle = self._handle.query_selector(selector)
+        try:
+            handle = self._page.query_selector(selector)
+        except Exception as e:
+            if 'closed' in str(e).lower() or 'timeout' in str(e).lower():
+                raise NoSuchElementException(f"Page closed or timeout: {by}={value}")
+            raise
         if not handle:
             raise NoSuchElementException(f"No element found: {by}={value}")
         return PlaywrightElement(handle, self._page)
 
-    def find_elements(self, by: str, value: str) -> List['PlaywrightElement']:
+    def find_elements(self, by: str, value: str) -> List[PlaywrightElement]:
         selector = _to_playwright_selector(by, value)
-        handles = self._handle.query_selector_all(selector)
+        try:
+            handles = self._page.query_selector_all(selector)
+        except Exception as e:
+            if 'closed' in str(e).lower() or 'timeout' in str(e).lower():
+                return []
+            raise
         return [PlaywrightElement(h, self._page) for h in handles]
 
     # ── internal ──
@@ -318,6 +330,12 @@ class PlaywrightDriver:
         self._script_timeout = 15_000  # ms
         self._cdp_session = None
         self._switch_to = _SwitchTo(self)
+        # Set default timeout for all Playwright operations (evaluate, wait_for, etc.)
+        # Prevents hanging on dead renderers / pending navigations.
+        # 5s is enough for any legitimate DOM/JS operation; anything longer
+        # means the page is stuck (navigation pending, renderer dead, etc.).
+        self._default_timeout_ms = 5_000
+        self._page.set_default_timeout(self._default_timeout_ms)
 
     def recover_page(self) -> bool:
         """Create a new page in the same context when the current one is dead.
@@ -429,14 +447,24 @@ class PlaywrightDriver:
 
     def find_element(self, by: str, value: str) -> PlaywrightElement:
         selector = _to_playwright_selector(by, value)
-        handle = self._page.query_selector(selector)
+        try:
+            handle = self._page.query_selector(selector)
+        except Exception as e:
+            if 'closed' in str(e).lower() or 'timeout' in str(e).lower():
+                raise NoSuchElementException(f"Page closed or timeout: {by}={value}")
+            raise
         if not handle:
             raise NoSuchElementException(f"No element found: {by}={value}")
         return PlaywrightElement(handle, self._page)
 
     def find_elements(self, by: str, value: str) -> List[PlaywrightElement]:
         selector = _to_playwright_selector(by, value)
-        handles = self._page.query_selector_all(selector)
+        try:
+            handles = self._page.query_selector_all(selector)
+        except Exception as e:
+            if 'closed' in str(e).lower() or 'timeout' in str(e).lower():
+                return []
+            raise
         return [PlaywrightElement(h, self._page) for h in handles]
 
     # ── JavaScript ──
@@ -446,7 +474,25 @@ class PlaywrightDriver:
 
         Selenium passes WebElement args and uses ``arguments[N]`` in JS.
         We unwrap PlaywrightElements to ElementHandles for evaluate.
+        Uses a 10s timeout to prevent hanging on broken CDP connections.
         """
+        # Default timeout is already 5s (set in __init__), no need to
+        # change it per-call.  Just execute and handle hangs.
+        try:
+            return self._execute_script_inner(script, *args)
+        except Exception as e:
+            # If evaluate timed out, a pending navigation may be blocking it.
+            # Clear it so subsequent evaluate() calls don't hang too.
+            err_str = str(e).lower()
+            if 'timeout' in err_str or 'navigation' in err_str:
+                try:
+                    self.execute_cdp_cmd("Page.stopLoading")
+                except Exception:
+                    pass
+            raise
+
+    def _execute_script_inner(self, script: str, *args) -> Any:
+        """Inner implementation of execute_script."""
         pw_args = []
         for arg in args:
             if isinstance(arg, PlaywrightElement):
@@ -593,11 +639,42 @@ class PlaywrightDriver:
 
     @property
     def browser_pid(self) -> Optional[int]:
-        """Chrome process PID for cleanup tracking."""
+        """Chrome main process PID for cleanup tracking.
+        
+        With launch_persistent_context, context.browser is None so we can't use
+        browser.process.pid. Instead we get the Playwright node-driver PID
+        (parent of Chrome) and find the main Chrome child.
+        """
+        # Method 1: browser.process.pid (works with browser.launch, not persistent_context)
         try:
-            return self._browser.process.pid if hasattr(self._browser, 'process') else None
+            if hasattr(self._browser, 'process') and self._browser.process:
+                return self._browser.process.pid
         except Exception:
-            return None
+            pass
+        # Method 2: find Chrome PID via node-driver process tree
+        try:
+            transport = self._context._impl_obj._channel._connection._transport
+            if hasattr(transport, '_proc') and transport._proc:
+                import psutil
+                node_pid = transport._proc.pid
+                node = psutil.Process(node_pid)
+                for child in node.children(recursive=False):
+                    if 'chrome' in (child.name() or '').lower():
+                        return child.pid
+        except Exception:
+            pass
+        return None
+
+    @property
+    def node_driver_pid(self) -> Optional[int]:
+        """Playwright node-driver process PID — parent of Chrome process tree."""
+        try:
+            transport = self._context._impl_obj._channel._connection._transport
+            if hasattr(transport, '_proc') and transport._proc:
+                return transport._proc.pid
+        except Exception:
+            pass
+        return None
 
     def __repr__(self):
         try:
@@ -680,7 +757,28 @@ class PlaywrightActionChains:
         return self
 
     def perform(self):
-        """Execute all queued actions."""
+        """Execute all queued actions with a 10s timeout to prevent hanging."""
+        _ACTION_TIMEOUT_MS = 10000
+        old_timeout = self._page._timeout_settings._timeout if hasattr(self._page, '_timeout_settings') else None
+        try:
+            self._page.set_default_timeout(_ACTION_TIMEOUT_MS)
+        except Exception:
+            pass
+
+        try:
+            self._perform_inner()
+        finally:
+            try:
+                self._page.set_default_timeout(
+                    old_timeout if old_timeout is not None
+                    else self._driver._default_timeout_ms
+                )
+            except Exception:
+                pass
+        self._actions = []
+
+    def _perform_inner(self):
+        """Inner perform implementation."""
         mouse = self._page.mouse
         keyboard = self._page.keyboard
         _current_x = 0
@@ -765,8 +863,6 @@ class PlaywrightActionChains:
                     self._actions.clear()
                     raise  # Don't swallow browser death
                 logger.warning(f"ActionChain action '{action_name}' failed: {e}")
-
-        self._actions.clear()
 
     def reset_actions(self):
         self._actions.clear()

@@ -5,6 +5,7 @@ Realistic browsing sessions that build history, cookies, and behavioral patterns
 import os
 import time
 import random
+import signal
 import logging
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
@@ -26,6 +27,16 @@ from core import BrowserManager, ProxyManager, ProfileGenerator
 from core.domain_manager import domain_manager
 from core.warmup_url_manager import get_warmup_urls
 from .celery_app import BaseTask
+
+import redis as _redis
+
+def _get_warmup_redis():
+    """Get Redis connection for warmup completion tracking."""
+    return _redis.Redis(
+        host=os.environ.get('YANDEX_BOT_REDIS_HOST', 'redis'),
+        port=int(os.environ.get('YANDEX_BOT_REDIS_PORT', 6379)),
+        db=0, decode_responses=True
+    )
 
 # Fast mode: reduce all delays by this factor for higher throughput
 FAST_MODE = getattr(settings, 'fast_mode', False)
@@ -53,19 +64,8 @@ SPEED_FACTOR = 0.5 if FAST_MODE else 1.0  # 50% of normal time in fast mode
 
 # === Warmup site pools ===
 
-# Yandex ecosystem — MUST visit to build Yandex cookies/trust
-YANDEX_ECOSYSTEM = [
-    "https://ya.ru",
-    "https://yandex.ru",
-    "https://dzen.ru",
-    "https://market.yandex.ru",
-    "https://pogoda.yandex.ru",
-    "https://news.yandex.ru",
-    "https://music.yandex.ru",
-    "https://www.kinopoisk.ru",
-    "https://translate.yandex.ru",
-    "https://yandex.ru/images",
-]
+# Yandex ecosystem — DISABLED (captcha not handled during warmup)
+YANDEX_ECOSYSTEM = []
 
 # Popular Russian sites — build realistic browsing profile
 POPULAR_RUSSIAN_SITES = [
@@ -105,55 +105,9 @@ INTERNATIONAL_SITES = [
     "https://github.com",
 ]
 
-# Search queries for Yandex (realistic Russian)
-YANDEX_SEARCH_QUERIES = [
-    "погода москва сегодня",
-    "курс доллара",
-    "новости россия",
-    "рецепт борща",
-    "расписание электричек",
-    "купить квартиру москва",
-    "ремонт стиральной машины",
-    "как оформить загранпаспорт",
-    "отзывы стоматология рядом",
-    "расписание кинотеатр",
-    "кафе рядом со мной",
-    "доставка еды",
-    "запись к врачу онлайн",
-    "автосервис отзывы",
-    "фитнес клуб рядом",
-    "туры в турцию 2025",
-    "лучшие рестораны",
-    "салон красоты отзывы",
-    "ветеринарная клиника рядом",
-    "детский сад запись",
-    "аптека рядом",
-    "химчистка рядом",
-    "мастер на час",
-    "юрист консультация бесплатно",
-    "шиномонтаж рядом",
-]
-
-# Yandex Maps search queries — for stage 2-3 warmup (pre-browsing maps)
-YANDEX_MAPS_SEARCH_QUERIES = [
-    "кафе рядом",
-    "аптека",
-    "супермаркет рядом",
-    "банкомат сбербанк",
-    "заправка рядом",
-    "парикмахерская рядом",
-    "стоматология",
-    "ветеринарная клиника",
-    "шиномонтаж",
-    "автосервис",
-    "фитнес клуб",
-    "детский сад рядом",
-    "поликлиника",
-    "ресторан",
-    "пиццерия рядом",
-    "химчистка",
-    "ремонт телефонов",
-]
+# Yandex search/maps queries — DISABLED (captcha not handled during warmup)
+YANDEX_SEARCH_QUERIES = []
+YANDEX_MAPS_SEARCH_QUERIES = []
 
 # Google search queries (mixed)
 GOOGLE_SEARCH_QUERIES = [
@@ -176,6 +130,47 @@ MIN_WARMUP_SESSIONS = 3
 MIN_WARMUP_HOURS_SPREAD = 1
 # Hours between warmup sessions
 WARMUP_SESSION_INTERVAL_HOURS = 0.25
+# Chunked warmup: max sites per browser session chunk
+WARMUP_CHUNK_MAX_SITES = 10
+# Minimum successful site visits required to count a warmup session
+MIN_WARMUP_VISITS_PER_SESSION = 10
+
+# === 10K external sites pool ===
+_EXTERNAL_SITES_POOL = []
+
+def _load_external_sites():
+    """Load 10K sites from data/warmup_sites_10k.txt (lazy, once)."""
+    global _EXTERNAL_SITES_POOL
+    if _EXTERNAL_SITES_POOL:
+        return _EXTERNAL_SITES_POOL
+    sites_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "warmup_sites_10k.txt")
+    try:
+        with open(sites_file, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        _EXTERNAL_SITES_POOL = [f"https://{d}" if not d.startswith("http") else d for d in lines]
+        logger.info(f"📂 Loaded {len(_EXTERNAL_SITES_POOL)} external warmup sites from {sites_file}")
+    except FileNotFoundError:
+        logger.warning(f"External sites file not found: {sites_file}")
+    except Exception as e:
+        logger.error(f"Failed to load external sites: {e}")
+    return _EXTERNAL_SITES_POOL
+
+
+def _get_unique_external_sites(profile_id: int, count: int, stage: int = 1, exclude: list = None) -> List[str]:
+    """Pick a unique subset of external sites for a profile.
+    
+    Uses profile_id + stage as seed so each profile gets a deterministic
+    but different selection. Different stages give different sites.
+    """
+    pool = _load_external_sites()
+    if not pool:
+        return []
+    exclude_set = set(exclude or [])
+    available = [s for s in pool if s not in exclude_set]
+    if not available:
+        return []
+    rng = random.Random(profile_id * 1000 + stage)
+    return rng.sample(available, min(count, len(available)))
 
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=30, time_limit=600, soft_time_limit=540)
@@ -225,113 +220,24 @@ def generate_warmup_sites_task(self, profile_ids: List[int]):
     return {"generated": generated, "errors": errors, "total": len(profile_ids)}
 
 
-def _build_warmup_site_list(profile_id: int, count: int = 20, stage: int = 1, persona_data: dict = None) -> List[str]:
-    """Build a diverse site list based on warmup stage.
+def _build_warmup_site_list(profile_id: int, count: int = 50, stage: int = 1, persona_data: dict = None) -> List[str]:
+    """Build a diverse site list for warmup.
     
-    If persona_data contains 'warmup_sites' (AI-generated 50 sites),
-    uses those as the PRIMARY pool — each session picks a different subset,
-    ensuring Yandex ecosystem coverage on every visit.
-
-    If no warmup_sites, falls back to selecting from hardcoded lists.
-
-    Stage 1: General browsing + Yandex ecosystem (build cookies)
-    Stage 2: More Yandex + first Yandex Maps exploration
-    Stage 3: Yandex heavy + Yandex Maps organization searches
-    Stage 4+: Reinforcement/maintenance
+    Primary source: 10K external domains pool (unique per profile+stage).
+    Supplemented with Russian/International hardcoded lists and DB URLs.
     """
     sites = []
 
-    # ------------------------------------------------------------------
-    # AI warmup sites pool: pick subset from pre-generated 50 sites
-    # ------------------------------------------------------------------
-    ai_warmup_sites = []
-    if persona_data and isinstance(persona_data, dict):
-        ai_warmup_sites = persona_data.get("warmup_sites", [])
-        if isinstance(ai_warmup_sites, list) and len(ai_warmup_sites) >= 20:
-            # We have AI-generated warmup sites — use them as the main pool
-            logger.debug(f"Using {len(ai_warmup_sites)} AI warmup sites for profile {profile_id}")
+    # Russian sites (5-10)
+    russian_count = random.randint(5, 10)
+    available_russian = [s for s in POPULAR_RUSSIAN_SITES if s not in sites]
+    sites.extend(random.sample(available_russian, min(russian_count, len(available_russian))))
 
-            # Always include Yandex ecosystem essentials based on stage
-            yandex_essential = ["https://ya.ru", "https://dzen.ru"]
-            if stage >= 2:
-                yandex_essential.extend(["https://market.yandex.ru", "https://yandex.ru/maps"])
-                if stage >= 3:
-                    yandex_essential.extend([
-                        "https://pogoda.yandex.ru", "https://news.yandex.ru",
-                        "https://music.yandex.ru",
-                    ])
+    # International sites (2-4)
+    intl_count = random.randint(2, 4)
+    sites.extend(random.sample(INTERNATIONAL_SITES, min(intl_count, len(INTERNATIONAL_SITES))))
 
-            for url in yandex_essential:
-                if url not in sites:
-                    sites.append(url)
-
-            # Pick remaining from AI pool (exclude already added)
-            pool = [s for s in ai_warmup_sites if s not in sites]
-            random.shuffle(pool)
-
-            # How many more to add
-            remaining = count - len(sites)
-            if remaining > 0:
-                sites.extend(pool[:remaining])
-
-            # Final shuffle
-            random.shuffle(sites)
-            return sites
-
-    # ------------------------------------------------------------------
-    # Fallback: legacy behaviour with hardcoded lists
-    # ------------------------------------------------------------------
-    # Persona typical_sites (old-style, up to 5)
-    persona_sites = []
-    if persona_data and isinstance(persona_data, dict):
-        persona_sites = [s for s in persona_data.get("typical_sites", []) if isinstance(s, str)]
-
-    if stage == 1:
-        # Stage 1: Foundation — Yandex cookies + general browsing
-        yandex_count = random.randint(3, 5) if FAST_MODE else random.randint(4, 6)
-        sites.extend(random.sample(YANDEX_ECOSYSTEM, min(yandex_count, len(YANDEX_ECOSYSTEM))))
-
-        russian_count = random.randint(4, 7) if FAST_MODE else random.randint(8, 12)
-        available_russian = [s for s in POPULAR_RUSSIAN_SITES if s not in sites]
-        sites.extend(random.sample(available_russian, min(russian_count, len(available_russian))))
-
-        intl_count = random.randint(1, 2) if FAST_MODE else random.randint(2, 4)
-        sites.extend(random.sample(INTERNATIONAL_SITES, min(intl_count, len(INTERNATIONAL_SITES))))
-
-    elif stage == 2:
-        # Stage 2: Deepen Yandex trust + introduce Maps
-        yandex_count = random.randint(5, 7)
-        sites.extend(random.sample(YANDEX_ECOSYSTEM, min(yandex_count, len(YANDEX_ECOSYSTEM))))
-
-        # Always include Yandex Maps main page
-        if "https://yandex.ru/maps" not in sites:
-            sites.append("https://yandex.ru/maps")
-
-        russian_count = random.randint(5, 8)
-        available_russian = [s for s in POPULAR_RUSSIAN_SITES if s not in sites]
-        sites.extend(random.sample(available_russian, min(russian_count, len(available_russian))))
-
-        intl_count = random.randint(1, 2)
-        sites.extend(random.sample(INTERNATIONAL_SITES, min(intl_count, len(INTERNATIONAL_SITES))))
-
-    elif stage >= 3:
-        # Stage 3+: Yandex-heavy + Maps organization browsing
-        yandex_count = random.randint(5, 8)
-        sites.extend(random.sample(YANDEX_ECOSYSTEM, min(yandex_count, len(YANDEX_ECOSYSTEM))))
-
-        # Yandex Maps — main + category pages
-        maps_urls = [
-            "https://yandex.ru/maps",
-            "https://yandex.ru/maps/?ll=37.622504,55.753215&z=12",  # Moscow center
-            "https://yandex.ru/maps/?ll=30.315868,59.939095&z=12",  # SPb
-        ]
-        sites.extend(random.sample(maps_urls, min(2, len(maps_urls))))
-
-        russian_count = random.randint(3, 6)
-        available_russian = [s for s in POPULAR_RUSSIAN_SITES if s not in sites]
-        sites.extend(random.sample(available_russian, min(russian_count, len(available_russian))))
-
-    # Add DB/domain URLs for diversity
+    # DB/domain URLs for diversity
     try:
         db_urls = get_warmup_urls(count=5, profile_id=profile_id, strategy="diverse")
         if db_urls:
@@ -341,20 +247,15 @@ def _build_warmup_site_list(profile_id: int, count: int = 20, stage: int = 1, pe
     except:
         pass
 
-    # Inject persona-specific sites (replace some generic ones)
-    if persona_sites:
-        # Add up to 5 persona sites that aren't already in the list
-        persona_extra = [s for s in persona_sites if s not in sites]
-        random.shuffle(persona_extra)
-        sites.extend(persona_extra[:5])
-        logger.debug(f"Added {min(5, len(persona_extra))} persona sites for profile {profile_id}")
+    # Main source: unique external sites from 10K pool (fill up to count)
+    ext_count = max(count - len(sites), 30)
+    ext_sites = _get_unique_external_sites(profile_id, ext_count, stage=stage, exclude=sites)
+    sites.extend(ext_sites)
 
     # Trim to requested count, shuffle
     if len(sites) > count:
-        yandex_guaranteed = [s for s in sites if any(y in s for y in ["yandex", "ya.ru", "dzen.ru"])][:3]
-        rest = [s for s in sites if s not in yandex_guaranteed]
-        random.shuffle(rest)
-        sites = yandex_guaranteed + rest[:count - len(yandex_guaranteed)]
+        random.shuffle(sites)
+        sites = sites[:count]
 
     random.shuffle(sites)
     return sites
@@ -363,6 +264,31 @@ def _build_warmup_site_list(profile_id: int, count: int = 20, stage: int = 1, pe
 def _fast_sleep(min_t: float, max_t: float):
     """Sleep with fast_mode factor applied."""
     time.sleep(random.uniform(min_t * SPEED_FACTOR, max_t * SPEED_FACTOR))
+
+
+def _safe_back(driver):
+    """Go back and immediately stop any pending navigation to prevent evaluate() hangs."""
+    try:
+        driver.back()
+    except Exception:
+        pass
+    try:
+        driver.execute_cdp_cmd("Page.stopLoading")
+    except Exception:
+        pass
+
+
+def _safe_get(driver, url: str) -> bool:
+    """Navigate to url, stop pending navigation on timeout. Returns True on success."""
+    try:
+        driver.get(url)
+        return True
+    except Exception:
+        try:
+            driver.execute_cdp_cmd("Page.stopLoading")
+        except Exception:
+            pass
+        return False
 
 
 def _smooth_scroll(driver, direction="down", distance=None):
@@ -381,8 +307,16 @@ def _smooth_scroll(driver, direction="down", distance=None):
 
 
 def _human_read_page(driver, min_time=5, max_time=25):
-    """Simulate a human reading a page: scroll, pause, look around."""
+    """Simulate a human reading a page: scroll, pause, look around.
+    
+    Each Playwright call is wrapped in try/except to prevent a single broken
+    page from hanging the entire function. If execute_script hangs for >10s
+    (the default JS timeout in playwright_driver.py), it will throw and we
+    gracefully move on.
+    """
     read_time = random.uniform(min_time * SPEED_FACTOR, max_time * SPEED_FACTOR)
+    # Hard-cap read time to avoid exceeding caller's budget
+    read_time = min(read_time, 30)
     end_time = time.time() + read_time
 
     while time.time() < end_time:
@@ -418,12 +352,17 @@ def _human_read_page(driver, min_time=5, max_time=25):
                     time.sleep(random.uniform(0.2, 0.6))
                 except:
                     pass
-        except:
-            time.sleep(0.5)
+        except Exception as e:
+            # Any Playwright call can hang/timeout — break out rather than
+            # retrying on a broken page which will keep failing
+            logger.debug(f"_human_read_page action {action} failed: {e}")
+            break
 
 
 def _try_dismiss_cookies(driver):
-    """Try to accept/dismiss cookie consent banners."""
+    """Try to accept/dismiss cookie consent banners.
+    Hard-capped at 5s to prevent accumulating delays across 10+ calls per chunk."""
+    deadline = time.time() + 5
     try:
         selectors = [
             "button[class*='cookie']", "button[class*='consent']",
@@ -433,6 +372,8 @@ def _try_dismiss_cookies(driver):
             "button[class*='agree']", ".gdpr-accept",
         ]
         for sel in selectors:
+            if time.time() > deadline:
+                return False
             try:
                 btns = driver.find_elements(By.CSS_SELECTOR, sel)
                 for btn in btns[:2]:
@@ -452,7 +393,7 @@ def _try_dismiss_cookies(driver):
 def _read_dzen_articles(driver) -> bool:
     """Open Dzen.ru, browse feed, and read 1-2 articles in depth."""
     try:
-        driver.get("https://dzen.ru")
+        if not _safe_get(driver, "https://dzen.ru"): return False
         _fast_sleep(3, 5)
         _try_dismiss_cookies(driver)
         _fast_sleep(1, 2)
@@ -494,16 +435,13 @@ def _read_dzen_articles(driver) -> bool:
                 _human_read_page(driver, min_time=8, max_time=20)
 
                 # Go back to feed
-                driver.back()
+                _safe_back(driver)
                 _fast_sleep(1, 3)
                 # Scroll a bit more in the feed
                 _smooth_scroll(driver, "down", random.randint(300, 600))
                 _fast_sleep(1, 2)
             except:
-                try:
-                    driver.back()
-                except:
-                    pass
+                _safe_back(driver)
                 continue
 
         logger.info("📰 Dzen article reading completed")
@@ -515,7 +453,10 @@ def _read_dzen_articles(driver) -> bool:
 
 
 def _watch_youtube_video(driver) -> bool:
-    """Open YouTube, search for a topic, and watch a video briefly."""
+    """Open YouTube, search for a topic, and watch a video briefly.
+    Hard-capped at 60s to prevent hanging the chunk."""
+    yt_start = time.time()
+    YT_MAX_SECONDS = 60
     try:
         topics = [
             "обзор автомобиля", "рецепт ужина", "тренировка дома",
@@ -524,7 +465,8 @@ def _watch_youtube_video(driver) -> bool:
         ]
         query = random.choice(topics)
 
-        driver.get(f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}")
+        if not _safe_get(driver, f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"):
+            return False
         _fast_sleep(3, 5)
         _try_dismiss_cookies(driver)
         _fast_sleep(1, 2)
@@ -546,8 +488,10 @@ def _watch_youtube_video(driver) -> bool:
             ).click().perform()
             _fast_sleep(3, 5)
 
-            # "Watch" for 15-40 seconds (scroll comments, pause)
-            watch_time = random.uniform(15, 40) * SPEED_FACTOR
+            # "Watch" for 15-30 seconds (scroll comments, pause)
+            # Cap to remaining YT budget
+            remaining = YT_MAX_SECONDS - (time.time() - yt_start)
+            watch_time = min(random.uniform(15, 30) * SPEED_FACTOR, max(5, remaining - 3))
             end_time = time.time() + watch_time
             while time.time() < end_time:
                 action = random.choice(["pause", "scroll", "pause"])
@@ -574,7 +518,7 @@ def _deep_yandex_interaction(driver) -> bool:
         service = random.choice(["weather", "translate", "images", "news"])
 
         if service == "weather":
-            driver.get("https://pogoda.yandex.ru")
+            if not _safe_get(driver, "https://pogoda.yandex.ru"): return False
             _fast_sleep(2, 4)
             _try_dismiss_cookies(driver)
             # Read the forecast
@@ -592,7 +536,7 @@ def _deep_yandex_interaction(driver) -> bool:
             logger.info("🌤️ Yandex Weather browsed in depth")
 
         elif service == "translate":
-            driver.get("https://translate.yandex.ru")
+            if not _safe_get(driver, "https://translate.yandex.ru"): return False
             _fast_sleep(2, 4)
             _try_dismiss_cookies(driver)
             # Type a phrase to translate
@@ -628,7 +572,8 @@ def _deep_yandex_interaction(driver) -> bool:
             queries = ["красивые места России", "рецепты тортов", "интерьер квартиры",
                        "котики", "природа Байкал"]
             query = random.choice(queries)
-            driver.get(f"https://yandex.ru/images/search?text={query.replace(' ', '+')}")
+            if not _safe_get(driver, f"https://yandex.ru/images/search?text={query.replace(' ', '+')}"):
+                return False
             _fast_sleep(3, 5)
             _human_read_page(driver, min_time=5, max_time=12)
             # Click on an image (30% chance)
@@ -640,14 +585,14 @@ def _deep_yandex_interaction(driver) -> bool:
                         ActionChains(driver).move_to_element(random.choice(visible_imgs[:10])).pause(0.3).click().perform()
                         _fast_sleep(2, 4)
                         _human_read_page(driver, min_time=3, max_time=6)
-                        driver.back()
+                        _safe_back(driver)
                         _fast_sleep(1, 2)
                 except:
                     pass
             logger.info(f"🖼️ Yandex Images browsed: '{query}'")
 
         elif service == "news":
-            driver.get("https://dzen.ru/news")
+            if not _safe_get(driver, "https://dzen.ru/news"): return False
             _fast_sleep(2, 4)
             _try_dismiss_cookies(driver)
             _human_read_page(driver, min_time=5, max_time=12)
@@ -660,7 +605,7 @@ def _deep_yandex_interaction(driver) -> bool:
                         ActionChains(driver).move_to_element(random.choice(visible_news[:8])).pause(0.3).click().perform()
                         _fast_sleep(2, 4)
                         _human_read_page(driver, min_time=5, max_time=12)
-                        driver.back()
+                        _safe_back(driver)
                         _fast_sleep(1, 2)
                 except:
                     pass
@@ -740,7 +685,8 @@ def _browse_yandex_market(driver) -> bool:
     """Browse Yandex Market: search products, view cards, read reviews, use filters."""
     try:
         query = random.choice(YANDEX_MARKET_QUERIES)
-        driver.get(f"https://market.yandex.ru/search?text={query.replace(' ', '+')}")
+        if not _safe_get(driver, f"https://market.yandex.ru/search?text={query.replace(' ', '+')}"):
+            return False
         _fast_sleep(3, 6)
         _try_dismiss_cookies(driver)
         _fast_sleep(1, 2)
@@ -823,7 +769,7 @@ def _browse_yandex_market(driver) -> bool:
                         except:
                             pass
 
-                    driver.back()
+                    _safe_back(driver)
                     _fast_sleep(1, 3)
             except:
                 pass
@@ -843,7 +789,7 @@ def _browse_kinopoisk(driver) -> bool:
 
         if action == "main":
             # Browse main page (hd.kinopoisk.ru avoids CSP issues)
-            driver.get("https://hd.kinopoisk.ru")
+            if not _safe_get(driver, "https://hd.kinopoisk.ru"): return False
             _fast_sleep(3, 5)
             _try_dismiss_cookies(driver)
             _human_read_page(driver, min_time=5, max_time=12)
@@ -851,14 +797,14 @@ def _browse_kinopoisk(driver) -> bool:
         elif action == "search":
             # Search for something
             query = random.choice(KINOPOISK_QUERIES)
-            driver.get(f"https://www.kinopoisk.ru/s/type/all/find/{query.replace(' ', '+')}/")
+            if not _safe_get(driver, f"https://www.kinopoisk.ru/s/type/all/find/{query.replace(' ', '+')}/"): return False
             _fast_sleep(3, 5)
             _try_dismiss_cookies(driver)
             _human_read_page(driver, min_time=5, max_time=10)
 
         else:
             # Browse top-250
-            driver.get("https://www.kinopoisk.ru/lists/movies/top250/")
+            if not _safe_get(driver, "https://www.kinopoisk.ru/lists/movies/top250/"): return False
             _fast_sleep(3, 5)
             _try_dismiss_cookies(driver)
             _human_read_page(driver, min_time=5, max_time=12)
@@ -900,7 +846,7 @@ def _browse_kinopoisk(driver) -> bool:
                         except:
                             pass
 
-                    driver.back()
+                    _safe_back(driver)
                     _fast_sleep(1, 2)
             except:
                 pass
@@ -919,21 +865,22 @@ def _browse_yandex_music(driver) -> bool:
         action = random.choice(["main", "search", "chart"])
 
         if action == "main":
-            driver.get("https://music.yandex.ru")
+            if not _safe_get(driver, "https://music.yandex.ru"): return False
             _fast_sleep(3, 5)
             _try_dismiss_cookies(driver)
             _human_read_page(driver, min_time=5, max_time=12)
 
         elif action == "search":
             query = random.choice(YANDEX_MUSIC_QUERIES)
-            driver.get(f"https://music.yandex.ru/search?text={query.replace(' ', '+')}")
+            if not _safe_get(driver, f"https://music.yandex.ru/search?text={query.replace(' ', '+')}"):
+                return False
             _fast_sleep(3, 5)
             _try_dismiss_cookies(driver)
             _human_read_page(driver, min_time=5, max_time=10)
 
         else:
             # Browse chart
-            driver.get("https://music.yandex.ru/chart")
+            if not _safe_get(driver, "https://music.yandex.ru/chart"): return False
             _fast_sleep(3, 5)
             _try_dismiss_cookies(driver)
             _human_read_page(driver, min_time=5, max_time=12)
@@ -963,7 +910,7 @@ def _browse_yandex_music(driver) -> bool:
                     ).click().perform()
                     _fast_sleep(3, 5)
                     _human_read_page(driver, min_time=5, max_time=15)
-                    driver.back()
+                    _safe_back(driver)
                     _fast_sleep(1, 2)
             except:
                 pass
@@ -987,7 +934,8 @@ def _yandex_search_click_through(driver, search_queries_pool: list) -> bool:
 
         # Open Yandex search directly
         encoded_query = query.replace(' ', '+')
-        driver.get(f"https://yandex.ru/search/?text={encoded_query}")
+        if not _safe_get(driver, f"https://yandex.ru/search/?text={encoded_query}"):
+            return False
         _fast_sleep(3, 5)
         _try_dismiss_cookies(driver)
 
@@ -1038,7 +986,7 @@ def _yandex_search_click_through(driver, search_queries_pool: list) -> bool:
                 _human_read_page(driver, min_time=int(read_time * 0.6), max_time=int(read_time))
 
                 # Go back to SERP
-                driver.back()
+                _safe_back(driver)
                 _fast_sleep(1, 3)
 
                 # Scroll a bit on SERP (looking for next result)
@@ -1047,11 +995,8 @@ def _yandex_search_click_through(driver, search_queries_pool: list) -> bool:
                     _fast_sleep(1, 3)
 
             except Exception:
-                try:
-                    driver.back()
-                    _fast_sleep(1, 2)
-                except:
-                    pass
+                _safe_back(driver)
+                _fast_sleep(1, 2)
                 continue
 
         # Sometimes scroll SERP to page 2 (15% chance)
@@ -1085,7 +1030,7 @@ def _yandex_search_click_through(driver, search_queries_pool: list) -> bool:
 def _perform_yandex_search(driver, query: str) -> bool:
     """Perform a search on Yandex and browse results."""
     try:
-        driver.get("https://yandex.ru")
+        if not _safe_get(driver, "https://yandex.ru"): return False
         _fast_sleep(2, 4)
 
         # Find search input — try multiple selectors (ya.ru/yandex.ru change frequently)
@@ -1117,7 +1062,8 @@ def _perform_yandex_search(driver, query: str) -> bool:
             # Fallback: direct URL search
             logger.info("Yandex search input not found, using direct URL search")
             encoded_query = query.replace(' ', '+')
-            driver.get(f"https://yandex.ru/search/?text={encoded_query}")
+            if not _safe_get(driver, f"https://yandex.ru/search/?text={encoded_query}"):
+                return False
             _fast_sleep(2, 4)
             _human_read_page(driver, min_time=5, max_time=12)
             logger.info(f"🔍 Yandex search (URL) completed: '{query}'")
@@ -1156,7 +1102,7 @@ def _perform_yandex_search(driver, query: str) -> bool:
                     _fast_sleep(2, 5)
                     _human_read_page(driver, min_time=3, max_time=10)
                     # Go back
-                    driver.back()
+                    _safe_back(driver)
                     _fast_sleep(1, 2)
             except:
                 pass
@@ -1172,7 +1118,9 @@ def _perform_yandex_search(driver, query: str) -> bool:
 def _perform_google_search_warmup(driver, query: str) -> bool:
     """Perform a search on Google and browse results."""
     try:
-        driver.get("https://www.google.com")
+        if not _safe_get(driver, "https://www.google.com"):
+            logger.warning("Error in Google search: Timeout navigating to https://www.google.com")
+            return False
         _fast_sleep(1, 3)
 
         # Dismiss consent if needed
@@ -1227,7 +1175,7 @@ def _browse_yandex_maps(driver, query: str = None) -> bool:
     """
     try:
         # Go to Yandex Maps
-        driver.get("https://yandex.ru/maps")
+        if not _safe_get(driver, "https://yandex.ru/maps"): return False
         _fast_sleep(3, 6)
 
         # Dismiss popups/banners
@@ -1328,7 +1276,7 @@ def _browse_yandex_maps(driver, query: str = None) -> bool:
                                 # Read the organization card
                                 _human_read_page(driver, min_time=3, max_time=10)
                                 # Go back to results
-                                driver.back()
+                                _safe_back(driver)
                                 _fast_sleep(1, 3)
                                 break
                     except:
@@ -1338,7 +1286,8 @@ def _browse_yandex_maps(driver, query: str = None) -> bool:
             else:
                 # Fallback: direct URL search
                 encoded = query.replace(' ', '+')
-                driver.get(f"https://yandex.ru/maps/?text={encoded}")
+                if not _safe_get(driver, f"https://yandex.ru/maps/?text={encoded}"):
+                    return False
                 _fast_sleep(3, 6)
                 _human_read_page(driver, min_time=5, max_time=12)
                 logger.info(f"🗺️ Yandex Maps search (URL) completed: '{query}'")
@@ -1354,14 +1303,35 @@ def _browse_yandex_maps(driver, query: str = None) -> bool:
         return False
 
 
+# Hard cap per site visit — prevents any single site from consuming the entire chunk budget
+_SITE_VISIT_MAX_SECONDS = 60
+
+
 def _visit_site_with_actions(driver, url: str, site_index: int, total_sites: int) -> float:
-    """Visit a site and perform realistic human actions. Returns time spent."""
+    """Visit a site and perform realistic human actions. Returns time spent.
+    
+    Hard-capped at _SITE_VISIT_MAX_SECONDS to prevent any single site from
+    hanging the entire chunk (which leads to SIGKILL).
+    """
     visit_start = time.time()
+    visit_deadline = visit_start + _SITE_VISIT_MAX_SECONDS
+
+    def _visit_time_left():
+        return visit_deadline - time.time()
 
     try:
+        # Clear any pending navigation left over from navigate_to_url
+        try:
+            driver.execute_cdp_cmd("Page.stopLoading")
+        except Exception:
+            pass
+
         # Try to dismiss cookie banners
         _try_dismiss_cookies(driver)
         _fast_sleep(0.3, 1.0)
+
+        if _visit_time_left() < 5:
+            return time.time() - visit_start
 
         # Decide how long to stay based on site type
         if any(y in url for y in ["yandex", "ya.ru", "dzen.ru", "kinopoisk"]):
@@ -1373,16 +1343,23 @@ def _visit_site_with_actions(driver, url: str, site_index: int, total_sites: int
         else:
             min_time, max_time = 3, 10  # General sites
 
+        # Cap read time to remaining visit budget
+        max_time = min(max_time, _visit_time_left() - 2)
+        if max_time < 2:
+            return time.time() - visit_start
+
         # Read the page (scroll, pause, mouse moves)
-        _human_read_page(driver, min_time=min_time, max_time=max_time)
+        _human_read_page(driver, min_time=min(min_time, max_time), max_time=max_time)
 
         # Sometimes click on internal links (20% chance)
-        if random.random() < 0.2:
+        if random.random() < 0.2 and _visit_time_left() > 10:
             try:
                 links = driver.find_elements(By.CSS_SELECTOR, "a[href]")
                 clickable_links = []
                 current_domain = url.split("//")[-1].split("/")[0].replace("www.", "")
-                for link in links:
+                for link in links[:15]:
+                    if _visit_time_left() < 5:
+                        break
                     try:
                         href = link.get_attribute("href") or ""
                         if (current_domain in href and link.is_displayed()
@@ -1391,6 +1368,8 @@ def _visit_site_with_actions(driver, url: str, site_index: int, total_sites: int
                             clickable_links.append(link)
                     except StaleElementReferenceException:
                         continue
+                    except Exception:
+                        break
 
                 if clickable_links:
                     chosen_link = random.choice(clickable_links[:10])
@@ -1398,9 +1377,10 @@ def _visit_site_with_actions(driver, url: str, site_index: int, total_sites: int
                         random.uniform(0.2, 0.5)
                     ).click().perform()
                     _fast_sleep(1, 3)
-                    _human_read_page(driver, min_time=2, max_time=6)
-                    # Go back
-                    driver.back()
+                    remaining = _visit_time_left() - 5
+                    if remaining > 2:
+                        _human_read_page(driver, min_time=2, max_time=min(6, remaining))
+                    _safe_back(driver)
                     _fast_sleep(0.5, 1.5)
             except:
                 pass
@@ -1410,24 +1390,19 @@ def _visit_site_with_actions(driver, url: str, site_index: int, total_sites: int
 
     return time.time() - visit_start
 
-
-@shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=60, time_limit=4500, soft_time_limit=4440)
+@shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=60, time_limit=300, soft_time_limit=270)
 def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sites_list: List[str] = None):
     """
-    Multi-session warmup: each call = one warmup session (stage).
-    Profile needs 3+ sessions spread over 6+ hours to be fully warmed.
+    Multi-session warmup orchestrator.
     
-    Stage 1: Yandex search + general Russian sites (build cookies)
-    Stage 2: More Yandex ecosystem + Yandex Maps exploration
-    Stage 3: Yandex Maps search + organization browsing
-    Stage 4+: Re-warmup / reinforcement
+    Instead of visiting all sites in one long-lived browser session (which
+    gets SIGKILL after 75 min), this task plans the session and delegates
+    actual browsing to ``warmup_chunk_task`` — each chunk opens a fresh
+    browser, visits ≤WARMUP_CHUNK_MAX_SITES sites, closes the browser
+    cleanly, and chains to the next chunk.
 
-    The periodic_rewarmup scheduler calls this automatically for next stages.
+    time_limit=300s (5 min) — orchestrator itself is lightweight, just planning.
     """
-    browser_manager = None
-    browser_id = None
-    _profile_dir_for_cleanup = None  # Track profile dir for cleanup even if browser_id is None
-
     try:
         # Get profile from database and determine current stage
         with get_db_session() as db:
@@ -1435,7 +1410,172 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
             if not profile_obj:
                 raise ValueError(f"Profile {profile_id} not found")
 
+            current_stage = profile_obj.get_next_warmup_stage()
+            is_rewarmup = profile_obj.warmup_completed
+
+            profile_persona_data = profile_obj.persona_data
+
+            profile_obj.status = "warming_up"
+            db.commit()
+
+        logger.info(f"🔥 Warmup ORCHESTRATOR profile {profile_id} — STAGE {current_stage} {'(re-warmup)' if is_rewarmup else ''}")
+
+        # Build site list — 50 domains in 1 session
+        sites_count = 50
+        if not sites_list:
+            sites_list = _build_warmup_site_list(profile_id, count=sites_count, stage=current_stage, persona_data=profile_persona_data)
+
+        # === Build pre-browsing actions plan ===
+        # No Yandex services (captcha not handled during warmup)
+        pre_actions = []
+
+        if random.random() < 0.5:
+            pre_actions.append("youtube")
+        if random.random() < 0.4:
+            pre_actions.append("google_search")
+
+        # === Split pre_actions into chunks (max 2 actions per chunk) ===
+        PRE_ACTION_CHUNK_SIZE = 2
+        pre_action_chunks = []
+        for i in range(0, len(pre_actions), PRE_ACTION_CHUNK_SIZE):
+            pre_action_chunks.append(pre_actions[i:i + PRE_ACTION_CHUNK_SIZE])
+
+        # === Split site list into chunks of WARMUP_CHUNK_MAX_SITES ===
+        site_chunks = []
+        for i in range(0, len(sites_list), WARMUP_CHUNK_MAX_SITES):
+            site_chunks.append(sites_list[i:i + WARMUP_CHUNK_MAX_SITES])
+
+        # === Build the chunk plan ===
+        # Each chunk = {"pre_actions": [...], "sites": [...]}
+        all_chunks = []
+        for idx, site_chunk in enumerate(site_chunks):
+            chunk_pre = pre_action_chunks[idx] if idx < len(pre_action_chunks) else []
+            all_chunks.append({
+                "pre_actions": chunk_pre,
+                "sites": site_chunk,
+            })
+        # Extra pre-action chunks without sites
+        for idx in range(len(site_chunks), len(pre_action_chunks)):
+            all_chunks.append({
+                "pre_actions": pre_action_chunks[idx],
+                "sites": [],
+            })
+
+        total_chunks = len(all_chunks)
+        logger.info(
+            f"📋 Warmup plan for profile {profile_id}: "
+            f"{len(pre_actions)} pre-actions, {len(sites_list)} sites → {total_chunks} chunks "
+            f"(max {WARMUP_CHUNK_MAX_SITES} sites/chunk)"
+        )
+
+        # Fire the first chunk — it will chain to the next
+        warmup_chunk_task.apply_async(
+            args=[profile_id, current_stage, is_rewarmup, all_chunks, 0, total_chunks],
+            queue='warmup'
+        )
+
+        return {
+            "status": "orchestrated",
+            "profile_id": profile_id,
+            "stage": current_stage,
+            "total_chunks": total_chunks,
+            "total_sites": len(sites_list),
+            "total_pre_actions": len(pre_actions),
+        }
+
+    except Exception as e:
+        logger.error(f"Error in warmup orchestrator for profile {profile_id}: {e}")
+        try:
+            with get_db_session() as db:
+                profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+                if profile_obj:
+                    profile_obj.status = "created" if not profile_obj.warmup_completed else "warmed"
+                    db.commit()
+        except:
+            pass
+        raise
+
+
+def _execute_pre_action(driver, action, search_queries_pool):
+    """Execute a single pre-browsing action. Returns (time_spent, searches, maps)."""
+    searches = 0
+    maps = 0
+    time_spent = 0
+    try:
+        if action == "youtube":
+            if _watch_youtube_video(driver):
+                time_spent += 25
+            _fast_sleep(1, 3)
+        elif action == "google_search":
+            query = random.choice(GOOGLE_SEARCH_QUERIES)
+            if _perform_google_search_warmup(driver, query):
+                searches += 1
+                time_spent += 15
+            _fast_sleep(2, 5)
+    except Exception as act_err:
+        logger.warning(f"⚠️ Pre-action '{action}' failed: {act_err}")
+
+    return time_spent, searches, maps
+
+
+@shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=30,
+             time_limit=900, soft_time_limit=840,
+             reject_on_worker_lost=False, acks_on_failure_or_timeout=True)
+def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bool,
+                      all_chunks: list, chunk_index: int, total_chunks: int):
+    """
+    Execute ONE warmup chunk: open browser, do pre-actions + visit sites, close browser.
+    Then chain to the next chunk. The last chunk finalises the warmup session in DB.
+    
+    Wall-clock budget (CHUNK_MAX_DURATION=720s) stops visiting new sites before
+    Celery's hard time_limit forces SIGKILL. reject_on_worker_lost=False prevents
+    infinite redelivery loops when a worker does get killed.
+    """
+    browser_manager = None
+    browser_id = None
+    _profile_dir_for_cleanup = None
+    chunk_failed = False
+
+    chunk_data = all_chunks[chunk_index]
+    pre_actions = chunk_data.get("pre_actions", [])
+    sites_to_visit = chunk_data.get("sites", [])
+    is_last_chunk = (chunk_index == total_chunks - 1)
+
+    logger.info(
+        f"🔥 Chunk {chunk_index + 1}/{total_chunks} for profile {profile_id} stage {current_stage}: "
+        f"{len(pre_actions)} pre-actions, {len(sites_to_visit)} sites"
+    )
+
+    successful_visits = 0
+    sites_visited = 0
+    searches_done = 0
+    maps_browsed = 0
+    total_time_spent = 0
+    start_time = time.time()
+
+    # Hard wall-clock alarm: guarantees the chunk exits before Celery's
+    # time_limit sends SIGKILL. This breaks through ANY blocking Playwright
+    # call (bounding_box, mouse.move, evaluate, etc.) when Chrome hangs.
+    _old_alarm_handler = signal.getsignal(signal.SIGALRM)
+    def _chunk_alarm(signum, frame):
+        raise TimeoutError(f"Chunk alarm: wall-clock budget ({CHUNK_MAX_DURATION}s) exceeded")
+    signal.signal(signal.SIGALRM, _chunk_alarm)
+    signal.alarm(CHUNK_MAX_DURATION)
+
+    try:
+        # Load profile data
+        with get_db_session() as db:
+            profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+            if not profile_obj:
+                raise ValueError(f"Profile {profile_id} not found")
+            if not profile_obj.is_active:
+                raise ValueError(f"Profile {profile_id} is not active")
+
             profile_name = profile_obj.name
+            # Keep updated_at fresh so auto_fix_stuck doesn't reset us
+            profile_obj.updated_at = datetime.utcnow()
+            db.commit()
+
             profile_user_agent = profile_obj.user_agent
             profile_viewport_width = profile_obj.viewport_width
             profile_viewport_height = profile_obj.viewport_height
@@ -1452,45 +1592,10 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
             profile_webgl_fp = profile_obj.webgl_fingerprint
             profile_audio_fp = profile_obj.audio_fingerprint
             profile_screen_fp = profile_obj.screen_fingerprint
-            
-            current_stage = profile_obj.get_next_warmup_stage()
-            is_rewarmup = profile_obj.warmup_completed  # re-warming already warmed profile
 
-            # Load AI persona data (if assigned)
-            profile_persona_data = profile_obj.persona_data
-
-            profile_obj.status = "warming_up"
-            db.commit()
-
-        logger.info(f"🔥 Warmup profile {profile_id} — STAGE {current_stage} {'(re-warmup)' if is_rewarmup else ''}")
-        if profile_persona_data:
-            logger.info(f"   Persona: {profile_persona_data.get('name', '?')} ({profile_persona_data.get('profession', '?')})")
-
-        # Check if profile has AI warmup sites (50 sites)
-        has_ai_warmup_sites = (
-            profile_persona_data
-            and isinstance(profile_persona_data, dict)
-            and isinstance(profile_persona_data.get("warmup_sites"), list)
-            and len(profile_persona_data.get("warmup_sites", [])) >= 20
-        )
-
-        # Build stage-appropriate site list
-        # Target ~50 total visits across all sessions (50 / MIN_WARMUP_SESSIONS ≈ 17 per session)
-        target_per_session = max(10, 50 // MIN_WARMUP_SESSIONS)
-        if has_ai_warmup_sites:
-            sites_count = target_per_session
-            logger.info(f"   AI warmup pool: {len(profile_persona_data['warmup_sites'])} sites, picking {sites_count}")
-        else:
-            sites_count = target_per_session
-        if not sites_list:
-            sites_list = _build_warmup_site_list(profile_id, count=sites_count, stage=current_stage, persona_data=profile_persona_data)
-
-        # Initialize managers
-        browser_manager = BrowserManager()
+        # Setup proxy
         proxy_manager = ProxyManager()
         proxy_manager.load_proxies_from_db()
-
-        # Get proxy for profile
         proxy_data = None
         if profile_proxy_host and profile_proxy_port:
             proxy_data = {
@@ -1502,38 +1607,22 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
             }
         else:
             proxy_data = proxy_manager.get_available_proxy()
-            if proxy_data:
-                logger.info(f"Using proxy for warmup: {proxy_data['host']}:{proxy_data['port']}")
 
         if not proxy_data:
-            error_msg = "🚫 Нет доступных прокси! Нагул без прокси запрещён."
-            logger.error(error_msg)
-            with get_db_session() as db:
-                profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
-                if profile_obj:
-                    profile_obj.status = "error"
-                    db.commit()
-            return {'status': 'error', 'error': error_msg, 'profile_id': profile_id}
+            raise RuntimeError(f"No proxy available for profile {profile_id}")
 
-        # Generate profile data for browser
+        # Build profile data for browser
         profile_generator = ProfileGenerator()
-        
-        is_mobile = profile_is_mobile
-        
-        profile_data = profile_generator.generate_profile(profile_name, is_mobile=is_mobile)
+        profile_data = profile_generator.generate_profile(profile_name, is_mobile=profile_is_mobile)
         profile_data.update({
             'user_agent': profile_user_agent or profile_data['user_agent'],
-            'viewport': {
-                'width': profile_viewport_width,
-                'height': profile_viewport_height
-            },
+            'viewport': {'width': profile_viewport_width, 'height': profile_viewport_height},
             'timezone': profile_timezone,
             'language': profile_language,
             'platform': profile_platform or profile_data.get('platform', 'Win32'),
-            'images_enabled': True,  # Images enabled — Yandex detects image-less browsers
+            'images_enabled': True,
         })
-
-        # Use stored fingerprint data from DB if available (new scheme)
+        # Apply stored fingerprints
         if profile_webgl_fp:
             import json as _json
             try:
@@ -1557,199 +1646,62 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
                 profile_data['speech_voices'] = profile_screen_fp['speech_voices']
             if 'sensor' in profile_screen_fp:
                 profile_data['sensor'] = profile_screen_fp['sensor']
-            # New fingerprint vectors
             for key in ('connection_info', 'storage_quota', 'heap_size', 'system_colors',
                         'system_fonts', 'codecs', 'keyboard_layout', 'fonts'):
                 if key in profile_screen_fp:
                     profile_data[key] = profile_screen_fp[key]
-        
-        if is_mobile:
-            logger.info(f"📱 Mobile warmup profile: {profile_name}")
+            for _hw_key in ('hardware_concurrency', 'device_memory', 'max_touch_points', 'do_not_track'):
+                if _hw_key in profile_screen_fp:
+                    profile_data[_hw_key] = profile_screen_fp[_hw_key]
 
-        # Track profile dir for cleanup even if Chrome fails to start
         from app.config import settings as _settings
         _profile_dir_for_cleanup = os.path.join(_settings.browser_user_data_dir, profile_data['name'])
 
         # Create browser session
+        browser_manager = BrowserManager()
         browser_id = browser_manager.create_browser_session(profile_data, proxy_data)
         driver = browser_manager.active_browsers.get(browser_id)
         if not driver:
             raise RuntimeError(f"Failed to get driver for session {browser_id}")
 
-        logger.info(f"Created browser session {browser_id} for profile {profile_id} (stage {current_stage})")
+        logger.info(f"🌐 Browser session {browser_id} created for chunk {chunk_index + 1}")
 
-        # === STAGE-BASED WARMUP ===
-        start_time = time.time()
-        sites_visited = 0
-        successful_visits = 0
-        total_time_spent = 0
-        searches_done = 0
-        maps_browsed = 0
+        # Wall-clock budget: stop visiting new sites before hard time_limit kills us.
+        # time_limit=900, soft_time_limit=840 — but Playwright blocking calls can't be
+        # interrupted by SoftTimeLimitExceeded signal, so we must check manually.
+        CHUNK_MAX_DURATION = 720  # seconds — stop early, leave 180s buffer for cleanup
 
-        # Build search query pool: persona queries + extra AI queries + default queries
-        search_queries_pool = list(YANDEX_SEARCH_QUERIES)
-        if profile_persona_data and isinstance(profile_persona_data, dict):
-            persona_queries = profile_persona_data.get("search_queries", [])
-            extra_queries = profile_persona_data.get("extra_search_queries", [])
-            all_persona_queries = list(persona_queries) + list(extra_queries)
-            if all_persona_queries:
-                # Put persona queries first so they're more likely to be picked
-                search_queries_pool = all_persona_queries + search_queries_pool
-                logger.debug(f"Added {len(all_persona_queries)} persona+AI search queries for profile {profile_id}")
+        def _chunk_time_remaining():
+            return CHUNK_MAX_DURATION - (time.time() - start_time)
 
-        # --- Stage-specific pre-browsing ---
-        
-        # Inject Yandex trust markers in localStorage on every session
-        _inject_yandex_trust_markers(driver)
-        
-        if current_stage == 1:
-            # Stage 1: Yandex search + Dzen reading (build cookies & history)
-            if random.random() < 0.9:
-                query = random.choice(search_queries_pool)
-                if _perform_yandex_search(driver, query):
-                    searches_done += 1
-                    total_time_spent += 15
-                _fast_sleep(2, 5)
+        # === Execute pre-actions ===
+        for action in pre_actions:
+            if _chunk_time_remaining() < 60:
+                logger.warning(f"⏰ Budget exhausted before pre-action '{action}', skipping")
+                break
+            t, s, m = _execute_pre_action(driver, action, [])
+            total_time_spent += t
+            searches_done += s
+            maps_browsed += m
 
-            # Read Dzen articles (60% chance) — builds Yandex cookie trust
-            if random.random() < 0.6:
-                if _read_dzen_articles(driver):
-                    total_time_spent += 20
-                _fast_sleep(1, 3)
-
-            # Kinopoisk browsing (30% chance) — early Yandex ecosystem touch
-            if random.random() < 0.3:
-                if _browse_kinopoisk(driver):
-                    total_time_spent += 15
-                _fast_sleep(1, 3)
-
-        elif current_stage == 2:
-            # Stage 2: Yandex search + Maps + Market + YouTube + services
-            query = random.choice(search_queries_pool)
-            if _perform_yandex_search(driver, query):
-                searches_done += 1
-                total_time_spent += 15
-            _fast_sleep(2, 5)
-
-            # Search click-through (50% chance) — key behavioral signal
-            if random.random() < 0.5:
-                if _yandex_search_click_through(driver, search_queries_pool):
-                    searches_done += 1
-                    total_time_spent += 20
-                _fast_sleep(2, 4)
-
-            # Browse Yandex Maps without search (just explore)
-            if _browse_yandex_maps(driver, query=None):
-                maps_browsed += 1
-                total_time_spent += 20
-            _fast_sleep(2, 4)
-
-            # Yandex Market browsing (50% chance)
-            if random.random() < 0.5:
-                if _browse_yandex_market(driver):
-                    total_time_spent += 20
-                _fast_sleep(1, 3)
-
-            # Deep Yandex service interaction (70% chance)
-            if random.random() < 0.7:
-                if _deep_yandex_interaction(driver):
-                    total_time_spent += 10
-                _fast_sleep(1, 3)
-
-            # Kinopoisk (35% chance)
-            if random.random() < 0.35:
-                if _browse_kinopoisk(driver):
-                    total_time_spent += 15
-                _fast_sleep(1, 3)
-
-            # YouTube video (40% chance)
-            if random.random() < 0.4:
-                if _watch_youtube_video(driver):
-                    total_time_spent += 25
-                _fast_sleep(1, 3)
-
-        elif current_stage >= 3:
-            # Stage 3+: Full activity — search, Maps, Market, Kinopoisk, Music, Dzen, YouTube, services
-
-            # Search click-through (65% chance) — CORE behavioral signal
-            if random.random() < 0.65:
-                if _yandex_search_click_through(driver, search_queries_pool):
-                    searches_done += 1
-                    total_time_spent += 25
-                _fast_sleep(2, 5)
-
-            # Regular Yandex search
-            query = random.choice(search_queries_pool)
-            if _perform_yandex_search(driver, query):
-                searches_done += 1
-                total_time_spent += 15
-            _fast_sleep(2, 5)
-
-            # Browse Yandex Maps WITH search query
-            maps_query = random.choice(YANDEX_MAPS_SEARCH_QUERIES)
-            if _browse_yandex_maps(driver, query=maps_query):
-                maps_browsed += 1
-                total_time_spent += 25
-            _fast_sleep(2, 5)
-
-            # Sometimes do a second maps search (40% chance)
-            if random.random() < 0.4:
-                maps_query2 = random.choice([q for q in YANDEX_MAPS_SEARCH_QUERIES if q != maps_query])
-                if _browse_yandex_maps(driver, query=maps_query2):
-                    maps_browsed += 1
-                    total_time_spent += 20
-                _fast_sleep(2, 4)
-
-            # Yandex Market (55% chance) — product browsing builds e-commerce profile
-            if random.random() < 0.55:
-                if _browse_yandex_market(driver):
-                    total_time_spent += 20
-                _fast_sleep(1, 3)
-
-            # Kinopoisk (40% chance) — movies/series browsing
-            if random.random() < 0.4:
-                if _browse_kinopoisk(driver):
-                    total_time_spent += 15
-                _fast_sleep(1, 3)
-
-            # Yandex Music (30% chance) — audio platform engagement
-            if random.random() < 0.3:
-                if _browse_yandex_music(driver):
-                    total_time_spent += 12
-                _fast_sleep(1, 3)
-
-            # Read Dzen articles (50% chance)
-            if random.random() < 0.5:
-                if _read_dzen_articles(driver):
-                    total_time_spent += 20
-                _fast_sleep(1, 3)
-
-            # Deep Yandex service (60% chance)
-            if random.random() < 0.6:
-                if _deep_yandex_interaction(driver):
-                    total_time_spent += 10
-                _fast_sleep(1, 3)
-
-            # YouTube (30% chance)
-            if random.random() < 0.3:
-                if _watch_youtube_video(driver):
-                    total_time_spent += 25
-                _fast_sleep(1, 3)
-
-        # --- Visit sites with realistic browsing ---
+        # === Visit sites ===
         consecutive_failures = 0
-        for i, site_url in enumerate(sites_list):
+        for i, site_url in enumerate(sites_to_visit):
+            remaining = _chunk_time_remaining()
+            if remaining < 30:
+                logger.warning(
+                    f"⏰ Wall-clock budget exhausted ({CHUNK_MAX_DURATION}s) after {i}/{len(sites_to_visit)} sites "
+                    f"— stopping chunk early to avoid SIGKILL"
+                )
+                break
             try:
-                if browser_manager.navigate_to_url(browser_id, site_url, timeout=20):
+                if browser_manager.navigate_to_url(browser_id, site_url, timeout=min(20, remaining - 10)):
                     sites_visited += 1
                     consecutive_failures = 0
-
-                    visit_time = _visit_site_with_actions(driver, site_url, i, len(sites_list))
+                    visit_time = _visit_site_with_actions(driver, site_url, i, len(sites_to_visit))
                     total_time_spent += visit_time
                     successful_visits += 1
-
-                    logger.info(f"✅ [{successful_visits}/{len(sites_list)}] {site_url} — {visit_time:.1f}s")
-
+                    logger.info(f"✅ [{successful_visits}/{len(sites_to_visit)}] {site_url} — {visit_time:.1f}s")
                     if random.random() < 0.1:
                         _fast_sleep(3, 8)
                     else:
@@ -1759,181 +1711,55 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
                     consecutive_failures += 1
                     logger.warning(f"⚠️ Failed to load {site_url}, skipping")
                     _fast_sleep(0.5, 1.5)
-
                     if consecutive_failures >= 3:
-                        logger.warning(f"🛑 {consecutive_failures} consecutive failures — stopping warmup early")
+                        logger.warning(f"🛑 {consecutive_failures} consecutive failures — stopping chunk early")
                         break
-
             except Exception as site_error:
                 logger.error(f"Error visiting {site_url}: {site_error}")
                 consecutive_failures += 1
                 time.sleep(1)
                 if consecutive_failures >= 3:
-                    logger.warning(f"🛑 {consecutive_failures} consecutive errors — stopping warmup early")
                     break
                 continue
 
-            # Mid-session Google search (once, 15% chance in fast mode)
-            if i == len(sites_list) // 2 and random.random() < (0.1 if FAST_MODE else 0.25) and searches_done < 2:
-                query = random.choice(GOOGLE_SEARCH_QUERIES)
-                if _perform_google_search_warmup(driver, query):
-                    searches_done += 1
-                _fast_sleep(2, 4)
-
-        # --- End-of-session Yandex search reinforcement (20% in fast, 35% normal) ---
-        if random.random() < (0.2 if FAST_MODE else 0.35) and searches_done < 3:
-            query = random.choice(search_queries_pool)
-            if _perform_yandex_search(driver, query):
-                searches_done += 1
-            _fast_sleep(1, 3)
-
-        # Calculate results
         actual_duration = time.time() - start_time
-        success_rate = (successful_visits / max(sites_visited, 1) * 100)
-
-        # Update profile in database — multi-session logic
-        with get_db_session() as db:
-            profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
-            if profile_obj:
-                profile_obj.warmup_sessions_count = (profile_obj.warmup_sessions_count or 0) + 1
-                profile_obj.warmup_time_spent = (profile_obj.warmup_time_spent or 0) + max(1, int(actual_duration / 60))
-                profile_obj.last_used_at = datetime.utcnow()
-                
-                if not is_rewarmup:
-                    # Track stage progression
-                    profile_obj.warmup_stage = current_stage
-                    
-                    # Set first_warmup_at on first session
-                    if not profile_obj.first_warmup_at:
-                        profile_obj.first_warmup_at = datetime.utcnow()
-                    
-                    # Check if profile is fully warmed
-                    if current_stage >= MIN_WARMUP_SESSIONS:
-                        # Check time spread
-                        hours_since_first = 0
-                        if profile_obj.first_warmup_at:
-                            hours_since_first = (datetime.utcnow() - profile_obj.first_warmup_at).total_seconds() / 3600
-                        
-                        if hours_since_first >= MIN_WARMUP_HOURS_SPREAD:
-                            # Fully warmed!
-                            profile_obj.warmup_completed = True
-                            profile_obj.status = "warmed"
-                            logger.info(
-                                f"✅ Profile {profile_id} FULLY WARMED after {current_stage} sessions "
-                                f"over {hours_since_first:.1f} hours"
-                            )
-                        else:
-                            # Enough sessions but need more time spread — schedule retry
-                            profile_obj.status = "created"
-                            remaining_hours = MIN_WARMUP_HOURS_SPREAD - hours_since_first
-                            retry_minutes = max(30, int(remaining_hours * 60))
-                            logger.info(
-                                f"⏳ Profile {profile_id} completed stage {current_stage} but only "
-                                f"{hours_since_first:.1f}h since first warmup (need {MIN_WARMUP_HOURS_SPREAD}h). "
-                                f"Will retry in {retry_minutes} min."
-                            )
-                            # Schedule retry after the required time passes
-                            warmup_profile_task.apply_async(
-                                args=[profile_id],
-                                eta=datetime.utcnow() + timedelta(minutes=retry_minutes),
-                                queue='warmup'
-                            )
-                    else:
-                        # More sessions needed — schedule next stage with delay
-                        profile_obj.status = "created"
-                        next_delay_min = max(5, WARMUP_SESSION_INTERVAL_HOURS * 60)
-                        logger.info(
-                            f"📋 Profile {profile_id} completed stage {current_stage}/{MIN_WARMUP_SESSIONS}. "
-                            f"Next session scheduled in {next_delay_min} min."
-                        )
-                        # Auto-schedule next stage
-                        warmup_profile_task.apply_async(
-                            args=[profile_id],
-                            eta=datetime.utcnow() + timedelta(minutes=next_delay_min),
-                            queue='warmup'
-                        )
-                else:
-                    # Re-warmup — advance stage for Maps warmup catch-up
-                    if profile_obj.warmup_stage < current_stage:
-                        profile_obj.warmup_stage = current_stage
-                        logger.info(
-                            f"📈 Profile {profile_id} re-warmup advanced to stage {current_stage}"
-                        )
-                    profile_obj.status = "warmed"
-                
-                db.commit()
-
-        result = {
-            "status": "completed",
-            "profile_id": profile_id,
-            "stage": current_stage,
-            "is_rewarmup": is_rewarmup,
-            "duration_seconds": round(actual_duration, 1),
-            "sites_visited": sites_visited,
-            "successful_visits": successful_visits,
-            "success_rate": round(success_rate, 1),
-            "searches_performed": searches_done,
-            "maps_browsed": maps_browsed,
-            "total_time_spent": round(total_time_spent, 1),
-            "average_time_per_site": round(total_time_spent / max(successful_visits, 1), 1)
-        }
-
         logger.info(
-            f"🔥 Warmup DONE profile {profile_id} stage {current_stage} in {actual_duration:.0f}s: "
-            f"{successful_visits}/{sites_visited} sites, {searches_done} searches, "
-            f"{maps_browsed} maps sessions, "
-            f"avg {result['average_time_per_site']:.1f}s/site"
+            f"✅ Chunk {chunk_index + 1}/{total_chunks} done for profile {profile_id} in {actual_duration:.0f}s: "
+            f"{successful_visits}/{sites_visited} sites, {searches_done} searches, {maps_browsed} maps"
         )
-        return result
+
+        # Track total successful visits across all chunks in Redis
+        try:
+            r = _get_warmup_redis()
+            r.incrby(f"warmup:visits:{profile_id}:{current_stage}", successful_visits)
+            r.expire(f"warmup:visits:{profile_id}:{current_stage}", 7200)  # 2h TTL
+        except Exception:
+            pass
 
     except SoftTimeLimitExceeded:
-        logger.error(f"⏰ Soft time limit exceeded for warmup profile {profile_id}, cleaning up Chrome...")
-        try:
-            with get_db_session() as db:
-                profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
-                if profile_obj:
-                    if profile_obj.warmup_completed:
-                        profile_obj.status = "warmed"
-                    else:
-                        profile_obj.status = "created"
-                    db.commit()
-        except:
-            pass
-        raise
+        logger.error(f"⏰ Chunk {chunk_index + 1} soft time limit for profile {profile_id}")
+        chunk_failed = True
+
+    except TimeoutError as te:
+        logger.error(f"⏰ Chunk {chunk_index + 1} ALARM for profile {profile_id}: {te}")
+        chunk_failed = True
 
     except Exception as e:
-        logger.error(f"Error in warmup task for profile {profile_id}: {e}")
-
-        try:
-            with get_db_session() as db:
-                profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
-                if profile_obj:
-                    # On error, reset to previous state so scheduler retries
-                    if profile_obj.warmup_completed:
-                        profile_obj.status = "warmed"
-                    else:
-                        profile_obj.status = "created"
-                    db.commit()
-        except:
-            pass
-
-        # Don't retry if profile was deleted
-        if isinstance(e, ValueError) and 'not found' in str(e):
-            logger.warning(f"Profile {profile_id} not found, skipping retry")
-            raise e
-
-        if self.request.retries < self.max_retries:
-            raise self.retry(exc=e)
-        raise e
+        logger.error(f"Error in chunk {chunk_index + 1} for profile {profile_id}: {e}")
+        chunk_failed = True
 
     finally:
+        # Cancel alarm and restore handler
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, _old_alarm_handler)
+        # ALWAYS close browser — this is the key fix
         if browser_manager and browser_id:
             try:
                 browser_manager.close_browser_session(browser_id)
+                logger.info(f"✅ Browser session {browser_id} closed cleanly")
             except Exception as e:
                 logger.error(f"Error closing browser session: {e}")
         elif _profile_dir_for_cleanup:
-            # browser_id is None — Chrome failed to start but may have left orphans.
             try:
                 if browser_manager and hasattr(browser_manager, '_kill_chrome_by_profile_dir'):
                     browser_manager._kill_chrome_by_profile_dir(_profile_dir_for_cleanup)
@@ -1942,6 +1768,138 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
                     _sp.run(['pkill', '-9', '-f', _profile_dir_for_cleanup], capture_output=True, timeout=5)
             except Exception as cleanup_err:
                 logger.warning(f"Cleanup by profile dir failed: {cleanup_err}")
+
+    # === Chain to next chunk or finalise ===
+    if is_last_chunk:
+        # Get total successful visits across all chunks from Redis
+        total_successful = 0
+        try:
+            r = _get_warmup_redis()
+            total_successful = int(r.get(f"warmup:visits:{profile_id}:{current_stage}") or 0)
+            r.delete(f"warmup:visits:{profile_id}:{current_stage}")
+        except Exception:
+            pass
+        _finalise_warmup_session(profile_id, current_stage, is_rewarmup, total_successful)
+    else:
+        # Chain to next chunk with a small delay (let Chrome processes clean up)
+        # Use priority=3 so chain chunks go before new warmup tasks (default priority=0)
+        delay_seconds = random.randint(3, 8)
+        warmup_chunk_task.apply_async(
+            args=[profile_id, current_stage, is_rewarmup, all_chunks, chunk_index + 1, total_chunks],
+            countdown=delay_seconds,
+            queue='warmup',
+        )
+
+    # Signal progress to host watchdog after every chunk (not just session end)
+    try:
+        _get_warmup_redis().incr("warmup:completions")
+    except Exception:
+        pass
+
+    return {
+        "status": "chunk_done",
+        "profile_id": profile_id,
+        "chunk": chunk_index + 1,
+        "total_chunks": total_chunks,
+        "is_last": is_last_chunk,
+        "successful_visits": successful_visits,
+        "searches": searches_done,
+    }
+
+
+def _finalise_warmup_session(profile_id: int, current_stage: int, is_rewarmup: bool, total_successful_visits: int = 0):
+    """Update profile DB record after all chunks of a warmup session are done."""
+    try:
+        with get_db_session() as db:
+            profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+            if not profile_obj:
+                logger.warning(f"Profile {profile_id} not found during finalise")
+                return
+
+            # Quality check: if too few sites visited, don't count this session
+            if total_successful_visits < MIN_WARMUP_VISITS_PER_SESSION:
+                logger.warning(
+                    f"⚠️ Profile {profile_id} stage {current_stage}: only {total_successful_visits} "
+                    f"successful visits (need {MIN_WARMUP_VISITS_PER_SESSION}). Session NOT counted, will retry."
+                )
+                profile_obj.status = "created" if not profile_obj.warmup_completed else "warmed"
+                profile_obj.last_used_at = datetime.utcnow()
+                db.commit()
+                return
+
+            profile_obj.warmup_sessions_count = (profile_obj.warmup_sessions_count or 0) + 1
+            profile_obj.last_used_at = datetime.utcnow()
+
+            if not is_rewarmup:
+                profile_obj.warmup_stage = current_stage
+
+                if not profile_obj.first_warmup_at:
+                    profile_obj.first_warmup_at = datetime.utcnow()
+
+                if current_stage >= MIN_WARMUP_SESSIONS:
+                    hours_since_first = 0
+                    if profile_obj.first_warmup_at:
+                        hours_since_first = (datetime.utcnow() - profile_obj.first_warmup_at).total_seconds() / 3600
+
+                    if hours_since_first >= MIN_WARMUP_HOURS_SPREAD:
+                        profile_obj.warmup_completed = True
+                        profile_obj.status = "warmed"
+                        logger.info(
+                            f"✅ Profile {profile_id} FULLY WARMED after {current_stage} sessions "
+                            f"over {hours_since_first:.1f} hours"
+                        )
+                    else:
+                        profile_obj.status = "created"
+                        remaining_hours = MIN_WARMUP_HOURS_SPREAD - hours_since_first
+                        retry_minutes = max(30, int(remaining_hours * 60))
+                        logger.info(
+                            f"⏳ Profile {profile_id} completed stage {current_stage} but only "
+                            f"{hours_since_first:.1f}h since first warmup (need {MIN_WARMUP_HOURS_SPREAD}h). "
+                            f"Will retry in {retry_minutes} min."
+                        )
+                        warmup_profile_task.apply_async(
+                            args=[profile_id],
+                            eta=datetime.utcnow() + timedelta(minutes=retry_minutes),
+                            queue='warmup'
+                        )
+                else:
+                    profile_obj.status = "created"
+                    next_delay_min = max(5, WARMUP_SESSION_INTERVAL_HOURS * 60)
+                    logger.info(
+                        f"📋 Profile {profile_id} completed stage {current_stage}/{MIN_WARMUP_SESSIONS}. "
+                        f"Next session scheduled in {next_delay_min} min."
+                    )
+                    warmup_profile_task.apply_async(
+                        args=[profile_id],
+                        eta=datetime.utcnow() + timedelta(minutes=next_delay_min),
+                        queue='warmup'
+                    )
+            else:
+                if profile_obj.warmup_stage < current_stage:
+                    profile_obj.warmup_stage = current_stage
+                    logger.info(f"📈 Profile {profile_id} re-warmup advanced to stage {current_stage}")
+                profile_obj.status = "warmed"
+
+            db.commit()
+            logger.info(f"✅ Warmup session finalised for profile {profile_id} stage {current_stage}")
+
+            # Signal to host watchdog that warmup is making progress
+            try:
+                _get_warmup_redis().incr("warmup:completions")
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.error(f"Error finalising warmup for profile {profile_id}: {e}")
+        try:
+            with get_db_session() as db:
+                p = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
+                if p:
+                    p.status = "created" if not p.warmup_completed else "warmed"
+                    db.commit()
+        except:
+            pass
+
 
 
 @shared_task(base=BaseTask, bind=True)
@@ -2015,7 +1973,7 @@ def periodic_rewarmup():
                 BrowserProfile.warmup_stage >= 0,  # include stage 0 (never warmed) too
                 BrowserProfile.warmup_stage < MIN_WARMUP_SESSIONS + 1,  # not done yet
                 (BrowserProfile.last_used_at < interval_threshold) | (BrowserProfile.last_used_at.is_(None))
-            ).order_by(BrowserProfile.warmup_stage.asc(), BrowserProfile.last_used_at.asc().nullsfirst()).limit(20).all()
+            ).order_by(BrowserProfile.warmup_stage.desc(), BrowserProfile.last_used_at.asc().nullsfirst()).limit(20).all()
 
             if pipeline_profiles:
                 profile_ids_next = [p.id for p in pipeline_profiles]
@@ -2039,6 +1997,15 @@ def periodic_rewarmup():
 
             if stale_profiles:
                 profile_ids_rewarm = [p.id for p in stale_profiles]
+
+        # Mark profiles as warming_up BEFORE scheduling to prevent duplicate picks
+        all_ids_to_schedule = profile_ids_next + profile_ids_rewarm
+        if all_ids_to_schedule:
+            with get_db_session() as db:
+                db.query(BrowserProfile).filter(
+                    BrowserProfile.id.in_(all_ids_to_schedule)
+                ).update({BrowserProfile.status: "warming_up"}, synchronize_session=False)
+                db.commit()
 
         # Schedule pipeline warmup tasks with staggered delays
         for i, pid in enumerate(profile_ids_next):
@@ -2143,8 +2110,9 @@ def auto_schedule_initial_warmup():
         reset_count = 0
 
         with get_db_session() as db:
-            # First, reset profiles stuck in 'warming_up' for >10 min
-            stuck_threshold = now - timedelta(minutes=10)
+            # First, reset profiles stuck in 'warming_up' for >45 min
+            # Stage 3 profiles can take 20+ min (4 chunks × 5 min each)
+            stuck_threshold = now - timedelta(minutes=45)
             stuck = db.query(BrowserProfile).filter(
                 BrowserProfile.status == "warming_up",
                 BrowserProfile.updated_at < stuck_threshold
@@ -2162,7 +2130,7 @@ def auto_schedule_initial_warmup():
                 BrowserProfile.status == "warming_up"
             ).count()
 
-            # Allow up to 20 concurrent warmup tasks (concurrency=10, with overlap for pipeline)
+            # Allow up to 20 concurrent warmup tasks to keep queue manageable
             MAX_WARMUP_CONCURRENT = 20
             slots = max(0, MAX_WARMUP_CONCURRENT - active_warming)
 
@@ -2182,7 +2150,7 @@ def auto_schedule_initial_warmup():
                 BrowserProfile.warmup_stage < MIN_WARMUP_SESSIONS + 1,
                 (BrowserProfile.last_used_at < interval_threshold) | (BrowserProfile.last_used_at.is_(None))
             ).order_by(
-                BrowserProfile.warmup_stage.asc(),  # prioritize least warmed
+                BrowserProfile.warmup_stage.desc(),  # prioritize closest to completion
                 BrowserProfile.id.asc()  # oldest first
             ).limit(slots).all()
 
@@ -2191,6 +2159,13 @@ def auto_schedule_initial_warmup():
         if not profile_ids:
             logger.info(f"📋 No new profiles need initial warmup (reset={reset_count})")
             return {"scheduled": 0, "reset": reset_count}
+
+        # Mark profiles as warming_up BEFORE scheduling to prevent duplicate picks
+        with get_db_session() as db:
+            db.query(BrowserProfile).filter(
+                BrowserProfile.id.in_(profile_ids)
+            ).update({BrowserProfile.status: "warming_up"}, synchronize_session=False)
+            db.commit()
 
         # Schedule warmup tasks with minimal stagger
         for i, pid in enumerate(profile_ids):
@@ -2226,7 +2201,8 @@ def auto_fix_stuck_processes():
     fixed = 0
     try:
         now = datetime.utcnow()
-        stuck_threshold = timedelta(minutes=10)
+        # Stage 3 warmup can take 20+ min (multiple chunks)
+        stuck_threshold = timedelta(minutes=45)
 
         with get_db_session() as db:
             # Fix profiles stuck in warming_up state
@@ -2305,6 +2281,8 @@ def auto_maintain_profile_pool():
     """
     TARGET_POOL_SIZE = 2000
     BATCH_SIZE = 400
+    # Don't create more if too many profiles haven't even started warming yet
+    MAX_STAGE0_BACKLOG = 200
 
     try:
         with get_db_session() as db:
@@ -2319,6 +2297,13 @@ def auto_maintain_profile_pool():
                 BrowserProfile.status.in_(['created', 'warming_up']),
             ).count()
 
+            # Check how many stage 0 profiles are waiting (never started)
+            stage0_count = db.query(BrowserProfile).filter(
+                BrowserProfile.is_active == True,
+                BrowserProfile.warmup_completed == False,
+                BrowserProfile.warmup_stage == 0,
+            ).count()
+
             total_pipeline = warmed_count + warming_count
 
             if total_pipeline >= TARGET_POOL_SIZE:
@@ -2326,6 +2311,12 @@ def auto_maintain_profile_pool():
                     f"📋 Profile pool OK: {warmed_count} warmed + {warming_count} warming = {total_pipeline} (target={TARGET_POOL_SIZE})"
                 )
                 return {"status": "ok", "warmed": warmed_count, "warming": warming_count, "created": 0}
+
+            if stage0_count >= MAX_STAGE0_BACKLOG:
+                logger.info(
+                    f"⏭️ Too many stage-0 profiles waiting ({stage0_count}), skipping creation until they warm up"
+                )
+                return {"status": "backlog", "warmed": warmed_count, "warming": warming_count, "stage0_backlog": stage0_count, "created": 0}
 
             need = min(TARGET_POOL_SIZE - total_pipeline, BATCH_SIZE)
             logger.info(
@@ -2424,4 +2415,158 @@ def cleanup_orphaned_chrome_processes():
         return {"killed": killed}
     except Exception as e:
         logger.error(f"Error in cleanup_orphaned_chrome_processes: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Warmup watchdog — self-healing + Telegram alerts
+# ---------------------------------------------------------------------------
+_WATCHDOG_CHECK_WINDOW = 180  # 3 min — same as beat interval
+_WATCHDOG_MAX_ZERO_RUNS = 3   # alert after 3 consecutive zero-completion checks (~9 min)
+
+def _send_telegram_alert(message: str):
+    """Send alert via Telegram if configured.
+    
+    Env vars: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+    Rate-limited: max 1 message per 5 min per unique prefix.
+    """
+    import os, hashlib, requests as _req
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+    # Rate-limit via Redis
+    prefix = hashlib.md5(message[:40].encode()).hexdigest()[:8]
+    try:
+        r = _get_warmup_redis()
+        key = f"tg_alert:{prefix}"
+        if r.get(key):
+            return  # already sent recently
+        r.setex(key, 300, "1")  # 5 min cooldown
+    except Exception:
+        pass
+    try:
+        _req.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning(f"Telegram send failed: {e}")
+
+
+@shared_task(base=BaseTask)
+def warmup_watchdog():
+    """Self-healing warmup watchdog. Runs every 3 min via Celery Beat.
+    
+    Tracks chunk completions via Redis counter ``warmup:completions``.
+    If no chunks complete for several consecutive checks AND there are profiles
+    that still need warming, the watchdog:
+      1. Purges the warmup queue (break redelivery loops).
+      2. Resets stuck warming_up profiles back to created.
+      3. Sends a Telegram alert (if configured).
+    
+    Redis keys used:
+      warmup:completions        — counter incremented by warmup_chunk_task
+      warmup:wd:prev_completions — snapshot from previous watchdog run
+      warmup:wd:zero_runs       — consecutive runs with 0 new completions
+    """
+    try:
+        r = _get_warmup_redis()
+        now_completions = int(r.get("warmup:completions") or 0)
+        prev_completions = int(r.get("warmup:wd:prev_completions") or 0)
+        new_completions = now_completions - prev_completions
+
+        # Save for next run
+        r.set("warmup:wd:prev_completions", now_completions)
+
+        if new_completions > 0:
+            # Healthy — reset zero counter
+            r.set("warmup:wd:zero_runs", 0)
+            logger.info(f"✅ Watchdog: {new_completions} chunk completions in last window (total={now_completions})")
+            return {"status": "healthy", "new_completions": new_completions}
+
+        # Zero completions — check if there's actually work to do
+        with get_db_session() as db:
+            need_warmup = db.query(func.count(BrowserProfile.id)).filter(
+                BrowserProfile.warmup_completed == False,
+                BrowserProfile.is_active == True,
+            ).scalar() or 0
+            warming_now = db.query(func.count(BrowserProfile.id)).filter(
+                BrowserProfile.status == "warming_up",
+            ).scalar() or 0
+
+        if need_warmup == 0:
+            r.set("warmup:wd:zero_runs", 0)
+            logger.info("✅ Watchdog: no profiles need warmup — all done")
+            return {"status": "idle", "need_warmup": 0}
+
+        # Increment zero-completion counter
+        zero_runs = int(r.get("warmup:wd:zero_runs") or 0) + 1
+        r.set("warmup:wd:zero_runs", zero_runs)
+
+        logger.warning(
+            f"⚠️ Watchdog: 0 completions for {zero_runs} consecutive checks "
+            f"(need_warmup={need_warmup}, warming_now={warming_now})"
+        )
+
+        if zero_runs < _WATCHDOG_MAX_ZERO_RUNS:
+            return {"status": "warning", "zero_runs": zero_runs, "need_warmup": need_warmup}
+
+        # === SELF-HEAL ===
+        logger.error(f"🚨 Watchdog: warmup stuck for {zero_runs} checks (~{zero_runs * 3} min). Auto-healing...")
+
+        healed = {"purged": 0, "reset": 0}
+
+        # 1) Purge warmup queue to break redelivery loops
+        try:
+            from .celery_app import celery_app
+            purged = celery_app.control.purge()  # purge default queue
+            # Also purge warmup queue specifically
+            with celery_app.connection_or_acquire() as conn:
+                q = conn.default_channel.queue_declare('warmup', passive=True)
+                if hasattr(q, 'message_count'):
+                    healed["purged"] = q.message_count
+            celery_app.control.discard_all()
+            try:
+                # Direct Redis LTRIM to clear warmup queue
+                r.delete("warmup")
+            except Exception:
+                pass
+            logger.info(f"🧹 Watchdog: purged warmup queue")
+        except Exception as e:
+            logger.error(f"Watchdog: purge error: {e}")
+
+        # 2) Reset stuck warming_up profiles
+        try:
+            with get_db_session() as db:
+                stuck = db.query(BrowserProfile).filter(
+                    BrowserProfile.status == "warming_up"
+                ).all()
+                for p in stuck:
+                    p.status = "created" if not p.warmup_completed else "warmed"
+                    p.updated_at = datetime.utcnow()
+                    healed["reset"] += 1
+                if stuck:
+                    db.commit()
+                    logger.info(f"🔧 Watchdog: reset {healed['reset']} stuck profiles")
+        except Exception as e:
+            logger.error(f"Watchdog: reset error: {e}")
+
+        # 3) Reset zero counter so watchdog doesn't repeat heal every 3 min
+        r.set("warmup:wd:zero_runs", 0)
+
+        # 4) Telegram alert
+        msg = (
+            f"🚨 <b>Warmup авто-восстановление</b>\n"
+            f"Прогрев завис ({zero_runs * 3}+ мин без завершённых чанков).\n"
+            f"Очередь очищена, {healed['reset']} профилей сброшено.\n"
+            f"Ожидают прогрева: {need_warmup}"
+        )
+        _send_telegram_alert(msg)
+
+        return {"status": "healed", **healed, "need_warmup": need_warmup}
+
+    except Exception as e:
+        logger.error(f"Watchdog error: {e}")
+        return {"error": str(e)}
         return {"error": str(e)}

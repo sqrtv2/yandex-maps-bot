@@ -3,10 +3,11 @@ Main FastAPI application for Yandex Maps Profile Visitor system.
 """
 import os
 import json
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
@@ -33,6 +34,9 @@ from web.routes import router as web_router
 
 # Import parser routes
 from parser.routes import router as parser_router
+
+# Import mailing routes
+from mailing.routes import router as mailing_router
 
 # Import Celery tasks
 try:
@@ -198,6 +202,148 @@ def _stop_background_processes():
     subprocess.run(["pkill", "-9", "-f", "celery.*beat"], capture_output=True)
 
 
+# ---------------------------------------------------------------------------
+# In-process warmup watchdog — runs in web app, NOT in Celery workers.
+# This ensures self-healing even when all Celery worker slots are stuck.
+# ---------------------------------------------------------------------------
+_WD_INTERVAL = 180          # check every 3 minutes
+_WD_MAX_ZERO_RUNS = 3       # heal after 3 consecutive zero-completion checks (~9 min)
+
+async def _warmup_watchdog_loop():
+    """Background asyncio loop that monitors warmup progress and self-heals."""
+    await asyncio.sleep(30)  # let app settle
+    logger.info("🐕 Warmup watchdog started (in-process, interval=%ds)", _WD_INTERVAL)
+
+    while True:
+        try:
+            await asyncio.sleep(_WD_INTERVAL)
+            await asyncio.to_thread(_warmup_watchdog_tick)
+        except asyncio.CancelledError:
+            logger.info("🐕 Warmup watchdog stopped")
+            return
+        except Exception as e:
+            logger.error(f"🐕 Watchdog loop error: {e}")
+            await asyncio.sleep(60)
+
+
+def _warmup_watchdog_tick():
+    """Single watchdog check — runs in a thread to avoid blocking the event loop."""
+    import redis as _rwd
+    from sqlalchemy import func as _fn
+
+    r = _rwd.Redis(
+        host=os.environ.get('YANDEX_BOT_REDIS_HOST', settings.redis_host),
+        port=int(os.environ.get('YANDEX_BOT_REDIS_PORT', settings.redis_port)),
+        db=0, decode_responses=True,
+    )
+
+    now_completions = int(r.get("warmup:completions") or 0)
+    prev_completions = int(r.get("warmup:wd:prev_completions") or 0)
+    new_completions = now_completions - prev_completions
+
+    r.set("warmup:wd:prev_completions", now_completions)
+
+    if new_completions > 0:
+        r.set("warmup:wd:zero_runs", 0)
+        logger.info(f"🐕 Watchdog: {new_completions} completions (total={now_completions})")
+        return
+
+    # Check if work exists
+    with get_db_session() as db:
+        need_warmup = db.query(_fn.count(BrowserProfile.id)).filter(
+            BrowserProfile.warmup_completed == False,
+            BrowserProfile.is_active == True,
+        ).scalar() or 0
+        warming_now = db.query(_fn.count(BrowserProfile.id)).filter(
+            BrowserProfile.status == "warming_up",
+        ).scalar() or 0
+
+    if need_warmup == 0:
+        r.set("warmup:wd:zero_runs", 0)
+        return
+
+    zero_runs = int(r.get("warmup:wd:zero_runs") or 0) + 1
+    r.set("warmup:wd:zero_runs", zero_runs)
+
+    logger.warning(
+        f"🐕 Watchdog: 0 completions for {zero_runs} checks "
+        f"({zero_runs * 3} min), need_warmup={need_warmup}, warming={warming_now}"
+    )
+
+    if zero_runs < _WD_MAX_ZERO_RUNS:
+        return
+
+    # === SELF-HEAL ===
+    logger.error(f"🐕🚨 Watchdog HEALING: stuck for {zero_runs * 3}+ min")
+    healed_reset = 0
+
+    # 1) Purge warmup queue
+    try:
+        r.delete("warmup")
+        logger.info("🐕 Purged warmup queue")
+    except Exception as e:
+        logger.error(f"🐕 Purge error: {e}")
+
+    # 2) Reset stuck profiles
+    try:
+        with get_db_session() as db:
+            stuck = db.query(BrowserProfile).filter(
+                BrowserProfile.status == "warming_up"
+            ).all()
+            for p in stuck:
+                p.status = "created" if not p.warmup_completed else "warmed"
+                p.updated_at = datetime.utcnow()
+                healed_reset += 1
+            if stuck:
+                db.commit()
+                logger.info(f"🐕 Reset {healed_reset} stuck profiles")
+    except Exception as e:
+        logger.error(f"🐕 Reset error: {e}")
+
+    # 3) Reset counter
+    r.set("warmup:wd:zero_runs", 0)
+
+    # 4) Telegram alert
+    _send_tg_alert(
+        f"🚨 <b>Warmup авто-восстановление</b>\n"
+        f"Прогрев завис ({zero_runs * 3}+ мин без чанков).\n"
+        f"Очередь очищена, {healed_reset} профилей сброшено.\n"
+        f"Ожидают: {need_warmup}"
+    )
+
+
+def _send_tg_alert(message: str):
+    """Send Telegram alert if configured."""
+    import hashlib
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+    try:
+        import redis as _rtg
+        rr = _rtg.Redis(
+            host=os.environ.get('YANDEX_BOT_REDIS_HOST', settings.redis_host),
+            port=int(os.environ.get('YANDEX_BOT_REDIS_PORT', settings.redis_port)),
+            db=0, decode_responses=True,
+        )
+        prefix = hashlib.md5(message[:40].encode()).hexdigest()[:8]
+        key = f"tg_alert:{prefix}"
+        if rr.get(key):
+            return
+        rr.setex(key, 300, "1")
+    except Exception:
+        pass
+    try:
+        import requests as _req
+        _req.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning(f"Telegram send failed: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -236,9 +382,13 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("⚠️  Server started but background services are unavailable (no Redis)")
 
+    # Start in-process warmup watchdog (independent of Celery workers)
+    _watchdog_task = asyncio.create_task(_warmup_watchdog_loop())
+
     yield
 
     # Shutdown
+    _watchdog_task.cancel()
     logger.info("Shutting down Yandex Maps Profile Visitor system...")
     _stop_background_processes()
     logger.info("All background processes stopped.")
@@ -344,6 +494,9 @@ app.include_router(web_router)
 
 # Include parser routes
 app.include_router(parser_router)
+
+# Include mailing routes
+app.include_router(mailing_router)
 
 
 # WebSocket manager for real-time updates
@@ -501,6 +654,58 @@ async def health_check():
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         raise HTTPException(status_code=503, detail="Service unhealthy")
+
+
+@app.get("/api/warmup-health")
+async def warmup_health_public():
+    """Unauthenticated warmup health endpoint for external monitoring."""
+    import redis as _rh, os
+    from sqlalchemy import func
+
+    r = _rh.Redis(
+        host=os.environ.get('YANDEX_BOT_REDIS_HOST', settings.redis_host),
+        port=int(os.environ.get('YANDEX_BOT_REDIS_PORT', settings.redis_port)),
+        db=0, decode_responses=True,
+    )
+
+    total_completions = int(r.get("warmup:completions") or 0)
+    prev_completions = int(r.get("warmup:wd:prev_completions") or 0)
+    zero_runs = int(r.get("warmup:wd:zero_runs") or 0)
+    queue_len = r.llen("warmup") or 0
+
+    with get_db_session() as db:
+        status_counts = dict(
+            db.query(BrowserProfile.status, func.count(BrowserProfile.id))
+            .filter(BrowserProfile.is_active == True)
+            .group_by(BrowserProfile.status)
+            .all()
+        )
+
+    warmed = status_counts.get("warmed", 0)
+    warming = status_counts.get("warming_up", 0)
+    created = status_counts.get("created", 0)
+    total = sum(status_counts.values())
+
+    if zero_runs >= 3:
+        health = "critical"
+    elif zero_runs >= 1:
+        health = "degraded"
+    elif warming > 0 or warmed > 0:
+        health = "healthy"
+    else:
+        health = "idle"
+
+    return {
+        "health": health,
+        "total": total,
+        "warmed": warmed,
+        "warming": warming,
+        "created": created,
+        "completions": total_completions,
+        "recent": total_completions - prev_completions,
+        "zero_runs": zero_runs,
+        "queue": queue_len,
+    }
 
 
 # Browser Profiles API
