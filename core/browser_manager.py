@@ -2267,17 +2267,30 @@ class BrowserManager:
         # Step 3: Try graceful close via Playwright (context.close after Chrome is already dead)
         # This is fast since Chrome is already killed — just cleans up Playwright internal state.
         # Stop any pending navigation first to prevent driver.quit() from hanging.
+        # Use a thread with timeout to prevent blocking if the Playwright node driver is stuck.
         try:
             if browser_id in self.active_browsers:
                 driver = self.active_browsers[browser_id]
-                try:
-                    driver.execute_cdp_cmd("Page.stopLoading")
-                except Exception:
-                    pass
-                try:
-                    driver.quit()
-                except Exception as quit_error:
-                    logger.warning(f"driver.quit() failed for {browser_id}: {quit_error}")
+                
+                def _graceful_quit():
+                    try:
+                        driver.execute_cdp_cmd("Page.stopLoading")
+                    except Exception:
+                        pass
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                
+                import threading
+                quit_thread = threading.Thread(target=_graceful_quit, daemon=True)
+                quit_thread.start()
+                quit_thread.join(timeout=15)  # 15s max for graceful Playwright close
+                if quit_thread.is_alive():
+                    logger.warning(f"⏰ driver.quit() timed out for {browser_id} — Playwright node driver may be stuck")
+                    # Kill node-driver directly if we can find it
+                    if node_driver_pid:
+                        _kill_process_tree(node_driver_pid)
         except Exception as e:
             logger.warning(f"Error during graceful close for {browser_id}: {e}")
         

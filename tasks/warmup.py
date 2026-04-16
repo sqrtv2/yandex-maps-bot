@@ -1545,6 +1545,7 @@ def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bo
         f"🔥 Chunk {chunk_index + 1}/{total_chunks} for profile {profile_id} stage {current_stage}: "
         f"{len(pre_actions)} pre-actions, {len(sites_to_visit)} sites"
     )
+    import sys; sys.stderr.flush()  # Ensure log appears for replacement workers
 
     successful_visits = 0
     sites_visited = 0
@@ -1748,14 +1749,26 @@ def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bo
         chunk_failed = True
 
     finally:
-        # Cancel alarm and restore handler
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, _old_alarm_handler)
+        # Keep alarm ACTIVE during cleanup — set a shorter cleanup alarm (120s).
+        # Previous bug: signal.alarm(0) cancelled the alarm BEFORE close_browser_session(),
+        # so if Playwright API hung during cleanup, there was no safety net → SIGKILL at 900s.
+        CLEANUP_TIMEOUT = 120
+        signal.alarm(CLEANUP_TIMEOUT)
+
         # ALWAYS close browser — this is the key fix
         if browser_manager and browser_id:
             try:
                 browser_manager.close_browser_session(browser_id)
                 logger.info(f"✅ Browser session {browser_id} closed cleanly")
+            except TimeoutError:
+                logger.error(f"⏰ Browser cleanup alarm for {browser_id} — force killing")
+                # Alarm fired during cleanup — force-kill by profile dir
+                if _profile_dir_for_cleanup:
+                    try:
+                        import subprocess as _sp
+                        _sp.run(['pkill', '-9', '-f', _profile_dir_for_cleanup], capture_output=True, timeout=5)
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.error(f"Error closing browser session: {e}")
         elif _profile_dir_for_cleanup:
@@ -1767,6 +1780,10 @@ def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bo
                     _sp.run(['pkill', '-9', '-f', _profile_dir_for_cleanup], capture_output=True, timeout=5)
             except Exception as cleanup_err:
                 logger.warning(f"Cleanup by profile dir failed: {cleanup_err}")
+
+        # NOW cancel alarm and restore handler — AFTER cleanup is done
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, _old_alarm_handler)
 
     # === Chain to next chunk or finalise ===
     if is_last_chunk:
