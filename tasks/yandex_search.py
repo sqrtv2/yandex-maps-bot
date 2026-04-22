@@ -2841,7 +2841,9 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         # Real users arrive at Yandex via different paths: direct, bookmarks, or from other sites
         _check_wall_clock(start_time, 'before entry point', _watchdog)
         _referrer_used = False
-        _entry_method = 'direct'  # mail.ru disabled — causes 9min hangs when page.mouse/scroll blocks on dead renderer
+        # Re-enabled mail.ru 50/50: heartbeat watchdog (idle 120s) now kills any
+        # hang within 2 min instead of waiting 9 min. Each step also pings heartbeat.
+        _entry_method = random.choice(['direct', 'mail.ru'])
         
         if _entry_method == 'mail.ru':
             logger.info(f"🔗 Entry via mail.ru (50% chance)")
@@ -2849,6 +2851,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 _update_search_task_log(task_id, f"🔗 Заходим через mail.ru...")
             
             ref_loaded = _safe_get(driver, 'https://mail.ru', timeout=15, label="mail.ru entry")
+            _watchdog.heartbeat('mail.ru loaded')
             if ref_loaded == 'dead':
                 logger.warning("💀 Browser died visiting mail.ru — recovering page...")
                 if hasattr(driver, 'recover_page') and driver.recover_page():
@@ -2858,12 +2861,27 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     raise Exception("Browser died visiting mail.ru, cannot recover")
             elif ref_loaded:
                 _referrer_used = True
-                # Browse mail.ru briefly like a real user
-                time.sleep(random.uniform(2, 5))
-                _human_mouse_move(driver, duration=random.uniform(0.5, 1.5))
-                _human_scroll(driver, 1, 3)
-                time.sleep(random.uniform(1, 3))
-                logger.info(f"✅ mail.ru visited, now going to Yandex")
+                # Browse mail.ru briefly like a real user.
+                # Each call wrapped in try/except so a stuck mouse/scroll on a
+                # half-dead renderer doesn't block the whole task — watchdog will
+                # also kick in after 120s of no heartbeat.
+                try:
+                    time.sleep(random.uniform(2, 5))
+                    _watchdog.heartbeat('mail.ru after sleep')
+                    _human_mouse_move(driver, duration=random.uniform(0.5, 1.5))
+                    _watchdog.heartbeat('mail.ru after mouse')
+                    _human_scroll(driver, 1, 3)
+                    _watchdog.heartbeat('mail.ru after scroll')
+                    time.sleep(random.uniform(1, 3))
+                    logger.info(f"✅ mail.ru visited, now going to Yandex")
+                except _WatchdogTimeout:
+                    raise
+                except Exception as _mr_e:
+                    logger.warning(f"⚠️ mail.ru browsing error (continuing to Yandex): {_mr_e}")
+                    try:
+                        driver.execute_cdp_cmd("Page.stopLoading")
+                    except Exception:
+                        pass
             else:
                 logger.warning(f"⏱️ mail.ru timed out, going direct to Yandex")
                 try:
