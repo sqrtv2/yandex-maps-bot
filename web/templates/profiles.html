@@ -1106,7 +1106,7 @@ function renderWarmupActivityLog(data) {
 
     let html = '<table class="table table-sm table-hover mb-0" style="font-size: 0.85rem;">';
     html += '<thead class="table-light"><tr>';
-    html += '<th style="width:30px"></th><th>Профиль</th><th>Действие</th><th>Воркер</th><th style="width:90px">Время</th>';
+    html += '<th style="width:30px"></th><th>Профиль</th><th>Действие</th><th>Воркер</th><th style="width:70px">Когда</th><th style="width:90px">Время</th>';
     html += '</tr></thead><tbody>';
 
     for (const ev of data.events) {
@@ -1125,11 +1125,17 @@ function renderWarmupActivityLog(data) {
             timeCell = `<small class="text-muted">${ev.elapsed}</small>`;
         }
 
+        let whenCell = '';
+        if (ev.timestamp) {
+            whenCell = `<small class="text-muted">${ev.timestamp}</small>`;
+        }
+
         html += `<tr class="${rowClass}">`;
         html += `<td>${ev.icon}</td>`;
         html += `<td><strong>${profileLabel}</strong> <small class="text-muted">#${ev.profile_id}</small></td>`;
         html += `<td>${ev.message}</td>`;
         html += `<td>${workerBadge}</td>`;
+        html += `<td>${whenCell}</td>`;
         html += `<td>${timeCell}</td>`;
         html += '</tr>';
     }

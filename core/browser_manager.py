@@ -843,7 +843,7 @@ class BrowserManager:
             import re as _re
             _ua = profile_data.get("user_agent", "")
             _cv_match = _re.search(r'Chrome/(\d+[\.\d]*)', _ua)
-            chrome_version = _cv_match.group(1) if _cv_match else "136.0.7103.50"
+            chrome_version = _cv_match.group(1) if _cv_match else "145.0.7632.6"
             _ya_match = _re.search(r'YaBrowser/(\d+[\.\d]*)', _ua)
             ya_version = _ya_match.group(1) if _ya_match else ""
             ya_major = ya_version.split('.')[0] if ya_version else ""
@@ -1797,13 +1797,13 @@ class BrowserManager:
             try {{
                 if (navigator.userAgentData) {{
                     const _brands = {'true' if is_yabrowser else 'false'} ? [
-                        {{ brand: "Chromium", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '136'}" }},
-                        {{ brand: "YaBrowser", version: "{ya_major if ya_major else '26'}" }},
+                        {{ brand: "Chromium", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '145'}" }},
+                        {{ brand: "YaBrowser", version: "{ya_major if ya_major else '27'}" }},
                         {{ brand: "Yowser", version: "2" }},
-                        {{ brand: "Not_A Brand", version: "{ya_major if ya_major else '26'}" }}
+                        {{ brand: "Not_A Brand", version: "{ya_major if ya_major else '27'}" }}
                     ] : [
-                        {{ brand: "Chromium", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '136'}" }},
-                        {{ brand: "Google Chrome", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '136'}" }},
+                        {{ brand: "Chromium", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '145'}" }},
+                        {{ brand: "Google Chrome", version: "{chrome_version.split('.')[0] if '.' in str(chrome_version) else '145'}" }},
                         {{ brand: "Not-A.Brand", version: "99" }}
                     ];
                     const _fullBrands = {'true' if is_yabrowser else 'false'} ? [

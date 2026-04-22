@@ -4436,6 +4436,11 @@ async def get_warmup_activity_log(db: Session = Depends(get_db)):
                         if p:
                             profile_name = p.name
 
+                    ts_iso = None
+                    if started:
+                        from datetime import datetime as _dt, timezone as _tz
+                        ts_iso = _dt.fromtimestamp(started, tz=_tz.utc).strftime("%H:%M:%S")
+
                     events.append({
                         "type": "active",
                         "icon": "🔥",
@@ -4445,7 +4450,7 @@ async def get_warmup_activity_log(db: Session = Depends(get_db)):
                         "message": f"Прогрев {chunk_info}".strip() + (f" → {sites_info}" if sites_info else ""),
                         "elapsed": elapsed,
                         "task_name": tname.split(".")[-1],
-                        "timestamp": None,
+                        "timestamp": ts_iso,
                     })
         except Exception as e:
             logger.warning(f"Celery inspect failed in activity log: {e}")
@@ -4476,6 +4481,8 @@ async def get_warmup_activity_log(db: Session = Depends(get_db)):
                 icon = "📈"
                 msg = f"Stage {p.warmup_stage} пройден"
 
+            exact_time = p.updated_at.strftime("%H:%M:%S") if p.updated_at else ""
+
             events.append({
                 "type": "completed",
                 "icon": icon,
@@ -4485,7 +4492,7 @@ async def get_warmup_activity_log(db: Session = Depends(get_db)):
                 "message": msg,
                 "elapsed": time_ago,
                 "task_name": "",
-                "timestamp": p.updated_at.isoformat() if p.updated_at else None,
+                "timestamp": exact_time,
             })
 
         # 3) Summary stats

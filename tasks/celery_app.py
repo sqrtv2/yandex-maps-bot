@@ -384,64 +384,29 @@ class BaseTask(celery_app.Task):
             logger.error(f"Error updating task retry status: {e}")
 
 
-# Configure logging for Celery
-def setup_celery_logging():
-    """Setup logging for Celery workers."""
-    import logging.config
-
-    LOGGING_CONFIG = {
-        'version': 1,
-        'disable_existing_loggers': False,
-        'formatters': {
-            'default': {
-                'format': '[%(asctime)s] %(levelname)s in %(module)s: %(message)s',
-            },
-            'detailed': {
-                'format': '[%(asctime)s] %(levelname)s [%(name)s:%(lineno)d] %(message)s',
-            }
-        },
-        'handlers': {
-            'console': {
-                'level': 'INFO',
-                'class': 'logging.StreamHandler',
-                'formatter': 'default',
-            },
-            'file': {
-                'level': 'DEBUG',
-                'class': 'logging.handlers.RotatingFileHandler',
-                'filename': os.path.join(settings.logs_dir, 'celery.log'),
-                'maxBytes': 10485760,  # 10MB
-                'backupCount': 5,
-                'formatter': 'detailed',
-            },
-        },
-        'loggers': {
-            '': {
-                'handlers': ['console', 'file'],
-                'level': 'INFO',
-                'propagate': True,
-            },
-            'celery': {
-                'handlers': ['console', 'file'],
-                'level': 'INFO',
-                'propagate': False,
-            },
-            'selenium': {
-                'handlers': ['file'],
-                'level': 'WARNING',
-                'propagate': False,
-            },
-        }
-    }
-
-    logging.config.dictConfig(LOGGING_CONFIG)
+# Add file handler via Celery's signal — preserves Celery's own StreamHandler
+# that correctly writes to fd 2 (Docker log).  Using dictConfig() inside
+# worker_ready was BREAKING logging: the new StreamHandler captured Celery's
+# LoggingProxy as its stream, creating a circular log chain that silently
+# dropped all messages in forked replacement workers.
+@signals.after_setup_logger.connect
+def _add_file_handler(logger, loglevel, logfile, format, colorize, **kwargs):
+    """Add RotatingFileHandler to root logger (runs once in main process)."""
+    from logging.handlers import RotatingFileHandler
+    log_path = os.path.join(settings.logs_dir, 'celery.log')
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    fh = RotatingFileHandler(log_path, maxBytes=10485760, backupCount=5)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        '[%(asctime)s] %(levelname)s [%(name)s:%(lineno)d] %(message)s'
+    ))
+    logger.addHandler(fh)
 
 
 # Worker ready signal
 @signals.worker_ready.connect
 def worker_ready(sender=None, **kwargs):
     """Called when worker is ready."""
-    setup_celery_logging()
     logger.info(f"Worker {sender} is ready")
 
 

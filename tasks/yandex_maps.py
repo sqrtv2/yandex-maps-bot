@@ -28,6 +28,22 @@ from core.capsola_solver import create_capsola_solver
 from app.config import settings
 from .celery_app import BaseTask
 
+import threading
+# Thread-local storage for watchdog heartbeat callback.
+# Set by calling code (e.g. yandex_search task) before invoking captcha solvers.
+# Captcha code calls _heartbeat() to signal the watchdog that work is in progress.
+_heartbeat_local = threading.local()
+
+def set_captcha_heartbeat(callback):
+    """Set heartbeat callback for the current thread (called by search task)."""
+    _heartbeat_local.callback = callback
+
+def _heartbeat(label: str = ""):
+    """Send heartbeat to watchdog if callback is set. Safe to call from anywhere."""
+    cb = getattr(_heartbeat_local, 'callback', None)
+    if cb:
+        cb(label)
+
 
 def _update_task_log(profile_id: int, target_url: str, message: str, status: str = None, error: str = None, result_data: dict = None, exec_time: float = None, task_id: int = None):
     """Update the task in DB with log entry and optionally status.
@@ -591,6 +607,7 @@ def detect_captcha_or_block(driver) -> bool:
 def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidoscope_attempts: int = 7) -> bool:
     """Handle Yandex captcha or protection mechanisms (SmartCaptcha через Capsola)."""
     try:
+        _heartbeat('captcha: handle_yandex_protection start')
         logger.info("🔧 Attempting to handle Yandex protection")
         
         # Captcha debug screenshots disabled to save time

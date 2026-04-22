@@ -43,15 +43,17 @@ logger = logging.getLogger(__name__)
 MEMORY_BUDGET_MB = 6000  # 6 GB — leaves ~1.6 GB headroom
 
 # Wall-clock budget: max seconds for the entire search task.
-# Must be LESS than soft_time_limit (540s) to exit cleanly before Celery sends
+# Must be LESS than soft_time_limit (780s) to exit cleanly before Celery sends
 # SoftTimeLimitExceeded (which can't interrupt Playwright FFI calls).
-# 420s = 7 min: leaves 2 min buffer for cleanup + browser close.
-SEARCH_MAX_DURATION = 420
+# 600s = 10 min: allows captcha solving to complete; leaves 3 min buffer for cleanup.
+SEARCH_MAX_DURATION = 600
 
-# Hard-kill watchdog: kills Chrome/node-driver process tree BEFORE Celery's
-# time_limit sends SIGKILL (which can't be caught and skips cleanup).
-# Fires at WATCHDOG_KILL_AT seconds, which must be < time_limit (600s).
-WATCHDOG_KILL_AT = 560  # 9m20s — gives 40s for cleanup before 600s SIGKILL
+# Heartbeat-based watchdog: kills Chrome/node-driver when the task is STUCK
+# (no heartbeat for WATCHDOG_IDLE_TIMEOUT seconds). This lets captcha solving
+# take as long as needed (heartbeats keep coming) while still catching hangs.
+# Absolute safety net at WATCHDOG_ABSOLUTE_MAX seconds (< time_limit).
+WATCHDOG_IDLE_TIMEOUT = 120   # kill if no heartbeat for 2 minutes
+WATCHDOG_ABSOLUTE_MAX = 780   # absolute max before kill (< time_limit=840s)
 
 
 class _WatchdogTimeout(Exception):
@@ -65,16 +67,19 @@ def _watchdog_signal_handler(signum, frame):
 
 
 class _TaskWatchdog:
-    """Background thread that force-kills Chrome/node-driver when approaching time_limit.
+    """Background thread that force-kills Chrome/node-driver when the task is STUCK.
 
     Problem: When Chrome dies, the Playwright node-driver process may hang,
     blocking the Python worker on pipe.read(). soft_time_limit (Python signal)
     cannot interrupt C-level blocking calls. Celery then sends SIGKILL at
     time_limit, which kills the worker without any cleanup.
 
-    Solution: This watchdog thread sleeps until WATCHDOG_KILL_AT seconds,
-    then kills the node-driver + Chrome process tree. This unblocks pipe.read(),
-    Python regains control, the finally block runs, and cleanup happens normally.
+    Solution: Heartbeat-based watchdog. The task calls heartbeat() at every
+    meaningful action (navigation, captcha step, API call). The watchdog thread
+    checks every 5s: if no heartbeat for WATCHDOG_IDLE_TIMEOUT seconds, the task
+    is stuck → kill Chrome/node-driver. This allows captcha solving to take as
+    long as needed (heartbeats keep coming) while catching true hangs quickly.
+    Absolute safety net at WATCHDOG_ABSOLUTE_MAX seconds.
     """
 
     def __init__(self):
@@ -85,16 +90,28 @@ class _TaskWatchdog:
         self._profile_dir = None
         self._start_time = None
         self._main_thread_id = None
+        self._last_heartbeat = None  # time.time() of last heartbeat
+        self._last_heartbeat_label = "init"
+        import threading
+        self._lock = threading.Lock()
 
     @property
     def fired(self):
         """True if watchdog has killed processes (skip browser.close)."""
         return self._fired
 
+    def heartbeat(self, label: str = ""):
+        """Signal that the task is still making progress. Call from main thread."""
+        with self._lock:
+            self._last_heartbeat = time.time()
+            if label:
+                self._last_heartbeat_label = label
+
     def start(self, start_time: float, profile_dir: str = None):
         """Start the watchdog. Call after browser is created."""
         import threading
         self._start_time = start_time
+        self._last_heartbeat = time.time()
         self._profile_dir = profile_dir
         self._cancelled = False
         self._main_thread_id = threading.current_thread().ident
@@ -106,51 +123,68 @@ class _TaskWatchdog:
         self._cancelled = True
 
     def _run(self):
-        """Watchdog loop: sleep until kill time, then nuke the process tree."""
+        """Watchdog loop: check heartbeat every 5s, kill if idle too long or absolute max reached."""
         while not self._cancelled:
-            elapsed = time.time() - self._start_time
-            remaining = WATCHDOG_KILL_AT - elapsed
-            if remaining > 0:
-                # Sleep in 1s increments so cancel takes effect quickly
-                time.sleep(min(remaining, 1.0))
-                continue
-
-            # Time's up — kill Chrome and node-driver by profile dir
+            time.sleep(5)
             if self._cancelled:
                 return
-            self._fired = True
-            logger.warning(f"⏰ WATCHDOG: {elapsed:.0f}s elapsed (limit {WATCHDOG_KILL_AT}s), "
-                           f"killing Chrome/node-driver for {self._profile_dir}")
-            self._force_kill()
 
-            # Keep re-injecting exceptions every 3s until task finishes or hard limit.
-            # After the first kill + inject, the main thread may unblock from one
-            # Playwright call but enter another blocking call in error handling.
-            # Repeated injections ensure each new stuck call gets interrupted.
-            max_reinject = 10  # ~30s of retries, well within the 40s window before SIGKILL
-            for i in range(max_reinject):
+            now = time.time()
+            elapsed = now - self._start_time
+            with self._lock:
+                idle_time = now - self._last_heartbeat
+                last_label = self._last_heartbeat_label
+
+            # Check absolute maximum first
+            if elapsed >= WATCHDOG_ABSOLUTE_MAX:
                 if self._cancelled:
                     return
-                time.sleep(3)
+                self._fired = True
+                logger.warning(f"⏰ WATCHDOG: absolute max {WATCHDOG_ABSOLUTE_MAX}s reached "
+                               f"(elapsed={elapsed:.0f}s, last_heartbeat={last_label!r} {idle_time:.0f}s ago), "
+                               f"killing Chrome/node-driver for {self._profile_dir}")
+                self._force_kill()
+                self._reinject_exceptions()
+                return
+
+            # Check idle timeout (no heartbeat)
+            if idle_time >= WATCHDOG_IDLE_TIMEOUT:
                 if self._cancelled:
                     return
-                # SIGUSR1 interrupts C-level read() syscalls
+                self._fired = True
+                logger.warning(f"⏰ WATCHDOG: no heartbeat for {idle_time:.0f}s (limit {WATCHDOG_IDLE_TIMEOUT}s), "
+                               f"last_heartbeat={last_label!r}, elapsed={elapsed:.0f}s, "
+                               f"killing Chrome/node-driver for {self._profile_dir}")
+                self._force_kill()
+                self._reinject_exceptions()
+                return
+
+        # Cancelled normally
+        return
+
+    def _reinject_exceptions(self):
+        """Keep re-injecting exceptions every 3s until task finishes or hard limit."""
+        max_reinject = 10  # ~30s of retries
+        for i in range(max_reinject):
+            if self._cancelled:
+                return
+            time.sleep(3)
+            if self._cancelled:
+                return
+            try:
+                os.kill(os.getpid(), signal.SIGUSR1)
+            except Exception:
+                pass
+            if self._main_thread_id:
                 try:
-                    os.kill(os.getpid(), signal.SIGUSR1)
+                    import ctypes
+                    logger.warning(f"⏰ WATCHDOG: re-injecting _WatchdogTimeout (attempt {i+2})")
+                    ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                        ctypes.c_ulong(self._main_thread_id),
+                        ctypes.py_object(_WatchdogTimeout)
+                    )
                 except Exception:
                     pass
-                # ctypes injection interrupts Python-level blocking
-                if self._main_thread_id:
-                    try:
-                        import ctypes
-                        logger.warning(f"⏰ WATCHDOG: re-injecting _WatchdogTimeout (attempt {i+2})")
-                        ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                            ctypes.c_ulong(self._main_thread_id),
-                            ctypes.py_object(_WatchdogTimeout)
-                        )
-                    except Exception:
-                        pass
-            return
 
     def _force_kill(self):
         """Kill all Chrome AND node-driver processes associated with our profile."""
@@ -279,9 +313,12 @@ class _TaskWatchdog:
             logger.error(f"⏰ WATCHDOG: error during force kill: {e}")
 
 
-def _check_wall_clock(start_time: float, label: str = "") -> bool:
+def _check_wall_clock(start_time: float, label: str = "", watchdog: '_TaskWatchdog' = None) -> bool:
     """Check if wall-clock budget is exceeded.
-    Returns True if still within budget, raises Exception if over."""
+    Returns True if still within budget, raises Exception if over.
+    Also sends heartbeat to watchdog if provided."""
+    if watchdog:
+        watchdog.heartbeat(label)
     elapsed = time.time() - start_time
     if elapsed > SEARCH_MAX_DURATION:
         raise Exception(
@@ -675,7 +712,11 @@ def _human_mouse_move(driver, duration=None):
 
 def _safe_get(driver, url, timeout=40, label="page"):
     """Navigate to URL with timeout handling.
-    Returns True if loaded, False if timed out, 'dead' if browser/page is dead."""
+    Returns True if loaded, False if timed out, 'dead' if browser/page is dead.
+    
+    Includes a backup threading.Timer that calls Page.stopLoading via CDP
+    if Playwright's internal timeout doesn't fire (e.g. dead proxy).
+    """
     try:
         driver.set_page_load_timeout(timeout)
         driver.get(url)
@@ -2596,7 +2637,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
 
 
 @shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=30,
-             soft_time_limit=540, time_limit=600)
+             soft_time_limit=780, time_limit=840)
 def yandex_search_click_task(self, profile_id: int, target_id: int,
                              keyword: str, task_id: int = None,
                              search_params: Dict = None):
@@ -2778,15 +2819,19 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         from app.config import settings as _settings
         _profile_dir_for_cleanup = os.path.join(_settings.browser_user_data_dir, profile_data['name'])
 
-        _check_wall_clock(start_time, 'before browser launch')
+        _check_wall_clock(start_time, 'before browser launch', _watchdog)
         browser_id = browser_manager.create_browser_session(profile_data, proxy_data)
         driver = browser_manager.active_browsers[browser_id]
         driver.set_page_load_timeout(40)  # 40s instead of default 300s
         driver.set_script_timeout(15)  # Prevent execute_script from hanging on dead renderer
 
         # Start watchdog AFTER browser is created — it will kill Chrome/node-driver
-        # if the task runs past WATCHDOG_KILL_AT, preventing SIGKILL without cleanup
+        # if the task is stuck (no heartbeat for WATCHDOG_IDLE_TIMEOUT seconds)
         _watchdog.start(start_time, _profile_dir_for_cleanup)
+
+        # Set heartbeat callback for captcha-solving code in yandex_maps.py
+        from tasks.yandex_maps import set_captcha_heartbeat
+        set_captcha_heartbeat(lambda label: _watchdog.heartbeat(label))
 
         # NOTE: Network.enable + setBlockedURLs moved AFTER first navigation
         # to avoid interfering with Playwright's internal Fetch.enable proxy auth handler.
@@ -2794,9 +2839,9 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
 
         # === Step 0: Entry point — 50/50 direct ya.ru vs through mail.ru ===
         # Real users arrive at Yandex via different paths: direct, bookmarks, or from other sites
-        _check_wall_clock(start_time, 'before entry point')
+        _check_wall_clock(start_time, 'before entry point', _watchdog)
         _referrer_used = False
-        _entry_method = random.choice(['direct', 'mail.ru'])
+        _entry_method = 'direct'  # mail.ru disabled — causes 9min hangs when page.mouse/scroll blocks on dead renderer
         
         if _entry_method == 'mail.ru':
             logger.info(f"🔗 Entry via mail.ru (50% chance)")
@@ -2828,11 +2873,14 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         else:
             logger.info(f"🔗 Direct entry to ya.ru (50% chance)")
         
+        # Wall-clock check after entry point — catch slow proxy hangs early
+        _check_wall_clock(start_time, 'after entry point', _watchdog)
+        
         if task_id:
             _update_search_task_log(task_id, "🌐 Открываем Яндекс...")
 
         # === Step 1: Open Yandex ===
-        _check_wall_clock(start_time, 'before ya.ru')
+        _check_wall_clock(start_time, 'before ya.ru', _watchdog)
         ya_loaded = _safe_get(driver, "https://ya.ru", timeout=40, label="ya.ru")
         if ya_loaded == 'dead':
             logger.warning("💀 Browser died navigating to ya.ru — recovering...")
@@ -2948,7 +2996,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             logger.info(f"🔍 [DIAG] No captcha indicators detected")
         
         if detect_captcha_or_block(driver):
-            _check_wall_clock(start_time, 'before home captcha solve')
+            _check_wall_clock(start_time, 'before home captcha solve', _watchdog)
             logger.warning(f"🚨 Captcha detected on Yandex homepage! Types: {detected_types}")
             if task_id:
                 _update_search_task_log(task_id, f"⚠️ Капча на главной Яндекса ({', '.join(detected_types) or 'unknown'}), решаем...")
@@ -2961,6 +3009,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             solved = False
             for captcha_attempt in range(1, max_home_captcha_attempts + 1):
                 solve_start = time.time()
+                _watchdog.heartbeat('home captcha solve')
                 try:
                     solved = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=3)
                 except SoftTimeLimitExceeded:
@@ -3075,7 +3124,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         _human_mouse_move(driver, duration=random.uniform(0.8, 2.5))
 
         # === Step 2: Type keyword via keyboard emulation ===
-        _check_wall_clock(start_time, 'before typing keyword')
+        _check_wall_clock(start_time, 'before typing keyword', _watchdog)
         if task_id:
             _update_search_task_log(task_id, f"⌨️ Вводим запрос: '{keyword}'")
 
@@ -3466,7 +3515,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 pass
 
         # Check wall clock after all search input attempts
-        _check_wall_clock(start_time, 'after search input')
+        _check_wall_clock(start_time, 'after search input', _watchdog)
         logger.info(f"⏱️ [TIMING] after search input check passed, elapsed={time.time()-start_time:.0f}s")
 
         # Reset page load timeout to reasonable value after search section
@@ -3507,12 +3556,12 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         # Skip heavy screenshot here to preserve renderer health
         
         # === Force refresh if page didn't render (Title='' or Title='Яндекс') ===
-        _check_wall_clock(start_time, 'before refresh loop')
+        _check_wall_clock(start_time, 'before refresh loop', _watchdog)
         logger.info(f"⏱️ [TIMING] before refresh loop, elapsed={time.time()-start_time:.0f}s, title='{search_title_debug[:30]}'")
         if search_title_debug.strip() in ('', 'Яндекс') and not detect_captcha_or_block(driver):
             for _refresh_attempt in range(1, 2):
                 logger.warning(f"🔄 Empty page detected (Title='{search_title_debug}'), forced refresh #{_refresh_attempt}...")
-                _check_wall_clock(start_time, f'refresh loop #{_refresh_attempt}')
+                _check_wall_clock(start_time, f'refresh loop #{_refresh_attempt}', _watchdog)
                 try:
                     # Stop pending loads before refresh via CDP (not JS — avoids navigation hang)
                     try:
@@ -3544,7 +3593,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                     break
 
         # === Detect dead browser/proxy: still on ya.ru/ with empty Title after all retries ===
-        _check_wall_clock(start_time, 'after refresh loop')
+        _check_wall_clock(start_time, 'after refresh loop', _watchdog)
         try:
             _post_refresh_url = driver.current_url
             _post_refresh_title = driver.title
@@ -3615,6 +3664,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             solved2 = False
             for search_captcha_attempt in range(1, max_search_captcha_attempts + 1):
                 solve_start2 = time.time()
+                _watchdog.heartbeat(f'search captcha attempt {search_captcha_attempt}')
                 try:
                     solved2 = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=7)
                 except SoftTimeLimitExceeded:
@@ -3748,7 +3798,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         _human_mouse_move(driver, duration=random.uniform(0.5, 1.5))
 
         # === Step 3: Find and click target ===
-        _check_wall_clock(start_time, 'before find-and-click')
+        _check_wall_clock(start_time, 'before find-and-click', _watchdog)
         result = _find_and_click_target(driver, domain, max_pages=max_pages, keyword=keyword,
                                         task_start_time=start_time)
 
@@ -4156,6 +4206,13 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
     finally:
         # Cancel watchdog — cleanup is happening normally, no need to force-kill
         _watchdog.cancel()
+
+        # Clear captcha heartbeat callback
+        try:
+            from tasks.yandex_maps import set_captcha_heartbeat
+            set_captcha_heartbeat(None)
+        except Exception:
+            pass
 
         # Restore previous SIGUSR1 handler
         try:

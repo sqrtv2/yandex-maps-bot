@@ -614,16 +614,14 @@ class ProfileGenerator:
     ]
 
     # YaBrowser version pairs: (Chrome base version, YaBrowser version)
-    # YaBrowser 25.x = Chromium 132-134, YaBrowser 26.x = Chromium 134-136
-    # download URL showed 26.3.0 in April 2026
+    # MUST match actual Chromium engine on server (currently Chrome 145.0.7632.x).
+    # UA mismatch with engine triggers Yandex showcaptcha_url (fingerprint reject).
+    # YaBrowser 27.x = Chromium 145 (Apr 2026); kept 26.x/Chromium 136 as fallback.
     YABROWSER_VERSIONS = [
-        ("132.0.6834.{patch}", "25.2.3.{ypatch}"),
-        ("132.0.6834.{patch}", "25.2.5.{ypatch}"),
-        ("134.0.6998.{patch}", "25.4.2.{ypatch}"),
-        ("134.0.6998.{patch}", "25.4.5.{ypatch}"),
-        ("134.0.6998.{patch}", "26.1.2.{ypatch}"),
-        ("136.0.7103.{patch}", "26.3.0.{ypatch}"),
-        ("136.0.7103.{patch}", "26.3.2.{ypatch}"),
+        ("145.0.7632.{patch}", "27.1.0.{ypatch}"),
+        ("145.0.7632.{patch}", "27.1.2.{ypatch}"),
+        ("145.0.7632.{patch}", "27.2.0.{ypatch}"),
+        ("145.0.7632.{patch}", "27.2.1.{ypatch}"),
     ]
 
     def _generate_user_agent(self, is_mobile: bool = False, device_info: dict = None) -> str:

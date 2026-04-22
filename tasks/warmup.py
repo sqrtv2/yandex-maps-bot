@@ -1519,7 +1519,7 @@ def _execute_pre_action(driver, action, search_queries_pool):
 
 
 @shared_task(base=BaseTask, bind=True, max_retries=1, default_retry_delay=30,
-             time_limit=900, soft_time_limit=840,
+             time_limit=480, soft_time_limit=420,
              reject_on_worker_lost=False, acks_on_failure_or_timeout=True)
 def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bool,
                       all_chunks: list, chunk_index: int, total_chunks: int):
@@ -1527,7 +1527,7 @@ def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bo
     Execute ONE warmup chunk: open browser, do pre-actions + visit sites, close browser.
     Then chain to the next chunk. The last chunk finalises the warmup session in DB.
     
-    Wall-clock budget (CHUNK_MAX_DURATION=720s) stops visiting new sites before
+    Wall-clock budget (CHUNK_MAX_DURATION=300s) stops visiting new sites before
     Celery's hard time_limit forces SIGKILL. reject_on_worker_lost=False prevents
     infinite redelivery loops when a worker does get killed.
     """
@@ -1545,7 +1545,6 @@ def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bo
         f"🔥 Chunk {chunk_index + 1}/{total_chunks} for profile {profile_id} stage {current_stage}: "
         f"{len(pre_actions)} pre-actions, {len(sites_to_visit)} sites"
     )
-    import sys; sys.stderr.flush()  # Ensure log appears for replacement workers
 
     successful_visits = 0
     sites_visited = 0
@@ -1557,7 +1556,7 @@ def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bo
     # Hard wall-clock alarm: guarantees the chunk exits before Celery's
     # time_limit sends SIGKILL. This breaks through ANY blocking Playwright
     # call (bounding_box, mouse.move, evaluate, etc.) when Chrome hangs.
-    CHUNK_MAX_DURATION = 720  # seconds — stop early, leave 180s buffer for cleanup
+    CHUNK_MAX_DURATION = 300  # seconds — stop early, leave 180s buffer for cleanup
     _old_alarm_handler = signal.getsignal(signal.SIGALRM)
     def _chunk_alarm(signum, frame):
         raise TimeoutError(f"Chunk alarm: wall-clock budget ({CHUNK_MAX_DURATION}s) exceeded")
@@ -1669,7 +1668,7 @@ def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bo
         logger.info(f"🌐 Browser session {browser_id} created for chunk {chunk_index + 1}")
 
         # Wall-clock budget: stop visiting new sites before hard time_limit kills us.
-        # time_limit=900, soft_time_limit=840 — but Playwright blocking calls can't be
+        # time_limit=480, soft_time_limit=420 — but Playwright blocking calls can't be
         # interrupted by SoftTimeLimitExceeded signal, so we must check manually.
         def _chunk_time_remaining():
             return CHUNK_MAX_DURATION - (time.time() - start_time)
