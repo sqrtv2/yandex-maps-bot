@@ -644,7 +644,7 @@ def queue_watchdog():
 
     QUEUE_MAX = 30  # Max tasks in Redis queue before purge
     PENDING_MAX_MINUTES = 30  # Max age for pending tasks
-    IN_PROGRESS_MAX_MINUTES = 10  # Max age for in_progress tasks (must be > celery soft_time_limit=540s=9min)
+    IN_PROGRESS_MAX_MINUTES = 16  # Max age for in_progress tasks (must be > celery soft_time_limit=780s=13min, leave buffer)
 
     results = {}
 
