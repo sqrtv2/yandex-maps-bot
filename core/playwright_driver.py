@@ -756,7 +756,7 @@ class PlaywrightActionChains:
         self._actions.append(('scroll_by_amount', (dx, dy), {}))
         return self
 
-    def ghjperform(self):
+    def perform(self):
         """Execute all queued actions with a 10s timeout to prevent hanging."""
         _ACTION_TIMEOUT_MS = 10000
         old_timeout = self._page._timeout_settings._timeout if hasattr(self._page, '_timeout_settings') else None
