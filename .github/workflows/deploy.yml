@@ -24,7 +24,26 @@ jobs:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
+      - name: 🔍 Check required secrets
+        id: check_secrets
+        env:
+          HAS_HOST: ${{ secrets.SERVER_HOST != '' }}
+          HAS_USER: ${{ secrets.SERVER_USER != '' }}
+          HAS_KEY: ${{ secrets.SERVER_SSH_KEY != '' }}
+          HAS_PATH: ${{ secrets.DEPLOY_PATH != '' }}
+        run: |
+          if [ "$HAS_HOST" = "true" ] && [ "$HAS_USER" = "true" ] && \
+             [ "$HAS_KEY" = "true" ] && [ "$HAS_PATH" = "true" ]; then
+            echo "secrets_configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Required deployment secrets are not configured. \
+          Please set SERVER_HOST, SERVER_USER, SERVER_SSH_KEY, and DEPLOY_PATH \
+          in Settings → Secrets → Actions. Skipping deployment."
+            echo "secrets_configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 🔑 Setup SSH
+        if: steps.check_secrets.outputs.secrets_configured == 'true'
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
@@ -32,6 +51,7 @@ jobs:
           ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: 🚀 Deploy to server
+        if: steps.check_secrets.outputs.secrets_configured == 'true'
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'DEPLOY_SCRIPT'
