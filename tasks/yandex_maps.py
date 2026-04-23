@@ -827,6 +827,7 @@ def _solve_showcaptcha_fast(driver, max_wait: int = 45) -> bool:
         raise Exception("Browser died before showcaptchaFAST handling")
     
     for i in range(max_wait):
+        _heartbeat(f'showcaptchaFAST wait {i+1}/{max_wait}')
         time.sleep(1)
         try:
             new_url = driver.current_url
@@ -1441,6 +1442,7 @@ def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str, max_attempt
             logger.warning(f"Could not set timeouts: {e}")
         
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            _heartbeat(f'kaleidoscope attempt {attempt}/{MAX_ATTEMPTS}')
             logger.info(f"🧩 Kaleidoscope attempt {attempt}/{MAX_ATTEMPTS}")
             
             # Save debug screenshot
@@ -1849,6 +1851,8 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
         # Increased from 30s to 90s — with 12 concurrent Chrome workers, PoW needs more CPU time
         fields_ready = False
         for wait_i in range(90):
+            if wait_i % 10 == 0:
+                _heartbeat(f'kaleidoscope PoW wait {wait_i}/90')
             try:
                 field_status = driver.execute_script("""
                     var pdata = document.querySelector('input[name="pdata"]');
@@ -2036,6 +2040,8 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
         # which causes "Timed out receiving message from renderer" if we
         # call driver.current_url while Chrome is still loading.
         for wait_i in range(30):
+            if wait_i % 5 == 0:
+                _heartbeat(f'kaleidoscope nav wait {wait_i}/30')
             time.sleep(2)
             try:
                 new_url = driver.current_url
@@ -2261,6 +2267,7 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
         
         # ШАГ 2: Solve with retries (up to 5 attempts — Yandex may require 3+ correct rounds)
         for solve_attempt in range(1, 6):
+            _heartbeat(f'silhouette solve attempt {solve_attempt}/5')
             # For SmartCaptcha: click = main image (silhouette), task = task description icons
             logger.info(f"🔄 [{solve_attempt}/5] Sending Silhouette as SmartCaptcha to Capsola (click={len(click_image_data)}b, task={len(task_image_data)}b)...")
             result = capsola.solve_smart_captcha(click_image_data, task_image_data, max_wait=120)

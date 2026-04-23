@@ -52,7 +52,10 @@ SEARCH_MAX_DURATION = 600
 # (no heartbeat for WATCHDOG_IDLE_TIMEOUT seconds). This lets captcha solving
 # take as long as needed (heartbeats keep coming) while still catching hangs.
 # Absolute safety net at WATCHDOG_ABSOLUTE_MAX seconds (< time_limit).
-WATCHDOG_IDLE_TIMEOUT = 120   # kill if no heartbeat for 2 minutes
+# 2026-04-23: bumped 120 -> 300s after 800+ false-positive kills/day.
+# Captcha solvers (kaleidoscope x7, silhouette x5, PoW up to 45s) can legitimately
+# take 3-4 min between heartbeats. Absolute max still catches true hangs at 13 min.
+WATCHDOG_IDLE_TIMEOUT = 300   # kill if no heartbeat for 5 minutes
 WATCHDOG_ABSOLUTE_MAX = 780   # absolute max before kill (< time_limit=840s)
 
 
