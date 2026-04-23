@@ -906,6 +906,7 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
     from core.playwright_driver import PlaywrightWait as WebDriverWait, EC
     
     try:
+        _heartbeat('showcaptcha: solver entry')
         capsola = create_capsola_solver(settings.capsola_api_key)
         
         # ШАГ 1: Click the "I'm not a robot" checkbox
@@ -1017,6 +1018,7 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
         driver_alive = True
         image_grid_appeared = False
         for i in range(20):
+            _heartbeat(f'showcaptcha PoW wait {i+1}/20')
             time.sleep(1)
             try:
                 new_url = driver.current_url
@@ -1174,6 +1176,7 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
             logger.info("⚠️ Checkbox captcha failed. Refreshing to try getting different captcha type...")
             
             for refresh_attempt in range(1, 3):
+                _heartbeat(f'showcaptcha refresh {refresh_attempt}/2')
                 logger.info(f"🔄 Refresh attempt {refresh_attempt}/2 — looking for kaleidoscope/silhouette...")
                 try:
                     driver.refresh()

@@ -2840,13 +2840,14 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         # to avoid interfering with Playwright's internal Fetch.enable proxy auth handler.
         # Calling Network.enable before first navigation breaks HTTPS CONNECT tunnel auth.
 
-        # === Step 0: Entry point — 50/50 direct ya.ru vs through mail.ru ===
+        # === Step 0: Entry point — direct ya.ru ===
         # Real users arrive at Yandex via different paths: direct, bookmarks, or from other sites
         _check_wall_clock(start_time, 'before entry point', _watchdog)
         _referrer_used = False
-        # Re-enabled mail.ru 50/50: heartbeat watchdog (idle 120s) now kills any
-        # hang within 2 min instead of waiting 9 min. Each step also pings heartbeat.
-        _entry_method = random.choice(['direct', 'mail.ru'])
+        # 2026-04-23: mail.ru entry DISABLED again — _human_scroll/mouse on a half-loaded
+        # mail.ru page hangs Playwright FFI for 5+ min, watchdog kills task before it
+        # ever reaches Yandex. Re-enable only when mail.ru flakiness is fixed.
+        _entry_method = 'direct'
         
         if _entry_method == 'mail.ru':
             logger.info(f"🔗 Entry via mail.ru (50% chance)")
