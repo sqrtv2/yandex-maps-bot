@@ -36,8 +36,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from app.config import settings
+from app.database import get_db_session
 from app.models.browser_profile import BrowserProfile
-from core.database import get_db_session
 from tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
