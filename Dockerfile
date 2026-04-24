@@ -81,7 +81,7 @@ RUN python -m patchright install chromium
 # pulls the libasound/libxul system libs the FF binary needs to start.
 RUN mkdir -p /opt/camoufox-cache && \
     HOME=/opt/camoufox-cache python -m camoufox fetch && \
-    playwright install-deps firefox
+    python -m playwright install-deps firefox
 
 # Download Chrome 145 for better Yandex SmartCaptcha fingerprint compatibility
 # rebrowser-playwright 1.52 ships Chromium 136, but Chrome 145 passes more checks.
