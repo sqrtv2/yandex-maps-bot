@@ -209,7 +209,23 @@ def warmup_camoufox_session(self, profile_id: int) -> Dict:
         proxy = _build_proxy_dict(profile)
 
     if not proxy:
-        return {"ok": False, "error": "no proxy on profile"}
+        # Fallback to ProxyManager pool — same approach as chromium warmup
+        try:
+            from core.proxy_manager import ProxyManager
+            pm = ProxyManager()
+            pm.load_proxies_from_db()
+            pdict = pm.get_available_proxy()
+            if pdict:
+                ptype = (pdict.get("proxy_type") or "http").lower()
+                proxy = {"server": f"{ptype}://{pdict['host']}:{pdict['port']}"}
+                if pdict.get("username"):
+                    proxy["username"] = pdict["username"]
+                if pdict.get("password"):
+                    proxy["password"] = pdict["password"]
+        except Exception as e:
+            logger.warning(f"camoufox: ProxyManager fallback failed: {e}")
+    if not proxy:
+        return {"ok": False, "error": "no proxy available"}
 
     state = _load_state(profile_name)
     if state.get("completed"):
