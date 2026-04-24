@@ -171,7 +171,13 @@ def main() -> int:
         result["ok"] = result["sites_visited"] > 0
     except Exception as e:
         result["error"] = f"launcher: {type(e).__name__}: {e}"
-        result["traceback"] = traceback.format_exc()
+        tb = traceback.format_exc()
+        result["traceback"] = tb
+        # Mirror full traceback to stderr so the celery task can surface it
+        sys.stderr.write("\n=== camoufox_runner traceback ===\n")
+        sys.stderr.write(tb)
+        sys.stderr.write("=== /traceback ===\n")
+        sys.stderr.flush()
 
     result["elapsed_s"] = round(time.time() - t_start, 1)
     sys.stdout.write("__RESULT__" + json.dumps(result, ensure_ascii=False) + "\n")

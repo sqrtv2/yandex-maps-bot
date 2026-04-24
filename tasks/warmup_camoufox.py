@@ -170,14 +170,22 @@ def _run_subprocess(cfg: Dict) -> Dict:
     for line in out.splitlines():
         if line.startswith("__RESULT__"):
             try:
-                return json.loads(line[len("__RESULT__"):])
+                parsed = json.loads(line[len("__RESULT__"):])
             except Exception as e:
-                return {"ok": False, "error": f"bad runner json: {e}", "stderr": err[-300:]}
+                return {"ok": False, "error": f"bad runner json: {e}", "stderr": err[-600:]}
+            # If runner reported a launcher error, surface stderr tail too
+            # so we can see WHY (it dumps traceback to stderr).
+            if parsed.get("error") and not parsed.get("ok"):
+                if err.strip():
+                    logger.warning(
+                        f"camoufox runner stderr tail: ...{err[-1500:]}"
+                    )
+            return parsed
     return {
         "ok": False,
         "error": f"no __RESULT__ in stdout (rc={proc.returncode})",
         "stdout_tail": out[-300:],
-        "stderr_tail": err[-300:],
+        "stderr_tail": err[-600:],
     }
 
 
