@@ -484,18 +484,11 @@ class BrowserManager:
         try:
             browser_id = f"browser_{int(time.time())}_{random.randint(1000, 9999)}"
 
-            # Repair profile directory
-            profile_dir = os.path.abspath(os.path.join(settings.browser_user_data_dir, profile_data["name"]))
-            self.repair_profile_dir(profile_dir)
-            singleton_lock = os.path.join(profile_dir, "SingletonLock")
-            if os.path.exists(singleton_lock) or os.path.islink(singleton_lock):
-                try:
-                    os.remove(singleton_lock)
-                    logger.warning(f"🗑️ Removed stale SingletonLock for {profile_data['name']}")
-                except OSError as e:
-                    logger.warning(f"Could not remove SingletonLock: {e}")
-
             # ---- A/B backend selection (sticky per profile name) ----
+            # Select BEFORE computing profile_dir — patchright uses an isolated
+            # subdir so its (older) Chromium 136 doesn't read profile data
+            # written by rebrowser's Chrome 145 (incompatible Preferences/Local
+            # Storage formats crash the renderer at Page.enable).
             requested_backend = _pick_backend(profile_data.get("name", ""))
             playwright = _get_playwright(requested_backend)
             # Process may already be pinned to a different backend (sync_playwright
@@ -509,6 +502,27 @@ class BrowserManager:
                     f"🔀 Backend for {profile_data.get('name','?')}: requested={requested_backend} "
                     f"served={backend} (process pinned)"
                 )
+
+            # Per-backend profile path. rebrowser keeps the historical path
+            # (preserves warmup/cookies). patchright gets an isolated subdir
+            # — first run is fresh; warmup will rebuild it for that backend.
+            base_profile_dir = os.path.abspath(os.path.join(settings.browser_user_data_dir, profile_data["name"]))
+            if backend == BACKEND_PATCHRIGHT:
+                profile_dir = os.path.join(base_profile_dir, "_patchright")
+                os.makedirs(profile_dir, exist_ok=True)
+            else:
+                profile_dir = base_profile_dir
+            profile_data["_profile_dir"] = profile_dir
+
+            # Repair profile directory
+            self.repair_profile_dir(profile_dir)
+            singleton_lock = os.path.join(profile_dir, "SingletonLock")
+            if os.path.exists(singleton_lock) or os.path.islink(singleton_lock):
+                try:
+                    os.remove(singleton_lock)
+                    logger.warning(f"🗑️ Removed stale SingletonLock for {profile_data['name']}")
+                except OSError as e:
+                    logger.warning(f"Could not remove SingletonLock: {e}")
 
             # Build Playwright launch args
             launch_args = self._build_launch_args(profile_data)

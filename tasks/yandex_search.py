@@ -2983,6 +2983,19 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         logger.info(f"📋 [DIAG] After ya.ru load: URL={current_url_debug}, Title='{page_title_debug}'")
         if task_id:
             _update_search_task_log(task_id, f"📋 URL: {current_url_debug[:120]}, Title: '{page_title_debug}'")
+
+        # ── Detect Chrome network error page early (proxy/DNS timeout) ──
+        # When proxy can't reach ya.ru, Chrome shows chrome-error://chromewebdata/
+        # with title=domain. Selectors will all fail and the URL fallback will
+        # also die. Bail immediately so Celery retries with a fresh proxy and
+        # the profile is NOT marked as fingerprint-rejected.
+        if current_url_debug.startswith('chrome-error://') or current_url_debug.startswith('chrome://network-error'):
+            logger.error(
+                f"🌐 Chrome network-error page after ya.ru load "
+                f"(URL={current_url_debug}, title='{page_title_debug}') — "
+                f"proxy/DNS unreachable, aborting for retry"
+            )
+            raise Exception(f"Chrome network error page (proxy timeout): {current_url_debug}")
         
         # Detect captcha from URL first (zero renderer cost)
         _url_path_lower = current_url_debug.lower().split('?')[0]
@@ -3518,6 +3531,65 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         else:
             # Last resort fallback: direct URL navigation
             logger.warning("⚠️ Could not find search input — using direct URL as fallback")
+
+            # ── DIAG: dump page state BEFORE the fallback so we can debug
+            #         which selector list needs updating ──
+            try:
+                import os as _os_diag
+                _diag_dir = "/tmp/yasearch_no_input"
+                _os_diag.makedirs(_diag_dir, exist_ok=True)
+                _stem = f"{_diag_dir}/p{profile_id}_{int(time.time())}"
+                try:
+                    driver.save_screenshot(f"{_stem}.png")
+                    logger.warning(f"   📸 DIAG screenshot: {_stem}.png")
+                except Exception as _e:
+                    logger.warning(f"   DIAG screenshot failed: {_e}")
+                try:
+                    _html = driver.page_source or ""
+                    with open(f"{_stem}.html", "w", encoding="utf-8") as _f:
+                        _f.write(_html)
+                    logger.warning(f"   📄 DIAG html: {_stem}.html ({len(_html)} bytes)")
+                except Exception as _e:
+                    logger.warning(f"   DIAG html dump failed: {_e}")
+                try:
+                    _info = driver.execute_script("""
+                        var out = [];
+                        var els = document.querySelectorAll('input, textarea');
+                        for (var i = 0; i < els.length && i < 30; i++) {
+                            var el = els[i];
+                            var r = el.getBoundingClientRect();
+                            out.push({
+                                tag: el.tagName,
+                                type: el.type || '',
+                                name: el.name || '',
+                                id: el.id || '',
+                                cls: (el.className || '').substring(0, 100),
+                                aria: el.getAttribute('aria-label') || '',
+                                placeholder: el.placeholder || '',
+                                w: Math.round(r.width),
+                                h: Math.round(r.height),
+                                visible: el.offsetParent !== null
+                            });
+                        }
+                        return {
+                            url: location.href,
+                            title: document.title,
+                            ready: document.readyState,
+                            bodyLen: (document.body && document.body.innerHTML || '').length,
+                            forms: document.querySelectorAll('form').length,
+                            inputs: out
+                        };
+                    """)
+                    if _info:
+                        logger.warning(f"   🔬 DIAG dom: url={(_info.get('url') or '')[:120]}")
+                        logger.warning(f"   🔬 DIAG dom: title={_info.get('title')!r} ready={_info.get('ready')} forms={_info.get('forms')} body_len={_info.get('bodyLen')}")
+                        for _i, _el in enumerate(_info.get('inputs') or []):
+                            logger.warning(f"   🔬 DIAG input[{_i}]: {_el}")
+                except Exception as _e:
+                    logger.warning(f"   DIAG dom inspect failed: {_e}")
+            except Exception as _diag_outer:
+                logger.warning(f"   DIAG block error: {_diag_outer}")
+
             encoded = quote_plus(keyword)
             fallback_ok = _safe_get(driver, f"https://ya.ru/search/?text={encoded}", timeout=60, label="search fallback")
 
