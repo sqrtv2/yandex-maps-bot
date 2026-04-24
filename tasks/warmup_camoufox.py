@@ -299,6 +299,42 @@ def warmup_camoufox_session(self, profile_id: int) -> Dict:
         f"new_stage={state['stage']} completed={state['completed']}"
     )
 
+    # Self-reschedule next session if not yet completed (mirror of chromium
+    # warmup pipeline). Random 25–40 min delay per profile so MIN_HOURS_SPREAD
+    # is satisfied within ~3 sessions, while concurrency=5 worker chews
+    # through the global queue steadily.
+    if ok and not state["completed"]:
+        delay_s = random.randint(1500, 2400)
+        try:
+            warmup_camoufox_session.apply_async(
+                args=(profile_id,),
+                queue="warmup_camoufox",
+                countdown=delay_s,
+            )
+            logger.info(
+                f"🍃⏭  Camoufox next session for {profile_name} scheduled in "
+                f"{delay_s//60}m (stage={state['stage']}/{MIN_SESSIONS})"
+            )
+        except Exception as e:
+            logger.warning(f"camoufox self-reschedule failed for {profile_name}: {e}")
+    elif not ok:
+        # On failure, retry the SAME stage in 10–20 min so we don't lose the
+        # profile from the pipeline. Celery's max_retries=2 handles short bursts;
+        # this re-dispatches as a fresh task without exhausting retries.
+        delay_s = random.randint(600, 1200)
+        try:
+            warmup_camoufox_session.apply_async(
+                args=(profile_id,),
+                queue="warmup_camoufox",
+                countdown=delay_s,
+            )
+            logger.info(
+                f"🍃🔁 Camoufox retry for {profile_name} in {delay_s//60}m "
+                f"(stage stays at {state['stage']})"
+            )
+        except Exception as e:
+            logger.warning(f"camoufox retry-reschedule failed for {profile_name}: {e}")
+
     return {
         "ok": ok,
         "profile_id": profile_id,
