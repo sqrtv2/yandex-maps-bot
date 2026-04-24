@@ -73,6 +73,16 @@ RUN python -m rebrowser_playwright install chromium
 # install patchright's own browser into the same browsers path.
 RUN python -m patchright install chromium
 
+# Camoufox — anti-detect Firefox fork. Used by tasks.warmup_camoufox in a
+# dedicated celery worker (subprocess-isolated; sync API can't share asyncio
+# loop with chromium sync_playwright). `camoufox fetch` downloads the patched
+# binary into ~/.cache/camoufox; install it under /opt so it's accessible to
+# the appuser at runtime via a symlink. `playwright install-deps firefox`
+# pulls the libasound/libxul system libs the FF binary needs to start.
+RUN mkdir -p /opt/camoufox-cache && \
+    HOME=/opt/camoufox-cache python -m camoufox fetch && \
+    playwright install-deps firefox
+
 # Download Chrome 145 for better Yandex SmartCaptcha fingerprint compatibility
 # rebrowser-playwright 1.52 ships Chromium 136, but Chrome 145 passes more checks.
 # browser_manager.py globs /opt/pw-browsers/chromium-*/chrome-linux*/chrome and uses the newest.
@@ -91,7 +101,10 @@ RUN mkdir -p /app/logs /app/screenshots /app/data /app/browser_profiles /app/dow
 
 # Create non-root user
 RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app
+    chown -R appuser:appuser /app && \
+    mkdir -p /home/appuser/.cache && \
+    cp -r /opt/camoufox-cache/.cache/camoufox /home/appuser/.cache/camoufox && \
+    chown -R appuser:appuser /home/appuser/.cache
 
 # Make entrypoint executable
 COPY entrypoint.sh /app/entrypoint.sh

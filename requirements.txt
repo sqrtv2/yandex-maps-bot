@@ -16,6 +16,9 @@ playwright-stealth>=2.0.2
 rebrowser-playwright>=1.52.0
 # Patchright — fork with newer anti-detect patches (used for A/B testing alongside rebrowser)
 patchright>=1.40.0
+# Camoufox — anti-detect Firefox fork, runs ONLY in dedicated celery_camoufox_warmup
+# worker (separate process — sync API can't share loop with chromium workers).
+camoufox[geoip]>=0.4.11
 
 # User Agent & Fingerprinting
 fake-useragent==1.4.0

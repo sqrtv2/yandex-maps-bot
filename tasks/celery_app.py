@@ -49,6 +49,9 @@ celery_app.conf.update(
         'tasks.warmup.warmup_watchdog': {'queue': 'default'},
         'tasks.warmup.generate_warmup_sites_task': {'queue': 'default'},
         'tasks.warmup.*': {'queue': 'warmup'},
+        # Camoufox warmup runs on its own dedicated worker (separate browser
+        # binary, can't share sync_playwright loop with chromium workers).
+        'tasks.warmup_camoufox.*': {'queue': 'warmup_camoufox'},
         'tasks.yandex_maps.*': {'queue': 'yandex_maps'},
         'tasks.yandex_search.*': {'queue': 'yandex_search'},
         'tasks.proxy.*': {'queue': 'proxy'},
@@ -154,6 +157,7 @@ celery_app.conf.update(
 # Auto-discover tasks
 celery_app.autodiscover_tasks([
     'tasks.warmup',
+    'tasks.warmup_camoufox',
     'tasks.yandex_maps',
     'tasks.yandex_scheduler',
     'tasks.yandex_search',
