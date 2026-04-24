@@ -66,6 +66,13 @@ RUN pip uninstall -y playwright && rm -rf /usr/local/lib/python3.11/site-package
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 RUN python -m rebrowser_playwright install chromium
 
+# Install patchright's bundled patched Chromium (for A/B-testing backend).
+# patchright applies patches both at the driver layer AND in the bundled chromium
+# binary (e.g. console.debug source URL, runtime evaluation tricks). Using
+# patchright + non-patchright chromium would defeat half the protections, so we
+# install patchright's own browser into the same browsers path.
+RUN python -m patchright install chromium
+
 # Download Chrome 145 for better Yandex SmartCaptcha fingerprint compatibility
 # rebrowser-playwright 1.52 ships Chromium 136, but Chrome 145 passes more checks.
 # browser_manager.py globs /opt/pw-browsers/chromium-*/chrome-linux*/chrome and uses the newest.

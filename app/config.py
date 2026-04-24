@@ -93,6 +93,16 @@ class Settings(BaseSettings):
     browser_timeout: int = Field(default=30, description="Browser timeout in seconds")
     max_browser_instances: int = Field(default=3, description="Maximum concurrent browser instances")
 
+    # Browser backend A/B testing (rebrowser-playwright vs patchright)
+    # 0   = all profiles use rebrowser (current default)
+    # 100 = all profiles use patchright
+    # 50  = ~50/50 split, sticky per-profile (same profile always same backend
+    #       so per-profile success metrics aren't muddied)
+    browser_backend_patchright_pct: int = Field(
+        default=50,
+        description="Percentage of profiles routed to patchright backend (0-100)",
+    )
+
     # Anti-Captcha Configuration
     anticaptcha_api_key: str = Field(default="", description="Anti-captcha API key")
     anticaptcha_service: str = Field(default="2captcha", description="Anti-captcha service (2captcha, anticaptcha)")

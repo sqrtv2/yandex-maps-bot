@@ -27,20 +27,109 @@ from .profile_generator import ProfileGenerator
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# Browser backend A/B testing (rebrowser-playwright vs patchright)
+# ----------------------------------------------------------------------------
+# Two singletons live side-by-side in the same process. Backend is chosen
+# per profile via deterministic hash so the same profile always uses the
+# same backend — making per-profile success metrics directly comparable.
+# ============================================================================
+import hashlib as _hashlib
+import threading as _threading
+
+BACKEND_REBROWSER = "rebrowser"
+BACKEND_PATCHRIGHT = "patchright"
+
+_playwright_instances: Dict[str, Playwright] = {}
+_playwright_lock = _threading.Lock()
+
+# Lazy redis client (created on first counter increment)
+_redis_client = None
+_redis_lock = _threading.Lock()
+
+
+def _get_redis():
+    """Lazy-init Redis client for backend metrics counters."""
+    global _redis_client
+    if _redis_client is None:
+        with _redis_lock:
+            if _redis_client is None:
+                try:
+                    import redis
+                    _redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+                except Exception as e:
+                    logger.debug(f"Redis unavailable for backend metrics: {e}")
+                    _redis_client = False  # sentinel — don't retry
+    return _redis_client if _redis_client else None
+
+
+def _bump_backend_metric(backend: str, event: str) -> None:
+    """Increment Redis counter `backend:{backend}:{event}` (best-effort).
+
+    Events: launch_ok, launch_fail, session_close_ok, session_close_err.
+    Used by _check_ab.py to compare patchright vs rebrowser performance.
+    """
+    try:
+        r = _get_redis()
+        if r:
+            r.incr(f"backend:{backend}:{event}")
+    except Exception:
+        pass
+
+
+def _pick_backend(profile_name: str) -> str:
+    """Sticky per-profile backend selection.
+
+    Hash the profile name to a 0-99 bucket, route to patchright if bucket
+    falls under `browser_backend_patchright_pct`. Sticky means the same
+    profile always lands on the same backend across restarts.
+    """
+    pct = max(0, min(100, int(getattr(settings, "browser_backend_patchright_pct", 0))))
+    if pct <= 0:
+        return BACKEND_REBROWSER
+    if pct >= 100:
+        return BACKEND_PATCHRIGHT
+    bucket = int(_hashlib.md5(profile_name.encode()).hexdigest()[:8], 16) % 100
+    return BACKEND_PATCHRIGHT if bucket < pct else BACKEND_REBROWSER
+
+
 # Shared Playwright instance (reused across BrowserManager instances within the same process)
-_playwright_instance: Optional[Playwright] = None
+_playwright_instance: Optional[Playwright] = None  # legacy alias — kept for backwards compat
 
 # Directory for proxy auth Chrome extensions (one per proxy, reused across sessions)
 _PROXY_AUTH_EXT_DIR = os.path.join(tempfile.gettempdir(), 'pw_proxy_auth_extensions')
 
 
-def _get_playwright() -> Playwright:
-    """Get or create the shared Playwright instance."""
-    global _playwright_instance
-    if _playwright_instance is None:
-        _playwright_instance = sync_playwright().start()
-        logger.info("✅ Playwright instance started")
-    return _playwright_instance
+def _get_playwright(backend: str = BACKEND_REBROWSER) -> Playwright:
+    """Get or create a Playwright instance for the given backend.
+
+    rebrowser → `from playwright.sync_api import sync_playwright`
+                 (works because Dockerfile symlinks rebrowser_playwright as playwright)
+    patchright → `from patchright.sync_api import sync_playwright`
+                 (separate package, separate driver, separate bundled chromium)
+    """
+    if backend not in (BACKEND_REBROWSER, BACKEND_PATCHRIGHT):
+        backend = BACKEND_REBROWSER
+    if backend in _playwright_instances:
+        return _playwright_instances[backend]
+    with _playwright_lock:
+        if backend in _playwright_instances:
+            return _playwright_instances[backend]
+        if backend == BACKEND_PATCHRIGHT:
+            try:
+                from patchright.sync_api import sync_playwright as _patch_sp
+                _playwright_instances[backend] = _patch_sp().start()
+                logger.info("✅ Patchright instance started (backend=patchright)")
+            except ImportError:
+                logger.warning("⚠️ patchright not installed — falling back to rebrowser")
+                backend = BACKEND_REBROWSER
+            except Exception as e:
+                logger.error(f"❌ Patchright failed to start: {e} — falling back to rebrowser")
+                backend = BACKEND_REBROWSER
+        if backend == BACKEND_REBROWSER and backend not in _playwright_instances:
+            _playwright_instances[backend] = sync_playwright().start()
+            logger.info("✅ Playwright (rebrowser) instance started")
+        return _playwright_instances[backend]
 
 
 def _create_proxy_auth_extension(host: str, port: str, username: str, password: str) -> str:
@@ -392,6 +481,12 @@ class BrowserManager:
 
             playwright = _get_playwright()
 
+            # ---- A/B backend selection (sticky per profile name) ----
+            backend = _pick_backend(profile_data.get("name", ""))
+            playwright = _get_playwright(backend)
+            profile_data["_backend"] = backend  # downstream tasks/logs can read this
+            logger.info(f"🔀 Backend selected for {profile_data.get('name','?')}: {backend}")
+
             # Build Playwright launch args
             launch_args = self._build_launch_args(profile_data)
             
@@ -416,8 +511,19 @@ class BrowserManager:
                 # TLS fingerprint that Yandex's server detects, triggering captcha
                 # on 100% of search requests.
                 import glob
-                chromium_paths = sorted(glob.glob('/opt/pw-browsers/chromium-*/chrome-linux*/chrome'))
-                chromium_exe = chromium_paths[-1] if chromium_paths else None
+                if backend == BACKEND_PATCHRIGHT:
+                    # patchright bundles its own patched chromium — MUST use it,
+                    # because patchright applies binary-level patches that other
+                    # chromium builds don't have. Glob picks newest patchright build.
+                    patch_paths = sorted(glob.glob('/opt/pw-browsers/chromium-*/chrome-linux/chrome'))
+                    chromium_exe = patch_paths[-1] if patch_paths else None
+                    if not chromium_exe:
+                        # Fallback to chrome-linux64 layout if patchright happens to use it
+                        patch_paths = sorted(glob.glob('/opt/pw-browsers/chromium-*/chrome-linux64/chrome'))
+                        chromium_exe = patch_paths[-1] if patch_paths else None
+                else:
+                    chromium_paths = sorted(glob.glob('/opt/pw-browsers/chromium-*/chrome-linux*/chrome'))
+                    chromium_exe = chromium_paths[-1] if chromium_paths else None
 
                 # Launch persistent context (uses profile directory for cookies/storage)
                 # timeout=60s prevents hanging on slow proxy handshake / corrupted profile
@@ -442,6 +548,7 @@ class BrowserManager:
                 )
             except Exception as launch_exc:
                 logger.warning(f"Chrome launch failed, cleaning up orphans for {profile_dir}: {launch_exc}")
+                _bump_backend_metric(backend, "launch_fail")
                 self._kill_chrome_by_profile_dir(profile_dir)
                 singleton_lock = os.path.join(profile_dir, "SingletonLock")
                 if os.path.exists(singleton_lock) or os.path.islink(singleton_lock):
@@ -451,40 +558,47 @@ class BrowserManager:
                         pass
                 raise launch_exc
 
-            logger.info("✅ Playwright browser created successfully")
+            _bump_backend_metric(backend, "launch_ok")
+            logger.info(f"✅ Browser created successfully (backend={backend})")
 
-            # Apply playwright-stealth BEFORE our custom fingerprint scripts
-            # Disable features we handle ourselves with profile-specific values
-            try:
-                webgl_fp = profile_data.get("webgl_fingerprint", {})
-                stealth = Stealth(
-                    # NEW features we don't have — ENABLED:
-                    chrome_app=True,
-                    chrome_csi=True,
-                    chrome_load_times=True,
-                    hairline=True,
-                    media_codecs=True,
-                    error_prototype=True,
-                    navigator_vendor=True,
-                    sec_ch_ua=False,  # DISABLED: we set YaBrowser brands ourselves via CDP + JS
-                    # Features we already handle with profile-specific values — DISABLED:
-                    navigator_webdriver=True,       # ENABLED: double protection with our CDP script
-                    navigator_hardware_concurrency=False,  # profile-specific
-                    navigator_languages=False,       # profile-specific (ru-RU)
-                    navigator_languages_override=None,  # silence "override provided but feature disabled" warning
-                    navigator_platform=False,        # profile-specific
-                    navigator_platform_override=None,  # silence "override provided but feature disabled" warning
-                    navigator_plugins=False,         # our custom mock
-                    navigator_permissions=False,     # our custom patch
-                    navigator_user_agent=False,      # set via CDP
-                    chrome_runtime=True,             # SmartCaptcha checks window.chrome.runtime
-                    iframe_content_window=True,      # SmartCaptcha checks iframe access
-                    webgl_vendor=False,              # profile-specific values
-                )
-                stealth.apply_stealth_sync(context)
-                logger.info("✅ playwright-stealth applied (chrome_app, chrome_csi, chrome_load_times, hairline, media_codecs, error_prototype, navigator_vendor, sec_ch_ua, chrome_runtime, iframe_content_window)")
-            except Exception as stealth_err:
-                logger.warning(f"⚠️ playwright-stealth failed to apply: {stealth_err}")
+            # Apply playwright-stealth BEFORE our custom fingerprint scripts.
+            # SKIP on patchright: patchright already applies overlapping anti-detect
+            # patches at the driver level, and stacking playwright-stealth on top
+            # causes double-patching warnings + can re-introduce signals patchright
+            # specifically removed (e.g. duplicate Function.prototype.toString hooks).
+            if backend == BACKEND_PATCHRIGHT:
+                logger.info("⏭️  playwright-stealth SKIPPED (patchright handles this internally)")
+            else:
+                try:
+                    webgl_fp = profile_data.get("webgl_fingerprint", {})
+                    stealth = Stealth(
+                        # NEW features we don't have — ENABLED:
+                        chrome_app=True,
+                        chrome_csi=True,
+                        chrome_load_times=True,
+                        hairline=True,
+                        media_codecs=True,
+                        error_prototype=True,
+                        navigator_vendor=True,
+                        sec_ch_ua=False,  # DISABLED: we set YaBrowser brands ourselves via CDP + JS
+                        # Features we already handle with profile-specific values — DISABLED:
+                        navigator_webdriver=True,       # ENABLED: double protection with our CDP script
+                        navigator_hardware_concurrency=False,  # profile-specific
+                        navigator_languages=False,       # profile-specific (ru-RU)
+                        navigator_languages_override=None,  # silence "override provided but feature disabled" warning
+                        navigator_platform=False,        # profile-specific
+                        navigator_platform_override=None,  # silence "override provided but feature disabled" warning
+                        navigator_plugins=False,         # our custom mock
+                        navigator_permissions=False,     # our custom patch
+                        navigator_user_agent=False,      # set via CDP
+                        chrome_runtime=True,             # SmartCaptcha checks window.chrome.runtime
+                        iframe_content_window=True,      # SmartCaptcha checks iframe access
+                        webgl_vendor=False,              # profile-specific values
+                    )
+                    stealth.apply_stealth_sync(context)
+                    logger.info("✅ playwright-stealth applied (chrome_app, chrome_csi, chrome_load_times, hairline, media_codecs, error_prototype, navigator_vendor, sec_ch_ua, chrome_runtime, iframe_content_window)")
+                except Exception as stealth_err:
+                    logger.warning(f"⚠️ playwright-stealth failed to apply: {stealth_err}")
 
             # Get or create page
             if context.pages:
