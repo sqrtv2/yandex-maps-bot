@@ -104,49 +104,69 @@ def main() -> int:
 
     t_start = time.time()
     try:
-        from camoufox.sync_api import Camoufox
+        # IMPORTANT: bypass `camoufox.sync_api.Camoufox` because it imports
+        # `playwright.sync_api`, and on this server the `playwright` package
+        # is a shim that re-exports rebrowser_playwright. rebrowser_playwright
+        # 1.52's Node driver crashes with Firefox in `_onClearLifecycle`
+        # (TypeError: Cannot read properties of undefined ('get')) on first
+        # navigation, killing the browser process with SIGKILL before we ever
+        # reach a single page.
+        #
+        # We use `patchright` instead (clean playwright fork compatible with
+        # Firefox), feeding it the launch_options dict that camoufox builds
+        # for its anti-detect Firefox bundle.
+        from patchright.sync_api import sync_playwright
+        from camoufox.utils import launch_options as _cf_launch_options
 
-        launch_kwargs = dict(
+        opts = _cf_launch_options(
             headless=headless,
             humanize=humanize,
             os=os_choice,
             locale=locale,
             geoip=geoip,
             i_know_what_im_doing=True,
-            persistent_context=True,
             user_data_dir=profile_dir,
         )
+        # `launch_options` may include keys that launch_persistent_context()
+        # does not accept. Strip them.
+        opts.pop("persistent_context", None)
         if proxy:
-            launch_kwargs["proxy"] = proxy
+            opts["proxy"] = proxy
 
-        # Camoufox(persistent_context=True) returns a BrowserContext directly.
-        with Camoufox(**launch_kwargs) as ctx:
-            # New page (or reuse existing one persistent contexts may open)
+        with sync_playwright() as _pw:
+            ctx = _pw.firefox.launch_persistent_context(**opts)
             try:
-                page = ctx.pages[0] if getattr(ctx, "pages", None) else ctx.new_page()
-            except Exception:
-                page = ctx.new_page()
+                # New page (or reuse existing one persistent contexts may open)
+                try:
+                    page = ctx.pages[0] if getattr(ctx, "pages", None) else ctx.new_page()
+                except Exception:
+                    page = ctx.new_page()
 
-            try:
-                page.set_default_timeout(30000)
-                page.set_default_navigation_timeout(30000)
-            except Exception:
-                pass
+                try:
+                    page.set_default_timeout(30000)
+                    page.set_default_navigation_timeout(30000)
+                except Exception:
+                    pass
 
-            consec_fail = 0
-            for url in sites:
-                info = _visit_one(page, url)
-                result["details"].append(info)
-                if info["ok"]:
-                    result["sites_visited"] += 1
-                    consec_fail = 0
-                else:
-                    result["sites_failed"] += 1
-                    consec_fail += 1
-                if consec_fail >= 4:
-                    result["error"] = f"4 consecutive failures, last={info['err']}"
-                    break
-                _human_sleep(0.8, 2.0)
+                consec_fail = 0
+                for url in sites:
+                    info = _visit_one(page, url)
+                    result["details"].append(info)
+                    if info["ok"]:
+                        result["sites_visited"] += 1
+                        consec_fail = 0
+                    else:
+                        result["sites_failed"] += 1
+                        consec_fail += 1
+                    if consec_fail >= 4:
+                        result["error"] = f"4 consecutive failures, last={info['err']}"
+                        break
+                    _human_sleep(0.8, 2.0)
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
 
         result["ok"] = result["sites_visited"] > 0
     except Exception as e:
