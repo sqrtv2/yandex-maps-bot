@@ -38,6 +38,44 @@ def _get_warmup_redis():
         db=0, decode_responses=True
     )
 
+
+# Per-profile orchestrator lock — prevents multiple orchestrators/chunk-chains running
+# in parallel for the same profile (which would collide on the same Chrome profile dir).
+_WARMUP_LOCK_TTL = 1800  # 30 min — long enough for full chunk chain (5 chunks × ~5 min)
+
+
+def _warmup_lock_key(profile_id: int) -> str:
+    return f"warmup:orch_lock:{profile_id}"
+
+
+def _acquire_warmup_lock(profile_id: int) -> bool:
+    """Try to acquire orchestrator lock for profile. Returns True if acquired."""
+    try:
+        r = _get_warmup_redis()
+        return bool(r.set(_warmup_lock_key(profile_id), "1", nx=True, ex=_WARMUP_LOCK_TTL))
+    except Exception as e:
+        logger.warning(f"Could not acquire warmup lock for {profile_id}: {e}")
+        # Fail open: allow run to avoid total stall if Redis is down.
+        return True
+
+
+def _refresh_warmup_lock(profile_id: int) -> None:
+    """Refresh TTL on the orchestrator lock (called from chunk task to keep chain alive)."""
+    try:
+        r = _get_warmup_redis()
+        r.expire(_warmup_lock_key(profile_id), _WARMUP_LOCK_TTL)
+    except Exception:
+        pass
+
+
+def _release_warmup_lock(profile_id: int) -> None:
+    """Release the orchestrator lock for profile."""
+    try:
+        r = _get_warmup_redis()
+        r.delete(_warmup_lock_key(profile_id))
+    except Exception:
+        pass
+
 # Fast mode: reduce all delays by this factor for higher throughput
 FAST_MODE = getattr(settings, 'fast_mode', False)
 
@@ -1404,10 +1442,22 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
     time_limit=300s (5 min) — orchestrator itself is lightweight, just planning.
     """
     try:
+        # Per-profile lock: bail out if another orchestrator/chunk-chain is already running.
+        # Without this, multiple schedulers (auto_schedule_initial_warmup, periodic_rewarmup,
+        # _finalise_warmup_session self-schedule) can each fire warmup_profile_task for the
+        # same profile within minutes → 4+ parallel Chrome on the same profile dir →
+        # SingletonLock collisions → 0/3 sites visited → quality check fails → infinite loop.
+        if not _acquire_warmup_lock(profile_id):
+            logger.info(
+                f"🔒 Warmup orchestrator for profile {profile_id} skipped — another chain already running"
+            )
+            return {"status": "skipped_locked", "profile_id": profile_id}
+
         # Get profile from database and determine current stage
         with get_db_session() as db:
             profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
             if not profile_obj:
+                _release_warmup_lock(profile_id)
                 raise ValueError(f"Profile {profile_id} not found")
 
             current_stage = profile_obj.get_next_warmup_stage()
@@ -1490,9 +1540,12 @@ def warmup_profile_task(self, profile_id: int, duration_minutes: int = None, sit
                 profile_obj = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
                 if profile_obj:
                     profile_obj.status = "created" if not profile_obj.warmup_completed else "warmed"
+                    profile_obj.last_used_at = datetime.utcnow()
                     db.commit()
         except:
             pass
+        # Release lock so next scheduler tick can retry this profile
+        _release_warmup_lock(profile_id)
         raise
 
 
@@ -1545,6 +1598,9 @@ def warmup_chunk_task(self, profile_id: int, current_stage: int, is_rewarmup: bo
         f"🔥 Chunk {chunk_index + 1}/{total_chunks} for profile {profile_id} stage {current_stage}: "
         f"{len(pre_actions)} pre-actions, {len(sites_to_visit)} sites"
     )
+
+    # Keep orchestrator lock alive while chunk chain progresses
+    _refresh_warmup_lock(profile_id)
 
     successful_visits = 0
     sites_visited = 0
@@ -1870,25 +1926,18 @@ def _finalise_warmup_session(profile_id: int, current_stage: int, is_rewarmup: b
                         logger.info(
                             f"⏳ Profile {profile_id} completed stage {current_stage} but only "
                             f"{hours_since_first:.1f}h since first warmup (need {MIN_WARMUP_HOURS_SPREAD}h). "
-                            f"Will retry in {retry_minutes} min."
+                            f"Will retry via periodic_rewarmup (~{retry_minutes} min)."
                         )
-                        warmup_profile_task.apply_async(
-                            args=[profile_id],
-                            eta=datetime.utcnow() + timedelta(minutes=retry_minutes),
-                            queue='warmup'
-                        )
+                        # No self-schedule — periodic_rewarmup / auto_schedule_initial_warmup will
+                        # pick it up. Self-scheduling caused multiple parallel orchestrators per profile.
                 else:
                     profile_obj.status = "created"
                     next_delay_min = max(5, WARMUP_SESSION_INTERVAL_HOURS * 60)
                     logger.info(
                         f"📋 Profile {profile_id} completed stage {current_stage}/{MIN_WARMUP_SESSIONS}. "
-                        f"Next session scheduled in {next_delay_min} min."
+                        f"Next session will be scheduled by periodic_rewarmup (~{next_delay_min} min)."
                     )
-                    warmup_profile_task.apply_async(
-                        args=[profile_id],
-                        eta=datetime.utcnow() + timedelta(minutes=next_delay_min),
-                        queue='warmup'
-                    )
+                    # No self-schedule — see comment above.
             else:
                 if profile_obj.warmup_stage < current_stage:
                     profile_obj.warmup_stage = current_stage
@@ -1911,9 +1960,14 @@ def _finalise_warmup_session(profile_id: int, current_stage: int, is_rewarmup: b
                 p = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
                 if p:
                     p.status = "created" if not p.warmup_completed else "warmed"
+                    p.last_used_at = datetime.utcnow()
                     db.commit()
         except:
             pass
+    finally:
+        # Always release per-profile orchestrator lock so the next scheduler tick
+        # (auto_schedule_initial_warmup / periodic_rewarmup) can re-pick this profile.
+        _release_warmup_lock(profile_id)
 
 
 
