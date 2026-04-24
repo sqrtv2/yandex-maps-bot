@@ -115,6 +115,22 @@ def _get_playwright(backend: str = BACKEND_REBROWSER) -> Playwright:
     with _playwright_lock:
         if backend in _playwright_instances:
             return _playwright_instances[backend]
+        # IMPORTANT: sync_playwright keeps a background asyncio loop alive
+        # via greenlet. Starting BOTH rebrowser and patchright sync clients
+        # in the same process causes the second one to crash with
+        # "Playwright Sync API inside the asyncio loop". So once a backend
+        # is started in this process, ALL subsequent calls return that one
+        # (the routing is sticky per profile, but a single celery worker
+        # serves many profiles sequentially — first wins for that worker).
+        if _playwright_instances:
+            existing_backend = next(iter(_playwright_instances))
+            if existing_backend != backend:
+                logger.info(
+                    f"⚓ Backend pinned to '{existing_backend}' for this process "
+                    f"(asked for '{backend}', but sync_playwright is process-exclusive)"
+                )
+                _bump_backend_metric(backend, "fallback_to_pinned")
+                return _playwright_instances[existing_backend]
         if backend == BACKEND_PATCHRIGHT:
             try:
                 from patchright.sync_api import sync_playwright as _patch_sp
@@ -479,13 +495,20 @@ class BrowserManager:
                 except OSError as e:
                     logger.warning(f"Could not remove SingletonLock: {e}")
 
-            playwright = _get_playwright()
-
             # ---- A/B backend selection (sticky per profile name) ----
-            backend = _pick_backend(profile_data.get("name", ""))
-            playwright = _get_playwright(backend)
+            requested_backend = _pick_backend(profile_data.get("name", ""))
+            playwright = _get_playwright(requested_backend)
+            # Process may already be pinned to a different backend (sync_playwright
+            # is process-exclusive — see _get_playwright). Read back the pinned one.
+            backend = next(iter(_playwright_instances), requested_backend)
             profile_data["_backend"] = backend  # downstream tasks/logs can read this
-            logger.info(f"🔀 Backend selected for {profile_data.get('name','?')}: {backend}")
+            if backend == requested_backend:
+                logger.info(f"🔀 Backend selected for {profile_data.get('name','?')}: {backend}")
+            else:
+                logger.info(
+                    f"🔀 Backend for {profile_data.get('name','?')}: requested={requested_backend} "
+                    f"served={backend} (process pinned)"
+                )
 
             # Build Playwright launch args
             launch_args = self._build_launch_args(profile_data)
