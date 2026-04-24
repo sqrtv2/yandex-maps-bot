@@ -133,40 +133,78 @@ def main() -> int:
         if proxy:
             opts["proxy"] = proxy
 
-        with sync_playwright() as _pw:
-            ctx = _pw.firefox.launch_persistent_context(**opts)
+        # Patchright's node driver occasionally fails to initialise under
+        # parallel load with: "Connection.init: Connection closed while
+        # reading from the driver". The failure is non-deterministic, so
+        # retry the whole sync_playwright()+launch sequence a few times with
+        # exponential backoff before giving up.
+        last_init_err = None
+        ctx = None
+        _pw_cm = None
+        for attempt in range(3):
             try:
-                # New page (or reuse existing one persistent contexts may open)
+                _pw_cm = sync_playwright().__enter__()
+                ctx = _pw_cm.firefox.launch_persistent_context(**opts)
+                last_init_err = None
+                break
+            except Exception as e:
+                last_init_err = e
+                # tear down half-initialised playwright before retry
                 try:
-                    page = ctx.pages[0] if getattr(ctx, "pages", None) else ctx.new_page()
-                except Exception:
-                    page = ctx.new_page()
-
-                try:
-                    page.set_default_timeout(30000)
-                    page.set_default_navigation_timeout(30000)
-                except Exception:
-                    pass
-
-                consec_fail = 0
-                for url in sites:
-                    info = _visit_one(page, url)
-                    result["details"].append(info)
-                    if info["ok"]:
-                        result["sites_visited"] += 1
-                        consec_fail = 0
-                    else:
-                        result["sites_failed"] += 1
-                        consec_fail += 1
-                    if consec_fail >= 4:
-                        result["error"] = f"4 consecutive failures, last={info['err']}"
-                        break
-                    _human_sleep(0.8, 2.0)
-            finally:
-                try:
-                    ctx.close()
+                    if _pw_cm is not None:
+                        _pw_cm.stop()
                 except Exception:
                     pass
+                _pw_cm = None
+                msg = str(e)
+                if (
+                    "Connection closed while reading from the driver" in msg
+                    or "_playwright" in msg
+                ):
+                    time.sleep(0.7 * (attempt + 1) + random.uniform(0, 0.6))
+                    continue
+                raise
+        if ctx is None:
+            raise last_init_err if last_init_err else RuntimeError(
+                "camoufox: failed to start patchright after 3 attempts"
+            )
+
+        try:
+            # New page (or reuse existing one persistent contexts may open)
+            try:
+                page = ctx.pages[0] if getattr(ctx, "pages", None) else ctx.new_page()
+            except Exception:
+                page = ctx.new_page()
+
+            try:
+                page.set_default_timeout(30000)
+                page.set_default_navigation_timeout(30000)
+            except Exception:
+                pass
+
+            consec_fail = 0
+            for url in sites:
+                info = _visit_one(page, url)
+                result["details"].append(info)
+                if info["ok"]:
+                    result["sites_visited"] += 1
+                    consec_fail = 0
+                else:
+                    result["sites_failed"] += 1
+                    consec_fail += 1
+                if consec_fail >= 4:
+                    result["error"] = f"4 consecutive failures, last={info['err']}"
+                    break
+                _human_sleep(0.8, 2.0)
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            try:
+                _pw_cm.stop()
+            except Exception:
+                pass
 
         result["ok"] = result["sites_visited"] > 0
     except Exception as e:

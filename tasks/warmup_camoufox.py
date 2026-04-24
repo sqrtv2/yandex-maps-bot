@@ -244,13 +244,18 @@ def warmup_camoufox_session(self, profile_id: int) -> Dict:
     sites = _pick_sites(stage)
     profile_dir = str(_camoufox_dir(profile_name))
 
+    # Camoufox requires a clean BCP-47 locale (e.g. "ru-RU"). Profile.language
+    # in DB may contain a full Accept-Language string ("ru-RU,ru;q=0.9,en-US;q=0.8")
+    # which makes camoufox raise InvalidLocale. Take the first locale, strip ;q=.
+    clean_locale = (language or "ru-RU").split(",")[0].split(";")[0].strip() or "ru-RU"
+
     cfg = {
         "profile_dir": profile_dir,
         "proxy": proxy,
         "sites": sites,
         "user_agent": ua,
         "timezone": timezone,
-        "locale": language,
+        "locale": clean_locale,
         "headless": True,
     }
 
