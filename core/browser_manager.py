@@ -471,7 +471,9 @@ class BrowserManager:
                     navigator_webdriver=True,       # ENABLED: double protection with our CDP script
                     navigator_hardware_concurrency=False,  # profile-specific
                     navigator_languages=False,       # profile-specific (ru-RU)
+                    navigator_languages_override=None,  # silence "override provided but feature disabled" warning
                     navigator_platform=False,        # profile-specific
+                    navigator_platform_override=None,  # silence "override provided but feature disabled" warning
                     navigator_plugins=False,         # our custom mock
                     navigator_permissions=False,     # our custom patch
                     navigator_user_agent=False,      # set via CDP
@@ -555,7 +557,12 @@ class BrowserManager:
         args = [
             "--no-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
+            # NOTE: --disable-blink-features=AutomationControlled was removed.
+            # The flag itself is invisible from JS, BUT it disables a feature
+            # that real Chrome users have ENABLED. Some fingerprinters check
+            # whether AutomationControlled-related APIs behave as expected and
+            # flag the absence as a bot signal. We rely solely on the JS
+            # `navigator.webdriver` patch + Page.addScriptToEvaluateOnNewDocument.
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-hang-monitor",
@@ -839,6 +846,9 @@ class BrowserManager:
             keyboard_layout = profile_data.get("keyboard_layout", [])
             fonts_list = profile_data.get("fonts", [])
 
+            # V8 heap flag value (must match --max-old-space-size in launch args)
+            js_heap_mb = int(os.environ.get('YANDEX_BOT_BROWSER_JS_HEAP', '1024'))
+
             # Extract chrome and YaBrowser versions from user_agent for userAgentData mock
             import re as _re
             _ua = profile_data.get("user_agent", "")
@@ -848,16 +858,41 @@ class BrowserManager:
             ya_version = _ya_match.group(1) if _ya_match else ""
             ya_major = ya_version.split('.')[0] if ya_version else ""
             is_yabrowser = bool(_ya_match)
-            # Platform name for userAgentData (Windows/macOS/Linux)
+            # Platform name + platform_version + architecture for userAgentData
+            # MUST match the actual UA string — mismatch is a strong bot signal.
             _plat = profile_data.get("platform", "Win32")
-            if "Win" in _plat:
+            _ua_lower = _ua.lower()
+            if is_mobile or 'android' in _ua_lower:
+                platform_name = "Android"
+                _mob_dev = profile_data.get('mobile_device', {}) or {}
+                ua_platform_version = (_mob_dev.get('android') or '14') + '.0.0'
+                ua_architecture = ''   # Real Android Chrome returns empty string
+                ua_bitness = ''
+                ua_model = _mob_dev.get('model', '')
+            elif "Win" in _plat or 'windows' in _ua_lower:
                 platform_name = "Windows"
-            elif "Mac" in _plat or "iPhone" in _plat or "iPad" in _plat:
+                ua_platform_version = "15.0.0"  # Win11 reports as 15.x via UA-CH
+                ua_architecture = "x86"
+                ua_bitness = "64"
+                ua_model = ""
+            elif "Mac" in _plat or 'mac os x' in _ua_lower or 'macintosh' in _ua_lower:
                 platform_name = "macOS"
-            elif "Linux" in _plat or "Android" in _plat:
+                ua_platform_version = "14.7.0"
+                ua_architecture = "arm" if 'arm' in _ua_lower else "x86"
+                ua_bitness = "64"
+                ua_model = ""
+            elif "Linux" in _plat or 'linux' in _ua_lower:
                 platform_name = "Linux"
+                ua_platform_version = "6.5.0"
+                ua_architecture = "x86"
+                ua_bitness = "64"
+                ua_model = ""
             else:
                 platform_name = "Windows"
+                ua_platform_version = "15.0.0"
+                ua_architecture = "x86"
+                ua_bitness = "64"
+                ua_model = ""
 
             # Serialize WebGL profile data as JSON for JS injection
             import json as _json
@@ -969,38 +1004,24 @@ class BrowserManager:
                     get: () => {viewport_height},
                     configurable: true
                 }});
+                // outerWidth/outerHeight: real Chrome has
+                //   outerWidth  ≈ innerWidth  (same content area width)
+                //   outerHeight ≈ innerHeight + ~87px (title bar + tabs + address bar)
+                // Setting them equal to screen.width/height (as before) is impossible
+                // for any windowed browser and is a known bot-detection signal.
                 Object.defineProperty(window, 'outerWidth', {{
-                    get: () => {screen_width},
+                    get: () => {viewport_width},
                     configurable: true
                 }});
                 Object.defineProperty(window, 'outerHeight', {{
-                    get: () => {screen_height},
+                    get: () => {viewport_height} + 87,
                     configurable: true
                 }});
             }} catch(e) {{}}
 
-            // --- navigator.connection mock ---
-            try {{
-                const connectionData = {{
-                    effectiveType: '{"3g" if is_mobile else "4g"}',
-                    rtt: {'100' if is_mobile else '50'},
-                    downlink: {'2.5' if is_mobile else '10'},
-                    saveData: false,
-                    type: '{"cellular" if is_mobile else "wifi"}',
-                    onchange: null
-                }};
-                const connectionProxy = new Proxy(connectionData, {{
-                    get(target, prop) {{
-                        if (prop === Symbol.toStringTag) return 'NetworkInformation';
-                        return target[prop];
-                    }}
-                }});
-                Object.defineProperty(Navigator.prototype, 'connection', {{
-                    get: () => connectionProxy,
-                    configurable: true,
-                    enumerable: true
-                }});
-            }} catch(e) {{}}
+            // NOTE: navigator.connection mock moved to single block lower in the
+            // script that uses profile-specific connection_info data. The previous
+            // hardcoded block here was overwritten by the lower one anyway.
 
             // --- Battery API mock ---
             try {{
@@ -1134,42 +1155,47 @@ class BrowserManager:
                 const _wgp = {webgl_profile_json};
 
                 // --- WebGL1 parameter overrides ---
+                // CRITICAL: All numeric keys are official Khronos WebGL constants.
+                // Previous version had MANY wrong values (e.g. 3413 was used for
+                // SAMPLE_BUFFERS but 3413 = ALPHA_BITS) and several duplicate keys
+                // (3410 appeared twice, 3414 twice, 3415 twice) that silently
+                // dropped fields. This caused real GPU values from SwiftShader to
+                // leak through despite the override \u2014 a strong fingerprint
+                // mismatch with the declared NVIDIA/Intel/AMD GPU.
                 const webgl1Overrides = {{
-                    37445: _wgp.unmaskedVendor,   // UNMASKED_VENDOR_WEBGL
-                    37446: _wgp.unmaskedRenderer,  // UNMASKED_RENDERER_WEBGL
-                    7936: _wgp.vendor || 'WebKit',            // VENDOR
-                    7937: _wgp.renderer || 'WebKit WebGL',    // RENDERER
-                    7938: _wgp.version,            // VERSION
-                    35724: _wgp.shadingLanguage,   // SHADING_LANGUAGE_VERSION
-                    3379: parseInt(_wgp.maxTextureSize),       // MAX_TEXTURE_SIZE
-                    3386: new Int32Array(_wgp.maxViewportDims),  // MAX_VIEWPORT_DIMS
-                    34921: parseInt(_wgp.maxVertexAttribs),    // MAX_VERTEX_ATTRIBS
-                    36349: parseInt(_wgp.maxFragmentUniformVectors),  // MAX_FRAGMENT_UNIFORM_VECTORS
-                    36347: parseInt(_wgp.maxVertexUniformVectors),    // MAX_VERTEX_UNIFORM_VECTORS
-                    34076: parseInt(_wgp.maxCubeMapTextureSize),      // MAX_CUBE_MAP_TEXTURE_SIZE
-                    34024: parseInt(_wgp.maxRenderBufferSize),        // MAX_RENDERBUFFER_SIZE
-                    35661: parseInt(_wgp.maxCombinedTextureImageUnits),  // MAX_COMBINED_TEXTURE_IMAGE_UNITS
-                    34930: parseInt(_wgp.maxTextureImageUnits),       // MAX_TEXTURE_IMAGE_UNITS
-                    35660: parseInt(_wgp.maxVertexTextureImageUnits), // MAX_VERTEX_TEXTURE_IMAGE_UNITS
-                    36348: parseInt(_wgp.maxVaryingVectors),          // MAX_VARYING_VECTORS
-                    3413: parseInt(_wgp.sampleBuffers),               // SAMPLE_BUFFERS
-                    3415: parseInt(_wgp.samples),                     // SAMPLES
-                    3408: new Float32Array(_wgp.aliasedLineWidthRange),  // ALIASED_LINE_WIDTH_RANGE
-                    3414: new Float32Array(_wgp.aliasedPointSizeRange),  // ALIASED_POINT_SIZE_RANGE
-                    3410: parseInt(_wgp.alphaBits),      // ALPHA_BITS
-                    3412: parseInt(_wgp.blueBits),       // BLUE_BITS
-                    3411: parseInt(_wgp.greenBits),      // GREEN_BITS
-                    3410: parseInt(_wgp.redBits),        // RED_BITS  → note: 3409 is RED_BITS, 3410 is GREEN
-                    3414: new Float32Array(_wgp.aliasedPointSizeRange),
-                    3416: parseInt(_wgp.depthBits),      // DEPTH_BITS
-                    3415: parseInt(_wgp.samples),
-                    36003: parseInt(_wgp.stencilBits),   // STENCIL_BITS
-                    36004: parseInt(_wgp.subpixelBits),  // SUBPIXEL_BITS
-                    36005: parseInt(_wgp.stencilBackValueMask),   // STENCIL_BACK_VALUE_MASK
-                    36006: parseInt(_wgp.stencilBackWritemask),   // STENCIL_BACK_WRITEMASK
-                    2967: parseInt(_wgp.stencilValueMask),        // STENCIL_VALUE_MASK
-                    2968: parseInt(_wgp.stencilWritemask),        // STENCIL_WRITEMASK
-                    34047: parseInt(_wgp.maxAnisotropy || '16'),  // MAX_TEXTURE_MAX_ANISOTROPY_EXT
+                    37445: _wgp.unmaskedVendor,                       // 0x9245 UNMASKED_VENDOR_WEBGL
+                    37446: _wgp.unmaskedRenderer,                     // 0x9246 UNMASKED_RENDERER_WEBGL
+                    7936:  _wgp.vendor || 'WebKit',                   // 0x1F00 VENDOR
+                    7937:  _wgp.renderer || 'WebKit WebGL',           // 0x1F01 RENDERER
+                    7938:  _wgp.version,                              // 0x1F02 VERSION
+                    35724: _wgp.shadingLanguage,                      // 0x8B8C SHADING_LANGUAGE_VERSION
+                    3379:  parseInt(_wgp.maxTextureSize),             // 0x0D33 MAX_TEXTURE_SIZE
+                    3386:  new Int32Array(_wgp.maxViewportDims),      // 0x0D3A MAX_VIEWPORT_DIMS
+                    34921: parseInt(_wgp.maxVertexAttribs),           // 0x8869 MAX_VERTEX_ATTRIBS
+                    36349: parseInt(_wgp.maxFragmentUniformVectors),  // 0x8DFD MAX_FRAGMENT_UNIFORM_VECTORS
+                    36347: parseInt(_wgp.maxVertexUniformVectors),    // 0x8DFB MAX_VERTEX_UNIFORM_VECTORS
+                    34076: parseInt(_wgp.maxCubeMapTextureSize),      // 0x851C MAX_CUBE_MAP_TEXTURE_SIZE
+                    34024: parseInt(_wgp.maxRenderBufferSize),        // 0x84E8 MAX_RENDERBUFFER_SIZE
+                    35661: parseInt(_wgp.maxCombinedTextureImageUnits), // 0x8B4D MAX_COMBINED_TEXTURE_IMAGE_UNITS
+                    34930: parseInt(_wgp.maxTextureImageUnits),       // 0x8872 MAX_TEXTURE_IMAGE_UNITS
+                    35660: parseInt(_wgp.maxVertexTextureImageUnits), // 0x8B4C MAX_VERTEX_TEXTURE_IMAGE_UNITS
+                    36348: parseInt(_wgp.maxVaryingVectors),          // 0x8DFC MAX_VARYING_VECTORS
+                    32936: parseInt(_wgp.sampleBuffers),              // 0x80A8 SAMPLE_BUFFERS
+                    32937: parseInt(_wgp.samples),                    // 0x80A9 SAMPLES
+                    33902: new Float32Array(_wgp.aliasedLineWidthRange),  // 0x846E ALIASED_LINE_WIDTH_RANGE
+                    33901: new Float32Array(_wgp.aliasedPointSizeRange),  // 0x846D ALIASED_POINT_SIZE_RANGE
+                    3410:  parseInt(_wgp.redBits),                    // 0x0D52 RED_BITS
+                    3411:  parseInt(_wgp.greenBits),                  // 0x0D53 GREEN_BITS
+                    3412:  parseInt(_wgp.blueBits),                   // 0x0D54 BLUE_BITS
+                    3413:  parseInt(_wgp.alphaBits),                  // 0x0D55 ALPHA_BITS
+                    3414:  parseInt(_wgp.depthBits),                  // 0x0D56 DEPTH_BITS
+                    3415:  parseInt(_wgp.stencilBits),                // 0x0D57 STENCIL_BITS
+                    3408:  parseInt(_wgp.subpixelBits),               // 0x0D50 SUBPIXEL_BITS
+                    36004: parseInt(_wgp.stencilBackValueMask),       // 0x8CA4 STENCIL_BACK_VALUE_MASK
+                    36005: parseInt(_wgp.stencilBackWritemask),       // 0x8CA5 STENCIL_BACK_WRITEMASK
+                    2963:  parseInt(_wgp.stencilValueMask),           // 0x0B93 STENCIL_VALUE_MASK
+                    2968:  parseInt(_wgp.stencilWritemask),           // 0x0B98 STENCIL_WRITEMASK
+                    34047: parseInt(_wgp.maxAnisotropy || '16'),      // 0x84FF MAX_TEXTURE_MAX_ANISOTROPY_EXT
                 }};
 
                 // --- WebGL2 additional parameter overrides ---
@@ -1538,25 +1564,41 @@ class BrowserManager:
                 const origCreateOscillator = AudioContext.prototype.createOscillator || 
                                               (typeof OfflineAudioContext !== 'undefined' && OfflineAudioContext.prototype.createOscillator);
                 
-                // Patch AnalyserNode.getFloatFrequencyData to add noise
+                // Seeded PRNG so audio noise is DETERMINISTIC per profile.
+                // Real audio fingerprint is identical on every call; using
+                // Math.random() each time made two consecutive calls return
+                // different values — a trivial bot signal.
+                const AUDIO_SEED = ({canvas_seed} ^ 0xA1D70) >>> 0;
+                function _audioRng(seed) {{
+                    return function() {{
+                        seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+                        var t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+                        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+                        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+                    }};
+                }}
+
+                // Patch AnalyserNode.getFloatFrequencyData to add stable noise
                 const origGetFloat = AnalyserNode.prototype.getFloatFrequencyData;
                 AnalyserNode.prototype.getFloatFrequencyData = function(array) {{
                     origGetFloat.call(this, array);
-                    // Add imperceptible noise to audio fingerprint data
+                    const rng = _audioRng(AUDIO_SEED ^ (array.length & 0xFFFF));
                     for (let i = 0; i < array.length; i += 3) {{
-                        array[i] = array[i] + (Math.random() * 0.0001 - 0.00005);
+                        array[i] = array[i] + (rng() * 0.0001 - 0.00005);
                     }}
                 }};
-                
+                _maskAsNative(AnalyserNode.prototype.getFloatFrequencyData, 'getFloatFrequencyData');
+
                 // Patch OfflineAudioContext.startRendering
                 if (typeof OfflineAudioContext !== 'undefined') {{
                     const origStartRendering = OfflineAudioContext.prototype.startRendering;
                     OfflineAudioContext.prototype.startRendering = function() {{
                         return origStartRendering.call(this).then(function(buffer) {{
-                            // Add noise to rendered audio buffer
+                            // Stable per-profile noise on rendered audio buffer
                             const channel = buffer.getChannelData(0);
+                            const rng = _audioRng(AUDIO_SEED ^ (channel.length & 0xFFFF));
                             for (let i = 0; i < channel.length; i += 100) {{
-                                channel[i] = channel[i] + (Math.random() * 0.0000001 - 0.00000005);
+                                channel[i] = channel[i] + (rng() * 0.0000001 - 0.00000005);
                             }}
                             return buffer;
                         }});
@@ -1712,8 +1754,16 @@ class BrowserManager:
             }} catch(e) {{}}
 
             // --- Performance.memory (heap size) mock ---
+            // Clamp jsHeapSizeLimit to actual V8 --max-old-space-size+new-space.
+            // Profile may declare 4GB but if Node was launched with 1GB old-space,
+            // an antibot could allocate Float64Array((claimed_limit-256MB)/8) and
+            // catch a RangeError before the declared limit → instant bot signal.
+            // Formula: V8 reserves old_space + ~256MB for new/large-object spaces.
             try {{
-                const _heapSize = {heap_size};
+                const _profileHeap = {heap_size};
+                const _v8MaxOldMb = {js_heap_mb};
+                const _v8RealLimit = (_v8MaxOldMb + 256) * 1024 * 1024;  // bytes
+                const _heapSize = Math.min(_profileHeap, _v8RealLimit);
                 if (window.performance) {{
                     Object.defineProperty(performance, 'memory', {{
                         get: function() {{
@@ -1827,10 +1877,10 @@ class BrowserManager:
                                         brands: _brands,
                                         mobile: {'true' if is_mobile else 'false'},
                                         platform: "{platform_name}",
-                                        platformVersion: "10.0.0",
-                                        architecture: "x86",
-                                        bitness: "64",
-                                        model: "",
+                                        platformVersion: "{ua_platform_version}",
+                                        architecture: "{ua_architecture}",
+                                        bitness: "{ua_bitness}",
+                                        model: "{ua_model}",
                                         uaFullVersion: "{'%s' % (ya_version if ya_version else chrome_version)}",
                                         fullVersionList: _fullBrands
                                     }});
@@ -1868,15 +1918,19 @@ class BrowserManager:
             }} catch(e) {{}}
 
             // --- Enhanced plugins/mimes mock ---
+            // Real desktop Chrome 145+ ships exactly these 5 internal PDF plugins
+            // for every user (NOT per-profile-varied — varying would be a signal).
+            // Real mobile Chrome on Android has NO plugins/mimes at all (length=0).
             try {{
-                const pluginArr = [
+                const _isMobileUA = {'true' if is_mobile else 'false'};
+                const pluginArr = _isMobileUA ? [] : [
                     {{ name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
                     {{ name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
                     {{ name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
                     {{ name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
                     {{ name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format" }}
                 ];
-                const mimeArr = [
+                const mimeArr = _isMobileUA ? [] : [
                     {{ type: "application/pdf", suffixes: "pdf", description: "Portable Document Format" }},
                     {{ type: "text/pdf", suffixes: "pdf", description: "Portable Document Format" }}
                 ];
@@ -1925,9 +1979,9 @@ class BrowserManager:
                     get: function() {{ return fakeMimes; }},
                     configurable: true, enumerable: true
                 }});
-                // Also define pdfViewerEnabled
+                // pdfViewerEnabled: true on desktop, false on mobile Android
                 Object.defineProperty(navigator, 'pdfViewerEnabled', {{
-                    get: function() {{ return true; }},
+                    get: function() {{ return !_isMobileUA; }},
                     configurable: true
                 }});
             }} catch(e) {{}}
