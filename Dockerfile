@@ -77,11 +77,18 @@ RUN python -m patchright install chromium
 # dedicated celery worker (subprocess-isolated; sync API can't share asyncio
 # loop with chromium sync_playwright). `camoufox fetch` downloads the patched
 # binary into ~/.cache/camoufox; install it under /opt so it's accessible to
-# the appuser at runtime via a symlink. `playwright install-deps firefox`
-# pulls the libasound/libxul system libs the FF binary needs to start.
+# the appuser at runtime via a symlink.
+# Firefox-specific libs that chromium doesn't pull (libdbus-glib, libxt) — we
+# install manually because `playwright install-deps firefox` requests packages
+# (ttf-ubuntu-font-family, etc.) that don't exist on debian bookworm.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libdbus-glib-1-2 \
+    libxt6 \
+    libxtst6 \
+    libgtk-3-0 \
+    && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /opt/camoufox-cache && \
-    HOME=/opt/camoufox-cache python -m camoufox fetch && \
-    python -m playwright install-deps firefox
+    HOME=/opt/camoufox-cache python -m camoufox fetch
 
 # Download Chrome 145 for better Yandex SmartCaptcha fingerprint compatibility
 # rebrowser-playwright 1.52 ships Chromium 136, but Chrome 145 passes more checks.
