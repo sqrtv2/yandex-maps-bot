@@ -33,7 +33,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from app.config import settings
 from app.database import get_db_session
@@ -47,6 +47,8 @@ MIN_SESSIONS = 3
 MIN_HOURS_SPREAD = 1.0
 SITES_PER_SESSION = 12
 RUNNER_TIMEOUT_S = 480  # 8 min per session — generous for camoufox FF startup
+SCHEDULE_LOCK_TTL_S = 120
+SCHEDULE_MARKER_TTL_S = 3 * 3600
 
 # Russian-popular pool (yandex deliberately EXCLUDED until cookies seeded
 # by neutral browsing — same logic as chromium warmup)
@@ -128,6 +130,39 @@ def _save_state(profile_name: str, state: Dict) -> None:
     tmp.replace(p)
 
 
+def _get_redis_client():
+    try:
+        import redis
+        return redis.Redis.from_url(settings.redis_url, decode_responses=True)
+    except Exception as e:
+        logger.warning(f"camoufox: Redis unavailable: {e}")
+        return None
+
+
+def _schedule_marker_key(profile_id: int) -> str:
+    return f"camoufox:warmup:scheduled:{profile_id}"
+
+
+def _mark_scheduled(profile_id: int, ttl_s: int = SCHEDULE_MARKER_TTL_S) -> None:
+    r = _get_redis_client()
+    if not r:
+        return
+    try:
+        r.set(_schedule_marker_key(profile_id), "1", ex=max(60, int(ttl_s)))
+    except Exception as e:
+        logger.debug(f"camoufox: failed to mark profile {profile_id} scheduled: {e}")
+
+
+def _clear_scheduled(profile_id: int) -> None:
+    r = _get_redis_client()
+    if not r:
+        return
+    try:
+        r.delete(_schedule_marker_key(profile_id))
+    except Exception as e:
+        logger.debug(f"camoufox: failed to clear schedule marker for {profile_id}: {e}")
+
+
 def _pick_sites(stage: int) -> List[str]:
     pool = list(SITE_POOL)
     # From stage >= 1, mix in yandex sites — by then we have neutral cookies.
@@ -148,6 +183,30 @@ def _build_proxy_dict(profile: BrowserProfile) -> Optional[Dict]:
     if profile.proxy_password:
         proxy["password"] = profile.proxy_password
     return proxy
+
+
+def _select_profiles_for_camoufox(db, limit: int, redis_client=None) -> List[Tuple[int, str, int]]:
+    selected: List[Tuple[int, str, int]] = []
+    profiles = (
+        db.query(BrowserProfile)
+        .filter(BrowserProfile.is_active == True)
+        .order_by(BrowserProfile.id)
+        .all()
+    )
+    for profile in profiles:
+        state = _load_state(profile.name)
+        if state.get("completed"):
+            continue
+        if redis_client:
+            try:
+                if redis_client.exists(_schedule_marker_key(profile.id)):
+                    continue
+            except Exception:
+                pass
+        selected.append((profile.id, profile.name, int(state.get("stage", 0))))
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _run_subprocess(cfg: Dict) -> Dict:
@@ -189,6 +248,67 @@ def _run_subprocess(cfg: Dict) -> Dict:
     }
 
 
+@celery_app.task(name="tasks.warmup_camoufox.schedule_camoufox_warmup", queue="default")
+def schedule_camoufox_warmup(limit: Optional[int] = None) -> Dict:
+    """Seed Camoufox warmup tasks for active profiles that are not completed yet."""
+    if not getattr(settings, "camoufox_warmup_enabled", True):
+        return {"status": "skipped", "reason": "disabled", "scheduled": 0}
+
+    batch_limit = int(limit or getattr(settings, "camoufox_warmup_batch_size", 20) or 20)
+    batch_limit = max(1, min(batch_limit, 200))
+    queue_max = int(getattr(settings, "camoufox_warmup_queue_max", 80) or 80)
+
+    r = _get_redis_client()
+    lock_key = "camoufox:warmup:scheduler:lock"
+    if r:
+        try:
+            if not r.set(lock_key, "1", nx=True, ex=SCHEDULE_LOCK_TTL_S):
+                return {"status": "skipped", "reason": "duplicate", "scheduled": 0}
+            queue_len = int(r.llen("warmup_camoufox") or 0)
+            if queue_len >= queue_max:
+                return {
+                    "status": "skipped",
+                    "reason": f"queue_full ({queue_len}/{queue_max})",
+                    "scheduled": 0,
+                }
+            batch_limit = min(batch_limit, max(0, queue_max - queue_len))
+        except Exception as e:
+            logger.warning(f"camoufox scheduler Redis check failed: {e}")
+
+    if batch_limit <= 0:
+        return {"status": "skipped", "reason": "no_capacity", "scheduled": 0}
+
+    try:
+        with get_db_session() as db:
+            selected = _select_profiles_for_camoufox(db, batch_limit, r)
+    except Exception as e:
+        logger.warning(f"camoufox scheduler DB selection failed: {e}")
+        return {"status": "error", "error": str(e), "scheduled": 0}
+
+    if not selected:
+        return {"status": "success", "message": "No Camoufox profiles need warmup", "scheduled": 0}
+
+    scheduled = 0
+    failures = []
+    for profile_id, profile_name, stage in selected:
+        try:
+            warmup_camoufox_session.apply_async(args=(profile_id,), queue="warmup_camoufox")
+            _mark_scheduled(profile_id, SCHEDULE_MARKER_TTL_S)
+            scheduled += 1
+            logger.info(
+                f"🍃 Seeded Camoufox warmup: profile={profile_name} id={profile_id} stage={stage}"
+            )
+        except Exception as e:
+            failures.append({"profile_id": profile_id, "error": str(e)})
+            logger.warning(f"camoufox scheduler failed to dispatch profile {profile_id}: {e}")
+
+    return {
+        "status": "success" if not failures else "partial",
+        "scheduled": scheduled,
+        "failures": failures[:10],
+    }
+
+
 @celery_app.task(
     bind=True,
     name="tasks.warmup_camoufox.warmup_camoufox_session",
@@ -204,11 +324,14 @@ def warmup_camoufox_session(self, profile_id: int) -> Dict:
     Returns dict with stats; updates JSON state on disk.
     """
     t0 = time.time()
+    _mark_scheduled(profile_id, RUNNER_TIMEOUT_S + 1800)
     with get_db_session() as db:
         profile = db.query(BrowserProfile).filter(BrowserProfile.id == profile_id).first()
         if not profile:
+            _clear_scheduled(profile_id)
             return {"ok": False, "error": f"profile {profile_id} not found"}
         if not profile.is_active:
+            _clear_scheduled(profile_id)
             return {"ok": False, "error": f"profile {profile_id} inactive"}
         profile_name = profile.name
         ua = profile.user_agent
@@ -233,11 +356,13 @@ def warmup_camoufox_session(self, profile_id: int) -> Dict:
         except Exception as e:
             logger.warning(f"camoufox: ProxyManager fallback failed: {e}")
     if not proxy:
+        _mark_scheduled(profile_id, 1200)
         return {"ok": False, "error": "no proxy available"}
 
     state = _load_state(profile_name)
     if state.get("completed"):
         logger.info(f"🍃 Camoufox warmup already completed for {profile_name}")
+        _clear_scheduled(profile_id)
         return {"ok": True, "skipped": "already_completed", "state": state}
 
     stage = int(state.get("stage", 0))
@@ -324,6 +449,7 @@ def warmup_camoufox_session(self, profile_id: int) -> Dict:
                 queue="warmup_camoufox",
                 countdown=delay_s,
             )
+            _mark_scheduled(profile_id, delay_s + RUNNER_TIMEOUT_S + 900)
             logger.info(
                 f"🍃⏭  Camoufox next session for {profile_name} scheduled in "
                 f"{delay_s//60}m (stage={state['stage']}/{MIN_SESSIONS})"
@@ -341,12 +467,15 @@ def warmup_camoufox_session(self, profile_id: int) -> Dict:
                 queue="warmup_camoufox",
                 countdown=delay_s,
             )
+            _mark_scheduled(profile_id, delay_s + RUNNER_TIMEOUT_S + 900)
             logger.info(
                 f"🍃🔁 Camoufox retry for {profile_name} in {delay_s//60}m "
                 f"(stage stays at {state['stage']})"
             )
         except Exception as e:
             logger.warning(f"camoufox retry-reschedule failed for {profile_name}: {e}")
+    elif state["completed"]:
+        _clear_scheduled(profile_id)
 
     return {
         "ok": ok,

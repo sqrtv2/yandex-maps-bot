@@ -14,6 +14,7 @@ services:
       - YANDEX_BOT_BROWSER_HEADLESS=true
       - YANDEX_BOT_YANDEX_SEARCH_API_KEY=${YANDEX_SEARCH_API_KEY:-}
       - YANDEX_BOT_YANDEX_SEARCH_FOLDER_ID=${YANDEX_SEARCH_FOLDER_ID:-}
+      - YANDEX_BOT_YANDEX_SEARCH_CAMOUFOX_PCT=${YANDEX_SEARCH_CAMOUFOX_PCT:-5}
       - GOOGLE_APPLICATION_CREDENTIALS=/app/key.json
       - AUTH_USERNAME=admin
       - AUTH_PASSWORD=admin123
@@ -280,9 +281,9 @@ services:
     command: celery -A tasks.celery_app worker --loglevel=info --concurrency=10 -Q yandex_search -n yandex_search@%h --max-memory-per-child=8000000 --max-tasks-per-child=2
     shm_size: '12gb'
     healthcheck:
-      test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d yandex_search@$$HOSTNAME --timeout=10 || exit 1"]
+      test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d yandex_search@$$HOSTNAME --timeout=25 || exit 1"]
       interval: 30s
-      timeout: 15s
+      timeout: 30s
       retries: 3
     environment:
       - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
@@ -292,6 +293,7 @@ services:
       - YANDEX_BOT_BROWSER_HEADLESS=true
       - YANDEX_BOT_SAVE_SCREENSHOTS=false
       - YANDEX_BOT_FAST_MODE=true
+      - YANDEX_BOT_YANDEX_SEARCH_CAMOUFOX_PCT=${YANDEX_SEARCH_CAMOUFOX_PCT:-5}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -315,6 +317,55 @@ services:
         limits:
           memory: 56G
           cpus: '8'
+    networks:
+      - yandex_maps_network
+
+  # Celery worker for Yandex Search clicks via Camoufox/Firefox.
+  # Dedicated queue is important: sync_playwright is process-exclusive, so
+  # Camoufox tasks must start in worker processes that are not already pinned
+  # to the Chromium rebrowser backend.
+  celery_yandex_search_camoufox:
+    build: .
+    init: true
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=2 -Q yandex_search_camoufox -n yandex_search_camoufox@%h --max-memory-per-child=8000000 --max-tasks-per-child=1
+    shm_size: '8gb'
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A tasks.celery_app inspect ping -d yandex_search_camoufox@$$HOSTNAME --timeout=25 || exit 1"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+    environment:
+      - YANDEX_BOT_DATABASE_URL=postgresql://postgres:password@postgres:5432/yandex_maps_bot
+      - YANDEX_BOT_REDIS_HOST=redis
+      - YANDEX_BOT_REDIS_PORT=6379
+      - YANDEX_BOT_DEBUG=false
+      - YANDEX_BOT_BROWSER_HEADLESS=true
+      - YANDEX_BOT_SAVE_SCREENSHOTS=false
+      - YANDEX_BOT_FAST_MODE=true
+      - YANDEX_BOT_YANDEX_SEARCH_CAMOUFOX_PCT=${YANDEX_SEARCH_CAMOUFOX_PCT:-5}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+      - ./browser_profiles:/app/browser_profiles
+      - ./tasks:/app/tasks
+      - ./core:/app/core
+      - ./app:/app/app
+      - ./web:/app/web
+      - ./parser:/app/parser
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 20G
+          cpus: '4'
     networks:
       - yandex_maps_network
 

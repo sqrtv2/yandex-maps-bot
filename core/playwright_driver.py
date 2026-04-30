@@ -321,11 +321,12 @@ class PlaywrightDriver:
     """
 
     def __init__(self, page: Page, context: BrowserContext, browser: Browser,
-                 playwright_instance: Playwright):
+                 playwright_instance: Playwright, browser_name: str = 'chromium'):
         self._page = page
         self._context = context
         self._browser = browser
         self._playwright = playwright_instance
+        self._browser_name = browser_name
         self._page_load_timeout = 60_000  # ms
         self._script_timeout = 15_000  # ms
         self._cdp_session = None
@@ -496,18 +497,22 @@ class PlaywrightDriver:
         pw_args = []
         for arg in args:
             if isinstance(arg, PlaywrightElement):
-                pw_args.append(arg._element_handle)
+                pw_args.append(arg._handle)
             else:
                 pw_args.append(arg)
 
         # Selenium-style scripts use `arguments[0]`, `arguments[1]`, etc.
         # Playwright's page.evaluate() can't return DOM elements (serializes to null).
         # We use evaluate_handle() + unwrap so JS returning DOM nodes works correctly.
-        from playwright.sync_api import ElementHandle as _EH
-
         def _unwrap_handle(handle):
             """Convert JSHandle to Python value or PlaywrightElement."""
-            if isinstance(handle, _EH):
+            try:
+                element = handle.as_element()
+            except Exception:
+                element = None
+            if element is not None:
+                return PlaywrightElement(element, self._page)
+            if handle.__class__.__name__ == "ElementHandle":
                 return PlaywrightElement(handle, self._page)
             try:
                 return handle.json_value()
@@ -520,7 +525,7 @@ class PlaywrightDriver:
             if len(pw_args) == 1:
                 adapted = adapted.replace('arguments[0]', '__el__')
                 wrapped = f"(__el__) => {{ {adapted} }}"
-                if isinstance(pw_args[0], _EH):
+                if hasattr(pw_args[0], "evaluate"):
                     # ElementHandle arg: use element_handle.evaluate so it unwraps to DOM node
                     return pw_args[0].evaluate(wrapped)
                 handle = self._page.evaluate_handle(wrapped, pw_args[0])
@@ -546,6 +551,23 @@ class PlaywrightDriver:
 
         Playwright provides CDP access via context.new_cdp_session() for Chromium.
         """
+        if self._browser_name != 'chromium':
+            params = params or {}
+            if cmd == "Page.stopLoading":
+                try:
+                    return self._page.evaluate("() => { try { window.stop(); } catch (e) {} return true; }")
+                except Exception:
+                    return None
+            if cmd == "Network.setExtraHTTPHeaders":
+                headers = params.get("headers") or {}
+                if headers:
+                    try:
+                        self._context.set_extra_http_headers(headers)
+                    except Exception:
+                        pass
+                return None
+            logger.debug("CDP command %s ignored for browser=%s", cmd, self._browser_name)
+            return None
         if self._cdp_session is None:
             self._cdp_session = self._context.new_cdp_session(self._page)
         return self._cdp_session.send(cmd, params or {})
@@ -596,7 +618,7 @@ class PlaywrightDriver:
 
     @property
     def capabilities(self) -> dict:
-        return {'browserName': 'chromium', 'proxy': {}}
+        return {'browserName': self._browser_name, 'proxy': {}}
 
     # ── lifecycle ──
 

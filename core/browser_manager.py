@@ -39,6 +39,7 @@ import threading as _threading
 
 BACKEND_REBROWSER = "rebrowser"
 BACKEND_PATCHRIGHT = "patchright"
+BACKEND_CAMOUFOX = "camoufox"
 
 _playwright_instances: Dict[str, Playwright] = {}
 _playwright_lock = _threading.Lock()
@@ -93,6 +94,22 @@ def _pick_backend(profile_name: str) -> str:
     return BACKEND_PATCHRIGHT if bucket < pct else BACKEND_REBROWSER
 
 
+def _normalize_backend(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    value = str(value).strip().lower()
+    aliases = {
+        "firefox": BACKEND_CAMOUFOX,
+        "cf": BACKEND_CAMOUFOX,
+        "camoufox": BACKEND_CAMOUFOX,
+        "patchright": BACKEND_PATCHRIGHT,
+        "rebrowser": BACKEND_REBROWSER,
+        "chromium": BACKEND_REBROWSER,
+        "chrome": BACKEND_REBROWSER,
+    }
+    return aliases.get(value)
+
+
 # Shared Playwright instance (reused across BrowserManager instances within the same process)
 _playwright_instance: Optional[Playwright] = None  # legacy alias — kept for backwards compat
 
@@ -108,7 +125,7 @@ def _get_playwright(backend: str = BACKEND_REBROWSER) -> Playwright:
     patchright → `from patchright.sync_api import sync_playwright`
                  (separate package, separate driver, separate bundled chromium)
     """
-    if backend not in (BACKEND_REBROWSER, BACKEND_PATCHRIGHT):
+    if backend not in (BACKEND_REBROWSER, BACKEND_PATCHRIGHT, BACKEND_CAMOUFOX):
         backend = BACKEND_REBROWSER
     if backend in _playwright_instances:
         return _playwright_instances[backend]
@@ -131,11 +148,11 @@ def _get_playwright(backend: str = BACKEND_REBROWSER) -> Playwright:
                 )
                 _bump_backend_metric(backend, "fallback_to_pinned")
                 return _playwright_instances[existing_backend]
-        if backend == BACKEND_PATCHRIGHT:
+        if backend in (BACKEND_PATCHRIGHT, BACKEND_CAMOUFOX):
             try:
                 from patchright.sync_api import sync_playwright as _patch_sp
                 _playwright_instances[backend] = _patch_sp().start()
-                logger.info("✅ Patchright instance started (backend=patchright)")
+                logger.info(f"✅ Patchright instance started (backend={backend})")
             except ImportError:
                 logger.warning("⚠️ patchright not installed — falling back to rebrowser")
                 backend = BACKEND_REBROWSER
@@ -489,7 +506,7 @@ class BrowserManager:
             # subdir so its (older) Chromium 136 doesn't read profile data
             # written by rebrowser's Chrome 145 (incompatible Preferences/Local
             # Storage formats crash the renderer at Page.enable).
-            requested_backend = _pick_backend(profile_data.get("name", ""))
+            requested_backend = _normalize_backend(profile_data.get("_force_backend")) or _pick_backend(profile_data.get("name", ""))
             playwright = _get_playwright(requested_backend)
             # Process may already be pinned to a different backend (sync_playwright
             # is process-exclusive — see _get_playwright). Read back the pinned one.
@@ -507,7 +524,10 @@ class BrowserManager:
             # (preserves warmup/cookies). patchright gets an isolated subdir
             # — first run is fresh; warmup will rebuild it for that backend.
             base_profile_dir = os.path.abspath(os.path.join(settings.browser_user_data_dir, profile_data["name"]))
-            if backend == BACKEND_PATCHRIGHT:
+            if backend == BACKEND_CAMOUFOX:
+                profile_dir = os.path.join(base_profile_dir, "_camoufox")
+                os.makedirs(profile_dir, exist_ok=True)
+            elif backend == BACKEND_PATCHRIGHT:
                 profile_dir = os.path.join(base_profile_dir, "_patchright")
                 os.makedirs(profile_dir, exist_ok=True)
             else:
@@ -543,12 +563,37 @@ class BrowserManager:
             is_mobile = profile_data.get('is_mobile', False)
 
             try:
+                if backend == BACKEND_CAMOUFOX:
+                    from camoufox.utils import launch_options as _camoufox_launch_options
+
+                    lang = profile_data.get('language') or 'ru-RU'
+                    locale = lang.split(',')[0].split(';')[0].strip() or 'ru-RU'
+                    camoufox_opts = _camoufox_launch_options(
+                        headless=False,
+                        humanize=True,
+                        os=("windows", "macos"),
+                        locale=locale,
+                        geoip=True,
+                        i_know_what_im_doing=True,
+                        user_data_dir=profile_dir,
+                    )
+                    camoufox_opts.pop("persistent_context", None)
+                    camoufox_opts["viewport"] = {"width": viewport.get("width", 1366), "height": viewport.get("height", 768)}
+                    camoufox_opts["timezone_id"] = profile_data.get("timezone", "Europe/Moscow")
+                    camoufox_opts["ignore_https_errors"] = True
+                    camoufox_opts["timeout"] = 60000
+                    camoufox_opts["extra_http_headers"] = {
+                        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+                    }
+                    if proxy_config:
+                        camoufox_opts["proxy"] = proxy_config
+                    context = playwright.firefox.launch_persistent_context(**camoufox_opts)
                 # Use full Chromium binary (not headless_shell) to avoid TLS/JA3
                 # fingerprint detection by SmartCaptcha. headless_shell has a unique
                 # TLS fingerprint that Yandex's server detects, triggering captcha
                 # on 100% of search requests.
-                import glob
-                if backend == BACKEND_PATCHRIGHT:
+                elif backend == BACKEND_PATCHRIGHT:
+                    import glob
                     # patchright bundles its own patched chromium — MUST use it,
                     # because patchright applies binary-level patches that other
                     # chromium builds don't have. Glob picks newest patchright build.
@@ -559,34 +604,36 @@ class BrowserManager:
                         patch_paths = sorted(glob.glob('/opt/pw-browsers/chromium-*/chrome-linux64/chrome'))
                         chromium_exe = patch_paths[-1] if patch_paths else None
                 else:
+                    import glob
                     chromium_paths = sorted(glob.glob('/opt/pw-browsers/chromium-*/chrome-linux*/chrome'))
                     chromium_exe = chromium_paths[-1] if chromium_paths else None
 
-                # Launch persistent context (uses profile directory for cookies/storage)
-                # timeout=60s prevents hanging on slow proxy handshake / corrupted profile
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir=profile_dir,
-                    headless=False,  # Always headed — uses Xvfb virtual display
-                    executable_path=chromium_exe,
-                    args=launch_args,
-                    proxy=proxy_config,
-                    viewport={"width": viewport.get("width", 1366), "height": viewport.get("height", 768)},
-                    user_agent=profile_data.get("user_agent"),
-                    locale="ru-RU",
-                    timezone_id=profile_data.get("timezone", "Europe/Moscow"),
-                    extra_http_headers={
-                        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
-                    },
-                    is_mobile=is_mobile,
-                    has_touch=is_mobile,
-                    device_scale_factor=profile_data.get('screen', {}).get('pixel_ratio', 1) if is_mobile else 1,
-                    ignore_https_errors=True,
-                    timeout=60000,  # 60s max for Chrome launch (prevents hang on proxy/profile issues)
-                )
+                if backend != BACKEND_CAMOUFOX:
+                    # Launch persistent context (uses profile directory for cookies/storage)
+                    # timeout=60s prevents hanging on slow proxy handshake / corrupted profile
+                    context = playwright.chromium.launch_persistent_context(
+                        user_data_dir=profile_dir,
+                        headless=False,  # Always headed — uses Xvfb virtual display
+                        executable_path=chromium_exe,
+                        args=launch_args,
+                        proxy=proxy_config,
+                        viewport={"width": viewport.get("width", 1366), "height": viewport.get("height", 768)},
+                        user_agent=profile_data.get("user_agent"),
+                        locale="ru-RU",
+                        timezone_id=profile_data.get("timezone", "Europe/Moscow"),
+                        extra_http_headers={
+                            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+                        },
+                        is_mobile=is_mobile,
+                        has_touch=is_mobile,
+                        device_scale_factor=profile_data.get('screen', {}).get('pixel_ratio', 1) if is_mobile else 1,
+                        ignore_https_errors=True,
+                        timeout=60000,  # 60s max for Chrome launch (prevents hang on proxy/profile issues)
+                    )
             except Exception as launch_exc:
-                logger.warning(f"Chrome launch failed, cleaning up orphans for {profile_dir}: {launch_exc}")
+                logger.warning(f"Browser launch failed, cleaning up orphans for {profile_dir}: {launch_exc}")
                 _bump_backend_metric(backend, "launch_fail")
-                self._kill_chrome_by_profile_dir(profile_dir)
+                self._kill_browser_by_profile_dir(profile_dir)
                 singleton_lock = os.path.join(profile_dir, "SingletonLock")
                 if os.path.exists(singleton_lock) or os.path.islink(singleton_lock):
                     try:
@@ -603,7 +650,9 @@ class BrowserManager:
             # patches at the driver level, and stacking playwright-stealth on top
             # causes double-patching warnings + can re-introduce signals patchright
             # specifically removed (e.g. duplicate Function.prototype.toString hooks).
-            if backend == BACKEND_PATCHRIGHT:
+            if backend == BACKEND_CAMOUFOX:
+                logger.info("⏭️  Chromium stealth skipped (Camoufox handles Firefox fingerprinting)")
+            elif backend == BACKEND_PATCHRIGHT:
                 logger.info("⏭️  playwright-stealth SKIPPED (patchright handles this internally)")
             else:
                 try:
@@ -652,10 +701,14 @@ class BrowserManager:
                 context=context,
                 browser=browser_obj if browser_obj else context,
                 playwright_instance=playwright,
+                browser_name='firefox' if backend == BACKEND_CAMOUFOX else 'chromium',
             )
 
             # Apply fingerprint settings via CDP
-            self._apply_profile_settings(driver, profile_data)
+            if backend == BACKEND_CAMOUFOX:
+                self._apply_camoufox_profile_settings(driver, profile_data)
+            else:
+                self._apply_profile_settings(driver, profile_data)
 
             # Verify browser is alive
             try:
@@ -666,7 +719,7 @@ class BrowserManager:
                     context.close()
                 except Exception:
                     pass
-                self._kill_chrome_by_profile_dir(profile_dir)
+                self._kill_browser_by_profile_dir(profile_dir)
                 raise WebDriverException(f"Browser crashed during profile setup: {health_err}")
 
             # Store browser instance
@@ -772,6 +825,30 @@ class BrowserManager:
             args.append(flag)
 
         return args
+
+    def _apply_camoufox_profile_settings(self, driver: PlaywrightDriver, profile_data: Dict):
+        """Apply only Firefox-safe settings for Camoufox sessions.
+
+        Camoufox already owns the Firefox fingerprint surface. The Chromium path
+        injects CDP and Chrome-specific JS (UA-CH, window.chrome, WebGPU mocks),
+        which would create impossible Firefox fingerprints, so keep this minimal.
+        """
+        try:
+            viewport = profile_data.get("viewport", {}) or {}
+            if viewport:
+                driver.set_window_size(
+                    int(viewport.get("width", 1366)),
+                    int(viewport.get("height", 768)),
+                )
+            try:
+                driver.pw_context.set_extra_http_headers({
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+                })
+            except Exception:
+                pass
+            logger.info("Applied Camoufox profile settings for: %s", profile_data.get("name"))
+        except Exception as e:
+            logger.warning("Could not apply Camoufox profile settings: %s", e)
 
     def _apply_profile_settings(self, driver: PlaywrightDriver, profile_data: Dict):
         """Apply JavaScript-based profile settings to browser."""
@@ -2467,7 +2544,7 @@ class BrowserManager:
         # Step 2: Kill ALL Chrome processes by profile directory
         # This catches Chrome children even when chrome_pid was None
         if profile_dir:
-            self._kill_chrome_by_profile_dir(profile_dir)
+            self._kill_browser_by_profile_dir(profile_dir)
         
         # Step 3: Try graceful close via Playwright (context.close after Chrome is already dead)
         # This is fast since Chrome is already killed — just cleans up Playwright internal state.
@@ -2517,6 +2594,10 @@ class BrowserManager:
 
     def _kill_chrome_by_profile_dir(self, profile_dir: str):
         """Find and kill ALL Chrome AND node-driver processes that use a specific profile directory."""
+        return self._kill_browser_by_profile_dir(profile_dir)
+
+    def _kill_browser_by_profile_dir(self, profile_dir: str):
+        """Find and kill browser/node-driver processes that use a specific profile directory."""
         killed = 0
         # Resolve to absolute path — Chrome cmdline always uses absolute paths
         abs_profile_dir = os.path.abspath(profile_dir)
@@ -2526,7 +2607,7 @@ class BrowserManager:
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                 try:
                     name = (proc.info.get('name') or '').lower()
-                    if 'chrome' not in name and 'chromedriver' not in name:
+                    if not any(token in name for token in ('chrome', 'chromedriver', 'firefox', 'camoufox')):
                         continue
                     cmdline = ' '.join(proc.info.get('cmdline') or [])
                     if abs_profile_dir in cmdline:
@@ -2549,7 +2630,7 @@ class BrowserManager:
                 except Exception:
                     pass
             if killed:
-                logger.info(f"🔪 Killed {killed} Chrome/node-driver processes for {os.path.basename(profile_dir)}")
+                logger.info(f"🔪 Killed {killed} browser/node-driver processes for {os.path.basename(profile_dir)}")
         except ImportError:
             # psutil not available — use pkill
             try:

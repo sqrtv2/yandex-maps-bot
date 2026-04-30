@@ -59,6 +59,29 @@ WATCHDOG_IDLE_TIMEOUT = 300   # kill if no heartbeat for 5 minutes
 WATCHDOG_ABSOLUTE_MAX = 780   # absolute max before kill (< time_limit=840s)
 
 
+def _normalize_browser_backend(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    value = str(value).strip().lower()
+    if value in ("camoufox", "firefox", "cf"):
+        return "camoufox"
+    if value in ("rebrowser", "patchright", "chromium", "chrome"):
+        return value
+    return None
+
+
+def _use_camoufox_for_search(profile_id: int, target_id: int, keyword: str) -> bool:
+    pct = max(0, min(100, int(getattr(settings, "yandex_search_camoufox_pct", 0) or 0)))
+    if pct <= 0:
+        return False
+    if pct >= 100:
+        return True
+    import hashlib as _hashlib
+    key = f"{profile_id}:{target_id}:{keyword}".encode("utf-8", errors="ignore")
+    bucket = int(_hashlib.md5(key).hexdigest()[:8], 16) % 100
+    return bucket < pct
+
+
 class _WatchdogTimeout(Exception):
     """Raised by SIGUSR1 handler when watchdog kills processes."""
     pass
@@ -2789,6 +2812,15 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             'images_enabled': False,  # Disable images for speed
         })
 
+        requested_browser_backend = _normalize_browser_backend(
+            params.get('browser_backend') or params.get('backend')
+        )
+        if requested_browser_backend:
+            profile_data['_force_backend'] = requested_browser_backend
+            logger.info(f"🧪 Browser backend requested for search: {requested_browser_backend}")
+            if task_id:
+                _update_search_task_log(task_id, f"🧪 Browser backend: {requested_browser_backend}")
+
         # Use stored fingerprint data from DB (consistent across sessions)
         _db_webgl = profile_data_from_db.get('webgl_fingerprint')
         if _db_webgl:
@@ -2825,6 +2857,9 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
         _check_wall_clock(start_time, 'before browser launch', _watchdog)
         browser_id = browser_manager.create_browser_session(profile_data, proxy_data)
         driver = browser_manager.active_browsers[browser_id]
+        _profile_dir_for_cleanup = browser_manager.browser_profiles.get(browser_id, {}).get(
+            '_profile_dir', _profile_dir_for_cleanup
+        )
         driver.set_page_load_timeout(40)  # 40s instead of default 300s
         driver.set_script_timeout(15)  # Prevent execute_script from hanging on dead renderer
 
@@ -4341,6 +4376,25 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
 
 # ======================== SCHEDULER ========================
 
+_KEYWORD_TYPE_STOPWORDS = {
+    'для', 'как', 'что', 'где', 'это', 'или', 'при', 'под', 'над', 'без', 'про',
+    'купить', 'цена', 'стоимость', 'заказать', 'москва', 'московская', 'область',
+    'официальный', 'сайт', 'интернет', 'магазин', 'онлайн', '2025', '2026',
+}
+
+
+def _keyword_type_key(keyword: str) -> str:
+    """Coarse keyword cluster key used to avoid dense similar-query bursts."""
+    tokens = re.findall(r'[a-zа-яё0-9]+', (keyword or '').lower())
+    meaningful_tokens = [
+        token for token in tokens
+        if len(token) > 2 and token not in _KEYWORD_TYPE_STOPWORDS
+    ]
+    if not meaningful_tokens:
+        meaningful_tokens = tokens[:3]
+    return ':'.join(meaningful_tokens[:3]) or 'generic'
+
+
 @shared_task(name='tasks.yandex_search.schedule_search_visits')
 def schedule_search_visits():
     """
@@ -4373,12 +4427,12 @@ def schedule_search_visits():
     except Exception as qe:
         scheduler_logger.warning(f"Could not check queue length: {qe}")
 
-    # ── Conveyor model: keep a buffer of pending tasks so workers never idle ──
-    # concurrency=20 in docker-compose limits actual simultaneous workers
+    # ── Conveyor model: keep the queue fed, but avoid dense same-domain/type bursts ──
+    # The search worker may have more process slots, while scheduler pacing
+    # spreads tasks across domains and keyword clusters inside each refill.
     # BUFFER_TARGET = how many pending tasks to maintain (above in_progress)
-    # Workers finish a task → immediately grab next from buffer → no gap
-    MAX_CONCURRENT_SEARCH_TASKS = 100
-    BUFFER_TARGET = 10  # keep ~10 pending tasks ready for workers (concurrency=10)
+    MAX_CONCURRENT_SEARCH_TASKS = 50
+    BUFFER_TARGET = 10
     try:
         with get_db_session() as db:
             active_count = db.query(Task).filter(
@@ -4616,6 +4670,7 @@ def schedule_search_visits():
                     # to prevent creating duplicate tasks while previous ones
                     # haven't completed (race condition with search_position_history)
                     pending_per_keyword = {}
+                    pending_per_keyword_type = {}
                     try:
                         pending_tasks = db.query(Task).filter(
                             Task.task_type == 'yandex_search',
@@ -4626,17 +4681,22 @@ def schedule_search_visits():
                             if p.get('target_id') == target.id:
                                 pk = p.get('keyword', '')
                                 pending_per_keyword[pk] = pending_per_keyword.get(pk, 0) + 1
+                                keyword_type = p.get('keyword_type') or _keyword_type_key(pk)
+                                pending_per_keyword_type[keyword_type] = pending_per_keyword_type.get(keyword_type, 0) + 1
                     except Exception:
                         pass
                     
+                    paced_keyword_budgets = []
+                    deferred_keyword_budgets = []
                     for kw in keywords:
+                        keyword_type = _keyword_type_key(kw)
                         fw = freq_weights.get(kw, 1.0)
                         kw_calc = _calculate_keyword_clicks(db, target.id, kw, target_success_rate=sr, freq_weight=fw)
                         # Subtract pending tasks from remaining to prevent double-scheduling
                         pending_kw = pending_per_keyword.get(kw, 0)
                         effective_done = kw_calc["today_done"] + pending_kw
                         remaining = max(0, kw_calc["clicks_per_day"] - effective_done)
-                        keyword_budgets.append({
+                        budget_row = {
                             "keyword": kw,
                             "clicks_per_day": kw_calc["clicks_per_day"],
                             "today_done": effective_done,
@@ -4645,8 +4705,20 @@ def schedule_search_visits():
                             "position": kw_calc.get("current_position"),
                             "reason": kw_calc["reason"],
                             "freq_weight": fw,
-                        })
+                            "keyword_type": keyword_type,
+                        }
+                        keyword_budgets.append(budget_row)
+                        if pending_per_keyword_type.get(keyword_type, 0) > 0:
+                            deferred_keyword_budgets.append(budget_row)
+                        else:
+                            paced_keyword_budgets.append(budget_row)
                         total_budget += remaining
+
+                    if deferred_keyword_budgets:
+                        scheduler_logger.info(
+                            f"⏸️ {target.domain}: deferred {len(deferred_keyword_budgets)} similar keyword(s) "
+                            f"while other keyword types are available"
+                        )
 
                     if total_budget <= 0:
                         # Keyword-level budgets exhausted — redistribute
@@ -4704,7 +4776,16 @@ def schedule_search_visits():
                                     total_budget += 0
 
                     # Sort: truly new keywords first, then zero-click, then by remaining budget desc
-                    candidates = [kb for kb in keyword_budgets if kb["remaining"] > 0]
+                    candidates = [kb for kb in paced_keyword_budgets if kb["remaining"] > 0]
+                    if not candidates:
+                        # Soft pacing: if all remaining work is similar to active/pending
+                        # tasks, keep the conveyor alive instead of starving the queue.
+                        candidates = [kb for kb in keyword_budgets if kb["remaining"] > 0]
+                        if candidates and deferred_keyword_budgets:
+                            scheduler_logger.info(
+                                f"🔄 {target.domain}: all candidates are similar to pending work; "
+                                f"allowing fallback to keep queue fed"
+                            )
                     if not candidates:
                         continue
                     # Tier 1: Never checked keywords (phase="start") — highest priority
@@ -4795,10 +4876,13 @@ def schedule_search_visits():
                 f"targets={len(target_schedule_data)}"
             )
 
-            # Build per-target task queues with proportional slot counts
+            # Build per-target task queues with proportional slot counts.
+            # Keep more than one task per domain possible, but cap per refill so
+            # a high-budget domain does not monopolize a small pending buffer.
             # When there's only 1 target, we also interleave by keyword
             # to avoid same keyword back-to-back (suspicious pattern).
             per_target_queues = []  # list of lists of (target, keyword_data, profile_id, search_params)
+            adaptive_domain_cap = max(2, math.ceil(slots_available / max(len(target_schedule_data), 1)))
             for td in target_schedule_data:
                 target = td['target']
                 candidates = td['candidates']
@@ -4806,8 +4890,7 @@ def schedule_search_visits():
 
                 proportion = td['total_budget'] / grand_total if grand_total > 0 else 1.0 / len(target_schedule_data)
                 target_slots = max(1, round(slots_available * proportion))
-                # Cap per-domain tasks per scheduler run (conveyor: small batches, frequent refills)
-                MAX_TASKS_PER_DOMAIN = 10
+                MAX_TASKS_PER_DOMAIN = adaptive_domain_cap
                 target_slots = min(target_slots, len(candidates), len(available_ids), MAX_TASKS_PER_DOMAIN)
 
                 scheduler_logger.info(
@@ -4882,10 +4965,15 @@ def schedule_search_visits():
 
                 try:
                     keyword = chosen['keyword']
+                    task_search_params = dict(search_params)
+                    task_queue = 'yandex_search'
+                    if _use_camoufox_for_search(profile_id, target.id, keyword):
+                        task_search_params['browser_backend'] = 'camoufox'
+                        task_queue = 'yandex_search_camoufox'
 
                     scheduler_logger.info(
                         f"  📝 [{idx+1}/{total_tasks_planned}] {target.domain} keyword='{keyword}' "
-                        f"({chosen['reason']}, done {chosen['today_done']}/{chosen['clicks_per_day']})"
+                        f"({chosen['reason']}, done {chosen['today_done']}/{chosen['clicks_per_day']}, queue={task_queue})"
                     )
 
                     task_record = Task(
@@ -4896,6 +4984,7 @@ def schedule_search_visits():
                         profile_id=profile_id,
                         parameters={
                             'keyword': keyword,
+                            'keyword_type': chosen.get('keyword_type') or _keyword_type_key(keyword),
                             'domain': target.domain,
                             'target_id': target.id,
                             'profile_id': profile_id,
@@ -4903,7 +4992,7 @@ def schedule_search_visits():
                             'position': chosen.get('position'),
                             'clicks_budget': chosen['clicks_per_day'],
                             'clicks_done': chosen['today_done'],
-                            **search_params
+                            **task_search_params
                         },
                         priority="normal",
                     )
@@ -4911,8 +5000,8 @@ def schedule_search_visits():
                     db.flush()
 
                     async_result = yandex_search_click_task.apply_async(
-                        args=[profile_id, target.id, keyword, task_record.id, search_params],
-                        queue='yandex_search'
+                        args=[profile_id, target.id, keyword, task_record.id, task_search_params],
+                        queue=task_queue
                     )
 
                     try:

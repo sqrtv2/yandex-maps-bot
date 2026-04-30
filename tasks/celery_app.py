@@ -32,6 +32,9 @@ celery_app.conf.update(
     task_routes={
         'tasks.yandex_search.schedule_search_visits': {'queue': 'yandex_search'},
         'tasks.yandex_search.daily_search_stats_reset': {'queue': 'yandex_search'},
+        # Optional Firefox/Camoufox search tasks are dispatched explicitly to
+        # yandex_search_camoufox so their worker processes start with patchright
+        # and are not pinned to the Chromium rebrowser backend.
         'tasks.yandex_scheduler.queue_watchdog': {'queue': 'yandex_search'},
         # Maps scheduler/maintenance run fast (<1s) — route to dedicated
         # 'maps_scheduler' queue that maps worker also listens on, so they
@@ -51,6 +54,7 @@ celery_app.conf.update(
         'tasks.warmup.*': {'queue': 'warmup'},
         # Camoufox warmup runs on its own dedicated worker (separate browser
         # binary, can't share sync_playwright loop with chromium workers).
+        'tasks.warmup_camoufox.schedule_camoufox_warmup': {'queue': 'default'},
         'tasks.warmup_camoufox.*': {'queue': 'warmup_camoufox'},
         'tasks.yandex_maps.*': {'queue': 'yandex_maps'},
         'tasks.yandex_search.*': {'queue': 'yandex_search'},
@@ -150,6 +154,10 @@ celery_app.conf.update(
         'warmup-watchdog': {
             'task': 'tasks.warmup.warmup_watchdog',
             'schedule': crontab(minute='*/3'),
+        },
+        'camoufox-warmup-seeder': {
+            'task': 'tasks.warmup_camoufox.schedule_camoufox_warmup',
+            'schedule': crontab(minute='*/10'),
         },
     }
 )

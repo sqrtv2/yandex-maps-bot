@@ -146,7 +146,7 @@ async def get_workers_status(db: Session = Depends(get_db)):
         
         # Get queue lengths
         queues = {}
-        for q_name in ['warmup', 'yandex_maps', 'yandex_search', 'default', 'proxy', 'maintenance']:
+        for q_name in ['warmup', 'yandex_maps', 'yandex_search', 'yandex_search_camoufox', 'default', 'proxy', 'maintenance']:
             queues[q_name] = r.llen(q_name) or 0
         
         # Also check legacy 'yandex' queue
@@ -406,7 +406,7 @@ async def get_queue_details():
         r = _redis.Redis(host=_s.redis_host, port=_s.redis_port)
         
         queues = {}
-        for q_name in ['warmup', 'yandex_maps', 'yandex_search', 'yandex', 'default', 'proxy', 'maintenance']:
+        for q_name in ['warmup', 'yandex_maps', 'yandex_search', 'yandex_search_camoufox', 'yandex', 'default', 'proxy', 'maintenance']:
             length = r.llen(q_name) or 0
             queues[q_name] = {
                 'length': length,
@@ -2974,6 +2974,11 @@ async def launch_search_visits(target_id: int, body: Dict[str, Any] = None, db: 
             'min_time_on_site': target.min_time_on_site,
             'max_time_on_site': target.max_time_on_site,
         }
+        requested_backend = (body.get("browser_backend") or body.get("backend") or "").strip().lower()
+        task_queue = 'yandex_search'
+        if requested_backend in ("camoufox", "firefox", "cf"):
+            search_params['browser_backend'] = 'camoufox'
+            task_queue = 'yandex_search_camoufox'
 
         launched = []
         for idx, profile in enumerate(selected):
@@ -3001,14 +3006,16 @@ async def launch_search_visits(target_id: int, body: Dict[str, Any] = None, db: 
                 yandex_search_click_task.apply_async(
                     args=[profile.id, target.id, keyword, task.id, search_params],
                     countdown=delay_seconds,
-                    queue='yandex_search'
+                    queue=task_queue
                 )
                 task.status = "pending"
                 launched.append({
                     "task_id": task.id,
                     "profile_id": profile.id,
                     "keyword": keyword,
-                    "delay": delay_seconds
+                    "delay": delay_seconds,
+                    "queue": task_queue,
+                    "browser_backend": search_params.get('browser_backend', 'chromium'),
                 })
             except Exception as send_err:
                 task.status = "failed"

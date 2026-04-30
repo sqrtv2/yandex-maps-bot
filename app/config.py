@@ -103,6 +103,14 @@ class Settings(BaseSettings):
         description="Percentage of profiles routed to patchright backend (0-100)",
     )
 
+    # Firefox/Camoufox A/B testing for Yandex Search only.
+    # 0   = all search tasks use the existing Chromium path
+    # 100 = all scheduled search tasks request Camoufox
+    yandex_search_camoufox_pct: int = Field(
+        default=0,
+        description="Percentage of scheduled Yandex Search tasks routed to Camoufox/Firefox (0-100)",
+    )
+
     # Anti-Captcha Configuration
     anticaptcha_api_key: str = Field(default="", description="Anti-captcha API key")
     anticaptcha_service: str = Field(default="2captcha", description="Anti-captcha service (2captcha, anticaptcha)")
@@ -134,6 +142,20 @@ class Settings(BaseSettings):
     warmup_duration_minutes: int = Field(default=2, description="Warmup duration in minutes (fast mode)")
     warmup_min_page_time: int = Field(default=2, description="Minimum time per page during warmup")
     warmup_max_page_time: int = Field(default=10, description="Maximum time per page during warmup")
+
+    # Camoufox warmup (anti-detect Firefox profile pool)
+    camoufox_warmup_enabled: bool = Field(
+        default=True,
+        description="Automatically seed Camoufox warmup tasks for active profiles"
+    )
+    camoufox_warmup_batch_size: int = Field(
+        default=20,
+        description="Maximum Camoufox profiles to seed per scheduler tick"
+    )
+    camoufox_warmup_queue_max: int = Field(
+        default=80,
+        description="Do not seed more Camoufox tasks when Redis queue is above this size"
+    )
 
     # Yandex Maps Configuration
     yandex_min_visit_time: int = Field(default=10, description="Minimum visit time on Yandex Maps")
