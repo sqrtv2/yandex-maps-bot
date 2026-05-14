@@ -9,6 +9,7 @@ import logging
 import math
 import re
 import signal
+import threading
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, quote_plus
 from datetime import datetime, timedelta
@@ -57,6 +58,21 @@ SEARCH_MAX_DURATION = 600
 # take 3-4 min between heartbeats. Absolute max still catches true hangs at 13 min.
 WATCHDOG_IDLE_TIMEOUT = 300   # kill if no heartbeat for 5 minutes
 WATCHDOG_ABSOLUTE_MAX = 780   # absolute max before kill (< time_limit=840s)
+
+# Total wall-clock budget for ALL captcha solving in a single search task.
+# Search task has WATCHDOG_ABSOLUTE_MAX=780s; if captchas eat 600s of that we
+# never get to find-and-click. With Capsola silhouette ~50% per round and
+# ~30-60s per attempt, 240s lets us do ~3 silhouette rounds + 1 PoW + a couple
+# of pagination captchas before giving up the task and retrying on a fresh
+# profile.
+_CAPTCHA_BUDGET_SECONDS = 240
+
+# Threshold below which a 'not found' verdict is treated as captcha-degraded
+# SERP rather than a real miss. Yandex sometimes returns a heavily-truncated
+# SERP after captcha solve (3-4 results total) — pretending those are the
+# real top-N misleads us. If organic results on the final SERP is below this,
+# we reclassify as captcha (and let the scheduler retry on a fresh profile).
+_NOT_FOUND_MIN_RESULTS = 5
 
 
 def _normalize_browser_backend(value: Optional[str]) -> Optional[str]:
@@ -352,6 +368,82 @@ def _check_wall_clock(start_time: float, label: str = "", watchdog: '_TaskWatchd
             + (f" at {label}" if label else "")
         )
     return True
+
+
+# === Captcha total-budget infrastructure ===
+# Tracks cumulative wall-clock time spent solving captchas in a single task.
+# Wrap each handle_yandex_protection() call via _solve_with_budget(); when the
+# budget is exhausted, subsequent solver calls fast-fail (return False) so the
+# task can finish/cleanup before the absolute watchdog kills it at 780s.
+
+class _CaptchaBudget:
+    def __init__(self, total_seconds: float = _CAPTCHA_BUDGET_SECONDS):
+        self.total = float(total_seconds)
+        self.spent = 0.0
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, self.total - self.spent)
+
+    def exhausted(self) -> bool:
+        return self.spent >= self.total
+
+    def track(self, label: str):
+        return _CaptchaBudgetTimer(self, label)
+
+
+class _CaptchaBudgetTimer:
+    def __init__(self, budget: _CaptchaBudget, label: str):
+        self.budget = budget
+        self.label = label
+        self._t0 = 0.0
+
+    def __enter__(self):
+        self._t0 = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        dt = time.time() - self._t0
+        self.budget.spent += dt
+        logger.info(
+            f"⏱️ Captcha budget [{self.label}]: +{dt:.1f}s "
+            f"(spent={self.budget.spent:.1f}s/{self.budget.total:.0f}s, "
+            f"remaining={self.budget.remaining:.1f}s)"
+        )
+        return False
+
+
+_CAPTCHA_BUDGET_TLS = threading.local()
+
+
+def _captcha_budget() -> Optional[_CaptchaBudget]:
+    return getattr(_CAPTCHA_BUDGET_TLS, "budget", None)
+
+
+def _set_captcha_budget(budget: Optional[_CaptchaBudget]) -> None:
+    _CAPTCHA_BUDGET_TLS.budget = budget
+
+
+def _solve_with_budget(driver, captcha_solver, label: str,
+                       max_kaleidoscope_attempts: int = 3) -> bool:
+    """Wrap handle_yandex_protection() with the per-task captcha budget.
+    Fast-fails when the budget is exhausted so we don't push the task past
+    the absolute watchdog.
+    """
+    from tasks.yandex_maps import handle_yandex_protection
+    budget = _captcha_budget()
+    if budget is not None and budget.exhausted():
+        logger.warning(
+            f"⛔ Captcha budget exhausted ({budget.spent:.1f}s/{budget.total:.0f}s); "
+            f"skipping captcha solve at [{label}]"
+        )
+        return False
+    if budget is None:
+        return handle_yandex_protection(driver, captcha_solver,
+                                        max_kaleidoscope_attempts=max_kaleidoscope_attempts)
+    with budget.track(label):
+        return handle_yandex_protection(driver, captcha_solver,
+                                        max_kaleidoscope_attempts=max_kaleidoscope_attempts)
 
 
 def _check_memory_budget() -> tuple:
@@ -1902,7 +1994,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                 # === Solve captcha during pagination ===
                 try:
                     captcha_solver = CaptchaSolver()
-                    solved_pag = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=3)
+                    solved_pag = _solve_with_budget(driver, captcha_solver, 'pagination', max_kaleidoscope_attempts=3)
                     if solved_pag:
                         logger.info(f"  ✅ Captcha on page {page_num} solved, retrying extraction...")
                         # After solving, check if we're back on search or need to re-navigate
@@ -1965,7 +2057,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                                 logger.warning(f"  🚨 Captcha appeared after refresh on page {page_num}")
                                 try:
                                     captcha_solver = CaptchaSolver()
-                                    solved_ref = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=3)
+                                    solved_ref = _solve_with_budget(driver, captcha_solver, 'after-refresh', max_kaleidoscope_attempts=3)
                                     if solved_ref:
                                         time.sleep(random.uniform(2, 4))
                                 except SoftTimeLimitExceeded:
@@ -1995,7 +2087,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                         if detect_captcha_or_block(driver):
                             try:
                                 captcha_solver = CaptchaSolver()
-                                solved_nav = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=3)
+                                solved_nav = _solve_with_budget(driver, captcha_solver, 'after-navigate', max_kaleidoscope_attempts=3)
                                 if solved_nav:
                                     time.sleep(random.uniform(2, 4))
                             except SoftTimeLimitExceeded:
@@ -2044,7 +2136,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                         logger.warning(f"  🚨 Captcha after dedup reload on page {page_num}, solving...")
                         try:
                             pag_solver2 = CaptchaSolver()
-                            pag_solved2 = handle_yandex_protection(driver, pag_solver2, max_kaleidoscope_attempts=3)
+                            pag_solved2 = _solve_with_budget(driver, pag_solver2, 'pagination-dedup', max_kaleidoscope_attempts=3)
                             if pag_solved2:
                                 logger.info(f"  ✅ Dedup reload captcha solved")
                                 time.sleep(random.uniform(2, 4))
@@ -2540,7 +2632,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                         logger.warning(f"  🚨 Captcha appeared after navigating to page {page_num + 1}, solving...")
                         try:
                             pag_solver = CaptchaSolver()
-                            pag_solved = handle_yandex_protection(driver, pag_solver, max_kaleidoscope_attempts=3)
+                            pag_solved = _solve_with_budget(driver, pag_solver, 'pagination-nav', max_kaleidoscope_attempts=3)
                             if pag_solved:
                                 logger.info(f"  ✅ Pagination captcha solved")
                                 time.sleep(random.uniform(2, 4))
@@ -2567,7 +2659,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                                         if 'showcaptcha' in _pc2_url or 'checkcaptcha' in _pc2_url:
                                             logger.warning(f"  🚨 Another captcha after re-navigation to page {page_num + 1}")
                                             try:
-                                                pag_solved2 = handle_yandex_protection(driver, pag_solver, max_kaleidoscope_attempts=3)
+                                                pag_solved2 = _solve_with_budget(driver, pag_solver, 'pagination-renav', max_kaleidoscope_attempts=3)
                                                 if pag_solved2:
                                                     time.sleep(random.uniform(2, 4))
                                             except SoftTimeLimitExceeded:
@@ -2628,7 +2720,7 @@ def _find_and_click_target(driver, domain: str, max_pages: int = 3, keyword: str
                             logger.warning(f"  🚨 Captcha appeared after navigating to page {page_num + 1}, solving...")
                             try:
                                 pag_solver = CaptchaSolver()
-                                pag_solved = handle_yandex_protection(driver, pag_solver, max_kaleidoscope_attempts=3)
+                                pag_solved = _solve_with_budget(driver, pag_solver, 'pagination-fallback', max_kaleidoscope_attempts=3)
                                 if pag_solved:
                                     logger.info(f"  ✅ Pagination captcha solved")
                                     time.sleep(random.uniform(2, 4))
@@ -2692,6 +2784,9 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
 
     try:
         start_time = time.time()
+
+        # Per-task captcha total-time budget (cleared in finally).
+        _set_captcha_budget(_CaptchaBudget(_CAPTCHA_BUDGET_SECONDS))
 
         # ── Mark task as in_progress IMMEDIATELY ──
         # This MUST happen before any code that can fail or retry.
@@ -3081,7 +3176,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 solve_start = time.time()
                 _watchdog.heartbeat('home captcha solve')
                 try:
-                    solved = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=3)
+                    solved = _solve_with_budget(driver, captcha_solver, 'home-page', max_kaleidoscope_attempts=3)
                 except SoftTimeLimitExceeded:
                     raise
                 except Exception as _hp_err:
@@ -3795,7 +3890,7 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
                 solve_start2 = time.time()
                 _watchdog.heartbeat(f'search captcha attempt {search_captcha_attempt}')
                 try:
-                    solved2 = handle_yandex_protection(driver, captcha_solver, max_kaleidoscope_attempts=7)
+                    solved2 = _solve_with_budget(driver, captcha_solver, 'search-results', max_kaleidoscope_attempts=3)
                 except SoftTimeLimitExceeded:
                     raise
                 except Exception as _hp2_err:
@@ -3945,6 +4040,24 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
             except Exception:
                 pass
             _is_actually_captcha = any(m in _final_title for m in _captcha_title_markers) or 'showcaptcha' in _final_url
+
+            # Additional heuristic: a degraded SERP after captcha solve sometimes
+            # comes back as a normal /search?text=... URL with a normal title but
+            # only a handful of organic results. Treat that as a captcha-degraded
+            # SERP (and let the scheduler retry on a fresh profile) instead of
+            # accusing the keyword/target of being absent.
+            if not _is_actually_captcha:
+                try:
+                    _final_organic = _extract_organic_results_js(driver) or []
+                    _final_organic_n = len(_final_organic)
+                except Exception:
+                    _final_organic_n = -1
+                if 0 <= _final_organic_n < _NOT_FOUND_MIN_RESULTS:
+                    logger.warning(
+                        f"🚨 Reclassifying not_found → captcha: only {_final_organic_n} "
+                        f"organic results on final SERP (< {_NOT_FOUND_MIN_RESULTS}) — likely captcha-degraded"
+                    )
+                    _is_actually_captcha = True
 
             if _is_actually_captcha:
                 # This is NOT a real "not found" — the page is a captcha
@@ -4335,6 +4448,12 @@ def yandex_search_click_task(self, profile_id: int, target_id: int,
     finally:
         # Cancel watchdog — cleanup is happening normally, no need to force-kill
         _watchdog.cancel()
+
+        # Clear per-task captcha budget
+        try:
+            _set_captcha_budget(None)
+        except Exception:
+            pass
 
         # Clear captcha heartbeat callback
         try:

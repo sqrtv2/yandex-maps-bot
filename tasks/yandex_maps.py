@@ -2101,6 +2101,17 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
         return False
 
 
+# Silhouette captcha retry policy.
+# Capsola's silhouette accuracy is roughly ~50% per round and each round costs
+# ~30-60s. The previous limit of 5 attempts (= up to ~5 minutes per call)
+# routinely pushed search tasks past WATCHDOG_ABSOLUTE_MAX (780s) when it
+# combined with pagination/showcaptcha solves. We cap to a small number of
+# attempts AND a wall-clock budget so retries can never starve the rest of
+# the task.
+_SILHOUETTE_MAX_ATTEMPTS = 3
+_SILHOUETTE_MAX_DURATION = 150  # seconds, total wall-clock budget per call
+
+
 def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
     """Solve Yandex Silhouette/PazlCaptcha using Capsola PazlCaptcha V1 API.
     
@@ -2268,31 +2279,39 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
             # Fallback to full screenshot approach
             return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
         
-        # ШАГ 2: Solve with retries (up to 5 attempts — Yandex may require 3+ correct rounds)
-        for solve_attempt in range(1, 6):
-            _heartbeat(f'silhouette solve attempt {solve_attempt}/5')
+        # ШАГ 2: Solve with bounded retries + wall-clock budget.
+        max_attempts = _SILHOUETTE_MAX_ATTEMPTS
+        budget_deadline = time.time() + _SILHOUETTE_MAX_DURATION
+        for solve_attempt in range(1, max_attempts + 1):
+            if time.time() >= budget_deadline:
+                logger.warning(
+                    f"⏱️ Silhouette wall-clock budget exhausted "
+                    f"({_SILHOUETTE_MAX_DURATION}s) after {solve_attempt - 1} attempts — giving up"
+                )
+                return False
+            _heartbeat(f'silhouette solve attempt {solve_attempt}/{max_attempts}')
             # For SmartCaptcha: click = main image (silhouette), task = task description icons
-            logger.info(f"🔄 [{solve_attempt}/5] Sending Silhouette as SmartCaptcha to Capsola (click={len(click_image_data)}b, task={len(task_image_data)}b)...")
+            logger.info(f"🔄 [{solve_attempt}/{max_attempts}] Sending Silhouette as SmartCaptcha to Capsola (click={len(click_image_data)}b, task={len(task_image_data)}b)...")
             result = capsola.solve_smart_captcha(click_image_data, task_image_data, max_wait=120)
             
             if not result or result.get('status') != 1:
-                logger.warning(f"⚠️ [{solve_attempt}/5] SmartCaptcha failed for silhouette: {result}")
-                if solve_attempt < 5:
+                logger.warning(f"⚠️ [{solve_attempt}/{max_attempts}] SmartCaptcha failed for silhouette: {result}")
+                if solve_attempt < max_attempts:
                     time.sleep(2)
                     continue
                 # Final attempt failed → fallback to full screenshot
                 return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
             
             answer = result.get('response', '')
-            logger.info(f"✅ [{solve_attempt}/5] SmartCaptcha silhouette answer: {answer}")
+            logger.info(f"✅ [{solve_attempt}/{max_attempts}] SmartCaptcha silhouette answer: {answer}")
             
             # ШАГ 3: Apply coordinate-based answer
             solved = _apply_silhouette_answer(driver, answer, click_image_data)
             if solved:
                 return True
             
-            if solve_attempt < 5:
-                logger.info(f"🔄 [{solve_attempt}/5] Silhouette answer didn't work, retrying...")
+            if solve_attempt < max_attempts:
+                logger.info(f"🔄 [{solve_attempt}/{max_attempts}] Silhouette answer didn't work, retrying...")
                 # Check if browser/page is still alive before retrying (use execute_script, not current_url which is cached)
                 try:
                     driver.execute_script("1")
