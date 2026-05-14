@@ -65,7 +65,18 @@ WATCHDOG_ABSOLUTE_MAX = 780   # absolute max before kill (< time_limit=840s)
 # ~30-60s per attempt, 240s lets us do ~3 silhouette rounds + 1 PoW + a couple
 # of pagination captchas before giving up the task and retrying on a fresh
 # profile.
+# Total wall-clock budget for ALL captcha solving in a single search task.
+# Search task has WATCHDOG_ABSOLUTE_MAX=780s; if captchas eat 600s of that we
+# never get to find-and-click. With Capsola silhouette ~50% per round and ~30-60s
+# per attempt, 240s lets us do ~3 silhouette rounds + 1 PoW + a couple of
+# pagination captchas before giving up the task and retrying on a fresh profile.
 _CAPTCHA_BUDGET_SECONDS = 240
+
+# Hard wall-clock cap for ANY single handle_yandex_protection() call.
+# Even if the per-task budget allows more, no single solve attempt may exceed
+# this. Bounds the FIRST call (which previously could run 300+s unbounded).
+# 90s = enough for: PoW (45s) + 1 refresh + 1 silhouette/kaleidoscope round.
+_CAPTCHA_PER_CALL_MAX_SECONDS = 90
 
 # Threshold below which a 'not found' verdict is treated as captcha-degraded
 # SERP rather than a real miss. Yandex sometimes returns a heavily-truncated
@@ -427,8 +438,11 @@ def _set_captcha_budget(budget: Optional[_CaptchaBudget]) -> None:
 def _solve_with_budget(driver, captcha_solver, label: str,
                        max_kaleidoscope_attempts: int = 3) -> bool:
     """Wrap handle_yandex_protection() with the per-task captcha budget.
-    Fast-fails when the budget is exhausted so we don't push the task past
-    the absolute watchdog.
+
+    - Skips the call entirely (returns False) if the per-task budget is exhausted.
+    - Computes a per-call deadline = min(remaining_budget, _CAPTCHA_PER_CALL_MAX_SECONDS)
+      and passes it down so the FIRST call also has a hard ceiling, not just
+      subsequent ones.
     """
     from tasks.yandex_maps import handle_yandex_protection
     budget = _captcha_budget()
@@ -439,11 +453,24 @@ def _solve_with_budget(driver, captcha_solver, label: str,
         )
         return False
     if budget is None:
-        return handle_yandex_protection(driver, captcha_solver,
-                                        max_kaleidoscope_attempts=max_kaleidoscope_attempts)
+        deadline = time.time() + _CAPTCHA_PER_CALL_MAX_SECONDS
+        return handle_yandex_protection(
+            driver, captcha_solver,
+            max_kaleidoscope_attempts=max_kaleidoscope_attempts,
+            deadline=deadline,
+        )
+    per_call = min(budget.remaining, float(_CAPTCHA_PER_CALL_MAX_SECONDS))
+    deadline = time.time() + per_call
+    logger.info(
+        f"⏱️ [CAPTCHA-BUDGET] {label}: per-call cap {per_call:.0f}s "
+        f"(budget remaining {budget.remaining:.0f}s)"
+    )
     with budget.track(label):
-        return handle_yandex_protection(driver, captcha_solver,
-                                        max_kaleidoscope_attempts=max_kaleidoscope_attempts)
+        return handle_yandex_protection(
+            driver, captcha_solver,
+            max_kaleidoscope_attempts=max_kaleidoscope_attempts,
+            deadline=deadline,
+        )
 
 
 def _check_memory_budget() -> tuple:
@@ -5177,6 +5204,132 @@ def schedule_search_visits():
                 r.delete(lock_key)
             except Exception:
                 pass
+        return {'status': 'error', 'error': str(e)}
+
+
+# Threshold: profile is considered "dirty" if it accumulates this many captcha
+# errors in the last 24 hours. Such profile is moved to 'quarantined' status,
+# excluding it from search rotation until re-warmup completes.
+_PROFILE_CAPTCHA_QUARANTINE_THRESHOLD = 5
+_PROFILE_QUARANTINE_DURATION_HOURS = 24
+
+
+@shared_task(name='tasks.yandex_search.quarantine_dirty_profiles')
+def quarantine_dirty_profiles():
+    """Move profiles with too many recent captcha errors to 'quarantined' status.
+
+    Periodic beat task. Profiles with >= _PROFILE_CAPTCHA_QUARANTINE_THRESHOLD
+    captcha errors in the last 24 hours get:
+      - status = 'quarantined' (auto-excluded from search rotation)
+      - warmup_completed = False (so the warmup pool picks them back up)
+
+    Quarantined profiles are released by `release_quarantined_profiles` after
+    _PROFILE_QUARANTINE_DURATION_HOURS once their captcha rate drops.
+    """
+    from app.models.error_log import ErrorLog
+    from sqlalchemy import func
+    scheduler_logger = logging.getLogger(__name__ + '.scheduler')
+    try:
+        with get_db_session() as db:
+            since = datetime.utcnow() - timedelta(hours=24)
+            rows = (
+                db.query(ErrorLog.profile_id, func.count(ErrorLog.id))
+                .filter(
+                    ErrorLog.task_type == 'yandex_search',
+                    ErrorLog.error_category == 'captcha',
+                    ErrorLog.created_at >= since,
+                    ErrorLog.profile_id.isnot(None),
+                )
+                .group_by(ErrorLog.profile_id)
+                .having(func.count(ErrorLog.id) >= _PROFILE_CAPTCHA_QUARANTINE_THRESHOLD)
+                .all()
+            )
+            if not rows:
+                scheduler_logger.info("✅ quarantine_dirty_profiles: no dirty profiles")
+                return {'status': 'success', 'quarantined': 0}
+
+            dirty_ids = [pid for pid, _cnt in rows]
+            counts = {pid: cnt for pid, cnt in rows}
+
+            # Only quarantine profiles currently in 'warmed' or 'active' status
+            # (avoid touching ones already quarantined / warming).
+            profiles = db.query(BrowserProfile).filter(
+                BrowserProfile.id.in_(dirty_ids),
+                BrowserProfile.status.in_(['warmed', 'active']),
+            ).all()
+
+            quarantined = 0
+            for p in profiles:
+                old_status = p.status
+                p.status = 'quarantined'
+                p.warmup_completed = False
+                p.updated_at = datetime.utcnow()
+                quarantined += 1
+                scheduler_logger.warning(
+                    f"🚫 Quarantined profile id={p.id} name={p.name}: "
+                    f"{counts.get(p.id, '?')} captcha errors in 24h "
+                    f"(was status={old_status})"
+                )
+            db.commit()
+
+            scheduler_logger.info(
+                f"🚫 quarantine_dirty_profiles: quarantined {quarantined}/{len(dirty_ids)} "
+                f"(threshold={_PROFILE_CAPTCHA_QUARANTINE_THRESHOLD} captcha/24h)"
+            )
+            return {'status': 'success', 'quarantined': quarantined, 'candidates': len(dirty_ids)}
+    except Exception as e:
+        scheduler_logger.error(f"❌ quarantine_dirty_profiles error: {e}", exc_info=True)
+        return {'status': 'error', 'error': str(e)}
+
+
+@shared_task(name='tasks.yandex_search.release_quarantined_profiles')
+def release_quarantined_profiles():
+    """Release profiles that completed quarantine period.
+
+    Profiles in 'quarantined' status whose updated_at is older than
+    _PROFILE_QUARANTINE_DURATION_HOURS AND that no longer have a high recent
+    captcha rate are reset to 'created' so the standard warmup pipeline can
+    pick them back up.
+    """
+    from app.models.error_log import ErrorLog
+    from sqlalchemy import func
+    scheduler_logger = logging.getLogger(__name__ + '.scheduler')
+    try:
+        with get_db_session() as db:
+            cutoff = datetime.utcnow() - timedelta(hours=_PROFILE_QUARANTINE_DURATION_HOURS)
+            candidates = db.query(BrowserProfile).filter(
+                BrowserProfile.status == 'quarantined',
+                BrowserProfile.updated_at <= cutoff,
+            ).all()
+            if not candidates:
+                return {'status': 'success', 'released': 0}
+
+            since = datetime.utcnow() - timedelta(hours=24)
+            released = 0
+            for p in candidates:
+                recent_captcha = db.query(func.count(ErrorLog.id)).filter(
+                    ErrorLog.profile_id == p.id,
+                    ErrorLog.task_type == 'yandex_search',
+                    ErrorLog.error_category == 'captcha',
+                    ErrorLog.created_at >= since,
+                ).scalar() or 0
+                if recent_captcha >= _PROFILE_CAPTCHA_QUARANTINE_THRESHOLD:
+                    # Still dirty — keep in quarantine, refresh updated_at.
+                    p.updated_at = datetime.utcnow()
+                    continue
+                p.status = 'created'
+                p.warmup_completed = False
+                p.warmup_stage = 0
+                p.updated_at = datetime.utcnow()
+                released += 1
+                scheduler_logger.info(
+                    f"♻️  Released profile id={p.id} name={p.name} from quarantine "
+                    f"(recent captcha={recent_captcha})"
+                )
+            db.commit()
+            return {'status': 'success', 'released': released, 'candidates': len(candidates)}
+    except Exception as e:
+        scheduler_logger.error(f"❌ release_quarantined_profiles error: {e}", exc_info=True)
         return {'status': 'error', 'error': str(e)}
 
 

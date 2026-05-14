@@ -135,6 +135,14 @@ celery_app.conf.update(
             'task': 'tasks.yandex_search.daily_search_stats_reset',
             'schedule': crontab(minute=0, hour=0),
         },
+        'yandex-search-quarantine-dirty-profiles': {
+            'task': 'tasks.yandex_search.quarantine_dirty_profiles',
+            'schedule': crontab(minute='*/30'),
+        },
+        'yandex-search-release-quarantined-profiles': {
+            'task': 'tasks.yandex_search.release_quarantined_profiles',
+            'schedule': crontab(minute=15, hour='*/1'),
+        },
         'queue-watchdog': {
             'task': 'tasks.yandex_scheduler.queue_watchdog',
             'schedule': crontab(minute='*/3'),

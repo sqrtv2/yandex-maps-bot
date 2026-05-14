@@ -604,11 +604,22 @@ def detect_captcha_or_block(driver) -> bool:
         return False
 
 
-def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidoscope_attempts: int = 7) -> bool:
-    """Handle Yandex captcha or protection mechanisms (SmartCaptcha через Capsola)."""
+def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidoscope_attempts: int = 7,
+                             deadline: Optional[float] = None) -> bool:
+    """Handle Yandex captcha or protection mechanisms (SmartCaptcha через Capsola).
+
+    `deadline` (epoch seconds, optional): hard wall-clock cap for this entire
+    call. Sub-solvers check it at retry boundaries and abort early when reached.
+    """
     try:
         _heartbeat('captcha: handle_yandex_protection start')
         logger.info("🔧 Attempting to handle Yandex protection")
+        if deadline is not None:
+            _remaining = deadline - time.time()
+            logger.info(f"⏱️ handle_yandex_protection deadline budget: {_remaining:.0f}s")
+            if _remaining <= 0:
+                logger.warning("⏱️ handle_yandex_protection deadline already exceeded — abort")
+                return False
         
         # Captcha debug screenshots disabled to save time
         # (save_screenshot can timeout for 30s)
@@ -659,6 +670,7 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidos
                 driver,
                 screenshot_path,
                 max_attempts=max_kaleidoscope_attempts,
+                deadline=deadline,
             )
             try:
                 driver.set_page_load_timeout(60)
@@ -680,7 +692,7 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidos
         
         if is_silhouette:
             logger.info("🧩 Silhouette/PazlCaptcha detected! Solving via Capsola PazlCaptcha API...")
-            result = _solve_yandex_silhouette_captcha(driver, screenshot_path)
+            result = _solve_yandex_silhouette_captcha(driver, screenshot_path, deadline=deadline)
             try:
                 driver.set_page_load_timeout(60)
                 driver.set_script_timeout(30)
@@ -730,7 +742,7 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidos
                 return result
             
             logger.info(f"🎯 SmartCaptcha detected (url={is_captcha_page}, source={is_smartcaptcha_in_source})")
-            result = _solve_yandex_showcaptcha(driver, screenshot_path, max_kaleidoscope_attempts=max_kaleidoscope_attempts)
+            result = _solve_yandex_showcaptcha(driver, screenshot_path, max_kaleidoscope_attempts=max_kaleidoscope_attempts, deadline=deadline)
             # Restore normal timeout after captcha solving (captcha sets 120s)
             try:
                 driver.set_page_load_timeout(60)
@@ -753,7 +765,7 @@ def handle_yandex_protection(driver, captcha_solver: CaptchaSolver, max_kaleidos
                 elements = driver.find_elements(By.CSS_SELECTOR, selector)
                 if elements:
                     logger.info(f"🎯 Embedded SmartCaptcha found: {selector}")
-                    result = _solve_yandex_showcaptcha(driver, screenshot_path, max_kaleidoscope_attempts=max_kaleidoscope_attempts)
+                    result = _solve_yandex_showcaptcha(driver, screenshot_path, max_kaleidoscope_attempts=max_kaleidoscope_attempts, deadline=deadline)
                     try:
                         driver.set_page_load_timeout(60)
                         driver.set_script_timeout(30)
@@ -892,7 +904,8 @@ def _solve_showcaptcha_fast(driver, max_wait: int = 45) -> bool:
     return False
 
 
-def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_attempts: int = 7) -> bool:
+def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_attempts: int = 7,
+                              deadline: Optional[float] = None) -> bool:
     """Solve Yandex SmartCaptcha using Capsola API.
     
     Flow:
@@ -1018,6 +1031,9 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
         driver_alive = True
         image_grid_appeared = False
         for i in range(20):
+            if deadline is not None and time.time() >= deadline:
+                logger.warning(f"⏱️ showcaptcha PoW wait deadline reached at {i}s — abort")
+                return False
             _heartbeat(f'showcaptcha PoW wait {i+1}/20')
             time.sleep(1)
             try:
@@ -1172,10 +1188,13 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
             
             # No image grid — checkbox-only captcha didn't pass (SmartCaptcha has ~2% success rate).
             # Strategy: Refresh page hoping Yandex switches to Kaleidoscope or Silhouette.
-            # 2 refreshes max — they usually give the same checkbox back, wasting time.
+            # Single refresh — a 2nd refresh almost always gives the same checkbox back, wasting time.
             logger.info("⚠️ Checkbox captcha failed. Refreshing to try getting different captcha type...")
-            
-            for refresh_attempt in range(1, 3):
+
+            for refresh_attempt in range(1, 2):
+                if deadline is not None and time.time() >= deadline:
+                    logger.warning(f"⏱️ showcaptcha refresh-loop deadline reached — abort")
+                    return False
                 _heartbeat(f'showcaptcha refresh {refresh_attempt}/2')
                 logger.info(f"🔄 Refresh attempt {refresh_attempt}/2 — looking for kaleidoscope/silhouette...")
                 try:
@@ -1201,7 +1220,7 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
                 ])
                 if is_kaleidoscope_now:
                     logger.info(f"🧩 Kaleidoscope appeared after refresh {refresh_attempt}! Solving via PazlCaptcha...")
-                    return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path, max_attempts=max_kaleidoscope_attempts)
+                    return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path, max_attempts=max_kaleidoscope_attempts, deadline=deadline)
                 
                 # Check for silhouette
                 is_silhouette_now = any(kw in page_src_refresh for kw in [
@@ -1209,7 +1228,7 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
                 ])
                 if is_silhouette_now:
                     logger.info(f"🧩 Silhouette appeared after refresh {refresh_attempt}! Solving...")
-                    return _solve_yandex_silhouette_captcha(driver, screenshot_path)
+                    return _solve_yandex_silhouette_captcha(driver, screenshot_path, deadline=deadline)
                 
                 # Check if no captcha at all (lucky!)
                 if not detect_captcha_or_block(driver):
@@ -1259,7 +1278,7 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
                                 src_check = driver.page_source[:3000].lower()
                                 if 'kaleidoscope' in src_check or 'captchaslider' in src_check:
                                     logger.info(f"🧩 Kaleidoscope appeared after checkbox click! Solving...")
-                                    return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path, max_attempts=max_kaleidoscope_attempts)
+                                    return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path, max_attempts=max_kaleidoscope_attempts, deadline=deadline)
                             except:
                                 pass
                         # Check for image grid
@@ -1309,7 +1328,7 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
             'captcha-slider' in page_src_check or
             '/ru/kaleidoscope' in page_src_check):
             logger.info("🧩 Kaleidoscope (slider puzzle) detected — using PazlCaptcha V1")
-            return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path, max_attempts=max_kaleidoscope_attempts)
+            return _solve_yandex_kaleidoscope_captcha(driver, screenshot_path, max_attempts=max_kaleidoscope_attempts, deadline=deadline)
         
         # 4b: Silhouette → SmartCaptcha
         if ('advancedcaptcha_silhouette' in page_src_check or
@@ -1317,7 +1336,7 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
             'silhouette-container' in page_src_check or
             '/silhouette' in page_src_check):
             logger.info("🧩 Silhouette captcha detected after checkbox — switching to SmartCaptcha solver")
-            return _solve_yandex_silhouette_captcha(driver, screenshot_path)
+            return _solve_yandex_silhouette_captcha(driver, screenshot_path, deadline=deadline)
         
         # ШАГ 5: Image grid is visible — extract images for Capsola SmartCaptcha
         logger.info("📸 Extracting SmartCaptcha images for Capsola...")
@@ -1412,7 +1431,8 @@ def _solve_yandex_showcaptcha(driver, screenshot_path: str, max_kaleidoscope_att
         return False
 
 
-def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str, max_attempts: int = 7) -> bool:
+def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str, max_attempts: int = 7,
+                                       deadline: Optional[float] = None) -> bool:
     """Solve Yandex Kaleidoscope (slider puzzle) captcha using Capsola PazlCaptcha API.
     
     This captcha shows a scrambled 5x5 image grid with a slider (0 to ~42 steps).
@@ -1445,6 +1465,9 @@ def _solve_yandex_kaleidoscope_captcha(driver, screenshot_path: str, max_attempt
             logger.warning(f"Could not set timeouts: {e}")
         
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            if deadline is not None and time.time() >= deadline:
+                logger.warning(f"⏱️ Kaleidoscope deadline reached after {attempt - 1} attempts — abort")
+                return False
             _heartbeat(f'kaleidoscope attempt {attempt}/{MAX_ATTEMPTS}')
             logger.info(f"🧩 Kaleidoscope attempt {attempt}/{MAX_ATTEMPTS}")
             
@@ -2112,7 +2135,8 @@ _SILHOUETTE_MAX_ATTEMPTS = 3
 _SILHOUETTE_MAX_DURATION = 150  # seconds, total wall-clock budget per call
 
 
-def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
+def _solve_yandex_silhouette_captcha(driver, screenshot_path: str,
+                                     deadline: Optional[float] = None) -> bool:
     """Solve Yandex Silhouette/PazlCaptcha using Capsola PazlCaptcha V1 API.
     
     This captcha type shows an image with silhouettes that need to be clicked in order.
@@ -2282,11 +2306,13 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str) -> bool:
         # ШАГ 2: Solve with bounded retries + wall-clock budget.
         max_attempts = _SILHOUETTE_MAX_ATTEMPTS
         budget_deadline = time.time() + _SILHOUETTE_MAX_DURATION
+        if deadline is not None:
+            budget_deadline = min(budget_deadline, deadline)
         for solve_attempt in range(1, max_attempts + 1):
             if time.time() >= budget_deadline:
                 logger.warning(
                     f"⏱️ Silhouette wall-clock budget exhausted "
-                    f"({_SILHOUETTE_MAX_DURATION}s) after {solve_attempt - 1} attempts — giving up"
+                    f"after {solve_attempt - 1} attempts — giving up"
                 )
                 return False
             _heartbeat(f'silhouette solve attempt {solve_attempt}/{max_attempts}')
