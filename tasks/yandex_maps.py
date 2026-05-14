@@ -2124,15 +2124,13 @@ def _move_kaleidoscope_slider(driver, step: int) -> bool:
         return False
 
 
-# Silhouette captcha retry policy.
-# Capsola's silhouette accuracy is roughly ~50% per round and each round costs
-# ~30-60s. The previous limit of 5 attempts (= up to ~5 minutes per call)
-# routinely pushed search tasks past WATCHDOG_ABSOLUTE_MAX (780s) when it
-# combined with pagination/showcaptcha solves. We cap to a small number of
-# attempts AND a wall-clock budget so retries can never starve the rest of
-# the task.
+# Silhouette captcha tunables (2026-05-14):
+# Capsola silhouette accuracy is ~50%, so >3 attempts wastes time without
+# materially improving success (1-(0.5)^3 = 87.5%). Each attempt costs ~30-60s
+# (Capsola roundtrip + click animation + page reload). Cap total wall-clock to
+# avoid the search task watchdog (780s) firing inside the captcha loop.
 _SILHOUETTE_MAX_ATTEMPTS = 3
-_SILHOUETTE_MAX_DURATION = 150  # seconds, total wall-clock budget per call
+_SILHOUETTE_MAX_DURATION = 150  # seconds, total budget across all attempts
 
 
 def _solve_yandex_silhouette_captcha(driver, screenshot_path: str,
@@ -2303,7 +2301,7 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str,
             # Fallback to full screenshot approach
             return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
         
-        # ШАГ 2: Solve with bounded retries + wall-clock budget.
+        # ШАГ 2: Solve with bounded retries + wall-clock budget (see module-level constants).
         max_attempts = _SILHOUETTE_MAX_ATTEMPTS
         budget_deadline = time.time() + _SILHOUETTE_MAX_DURATION
         if deadline is not None:
@@ -2312,7 +2310,7 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str,
             if time.time() >= budget_deadline:
                 logger.warning(
                     f"⏱️ Silhouette wall-clock budget exhausted "
-                    f"after {solve_attempt - 1} attempts — giving up"
+                    f"after {solve_attempt - 1} attempt(s) — aborting"
                 )
                 return False
             _heartbeat(f'silhouette solve attempt {solve_attempt}/{max_attempts}')
@@ -2322,11 +2320,18 @@ def _solve_yandex_silhouette_captcha(driver, screenshot_path: str,
             
             if not result or result.get('status') != 1:
                 logger.warning(f"⚠️ [{solve_attempt}/{max_attempts}] SmartCaptcha failed for silhouette: {result}")
-                if solve_attempt < max_attempts:
-                    time.sleep(2)
-                    continue
-                # Final attempt failed → fallback to full screenshot
-                return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
+                # --- 2captcha fallback (только на последней попытке, чтобы не жечь баланс) ---
+                if solve_attempt >= max_attempts:
+                    result = _try_twocaptcha_fallback(
+                        click_image_data, task_image_data, max_wait=150,
+                        context="Silhouette"
+                    )
+                if not result or result.get('status') != 1:
+                    if solve_attempt < max_attempts:
+                        time.sleep(2)
+                        continue
+                    # Final attempt failed → fallback to full screenshot
+                    return _try_capsola_full_screenshot(driver, capsola, screenshot_path)
             
             answer = result.get('response', '')
             logger.info(f"✅ [{solve_attempt}/{max_attempts}] SmartCaptcha silhouette answer: {answer}")
@@ -2872,7 +2877,13 @@ def _send_to_capsola_and_click(driver, capsola, click_image_data: bytes, task_im
         
         if not result or result.get('status') != 1:
             logger.error(f"❌ Capsola failed: {result}")
-            return _try_simple_refresh(driver)
+            # --- 2captcha fallback ---
+            result = _try_twocaptcha_fallback(
+                click_image_data, task_image_data, max_wait=120,
+                context="SmartCaptcha grid"
+            )
+            if not result or result.get('status') != 1:
+                return _try_simple_refresh(driver)
         
         answer = result.get('response', '')
         logger.info(f"✅ Capsola answer: {answer}")
@@ -2992,6 +3003,36 @@ def _try_simple_refresh(driver) -> bool:
     driver.refresh()
     time.sleep(random.uniform(5, 10))
     return not detect_captcha_or_block(driver)
+
+
+def _try_twocaptcha_fallback(click_image_data: bytes, task_image_data: bytes,
+                             max_wait: int = 120, context: str = "") -> Optional[Dict]:
+    """Fallback на 2captcha когда Capsola вернул неуспешный ответ.
+
+    Возвращает Capsola-совместимый dict `{'status': 1, 'response': 'coordinates:...'}`
+    либо None. Не кидает исключений.
+    """
+    try:
+        from app.config import settings
+        if not getattr(settings, 'two_captcha_enabled', False):
+            return None
+        api_key = getattr(settings, 'two_captcha_api_key', '') or ''
+        if not api_key:
+            return None
+        from core.twocaptcha_solver import create_twocaptcha_solver
+        solver = create_twocaptcha_solver(api_key)
+        if not solver:
+            return None
+        logger.info(f"🔁 2captcha fallback ({context}): trying after Capsola failure...")
+        result = solver.solve_smart_captcha(click_image_data, task_image_data, max_wait=max_wait)
+        if result and result.get('status') == 1:
+            logger.info(f"✅ 2captcha fallback ({context}): got answer")
+        else:
+            logger.warning(f"❌ 2captcha fallback ({context}): no answer")
+        return result
+    except Exception as e:
+        logger.error(f"2captcha fallback ({context}) exception: {e}")
+        return None
 
 
 def extract_recaptcha_site_key(driver) -> Optional[str]:

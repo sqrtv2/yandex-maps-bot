@@ -198,6 +198,16 @@ class Settings(BaseSettings):
     )
     capsola_enabled: bool = Field(default=True, description="Enable Capsola captcha solver")
 
+    # 2captcha — fallback для silhouette/grid SmartCaptcha когда Capsola не отвечает
+    two_captcha_api_key: str = Field(
+        default="d5b751346bf0811ba2af18b4d15c4385",
+        description="2captcha.com API Key (fallback solver)"
+    )
+    two_captcha_enabled: bool = Field(
+        default=True,
+        description="Enable 2captcha as fallback solver after Capsola fails"
+    )
+
     # Referrer settings for Yandex Search
     search_referrer_percent: int = Field(
         default=50,
