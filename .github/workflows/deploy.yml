@@ -24,12 +24,36 @@ jobs:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
+      - name: ✅ Validate required secrets
+        run: |
+          missing=""
+          if [ -z "${{ secrets.SERVER_HOST }}" ]; then
+            missing="${missing} SERVER_HOST"
+          fi
+          if [ -z "${{ secrets.SERVER_USER }}" ]; then
+            missing="${missing} SERVER_USER"
+          fi
+          if [ -z "${{ secrets.SERVER_SSH_KEY }}" ]; then
+            missing="${missing} SERVER_SSH_KEY"
+          fi
+          if [ -z "${{ secrets.DEPLOY_PATH }}" ]; then
+            missing="${missing} DEPLOY_PATH"
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required GitHub Secrets:${missing}"
+            echo "Please configure the following secrets in Settings → Secrets → Actions:${missing}"
+            exit 1
+          fi
+          echo "✅ All required secrets are configured."
+
       - name: 🔑 Setup SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          if ! ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null; then
+            echo "::warning::ssh-keyscan could not reach ${{ secrets.SERVER_HOST }}. Proceeding with StrictHostKeyChecking=no."
+          fi
 
       - name: 🚀 Deploy to server
         run: |
